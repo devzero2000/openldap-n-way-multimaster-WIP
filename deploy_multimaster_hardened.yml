@@ -48,11 +48,27 @@
           -
           replace: olcRootPW
           olcRootPW: {{ ldap_hashed_pw.stdout }}
-
+  
     - name: 5. Applicazione configurazione Database di base
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_db_init.ldif
       register: db_init_result
       failed_when: "'ERR' in db_init_result.stderr and 'Duplicate' not in db_init_result.stderr"
+
+    - name: "5b. [NUOVO] Generazione LDIF per Hashing Automatico Password"
+      copy:
+        dest: /tmp/01bb_password_hash.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          add: olcPasswordHash
+          olcPasswordHash: {SSHA}
+
+    - name: "5c. [NUOVO] Applicazione configurazione olcPasswordHash"
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01bb_password_hash.ldif
+      register: hash_result
+      failed_when:
+        - hash_result.rc != 0
+        - "'Type or value exists' not in hash_result.stderr"
 
     - name: A. [NUOVO] Blocco dei Bind Anonimi a livello globale
       copy:
@@ -130,7 +146,7 @@
         - dit_result.rc != 0
         - "'Already exists' not in dit_result.stderr"
 
-    - name: 6. Generazione LDIF per ServerID e caricamento modulo syncprov
+    - name: "6. Generazione LDIF per ServerID e caricamento moduli (syncprov e ppolicy)"
       copy:
         dest: /tmp/02_replication_setup.ldif
         content: |
@@ -145,8 +161,11 @@
           changetype: modify
           add: olcModuleLoad
           olcModuleLoad: syncprov
+          -
+          add: olcModuleLoad
+          olcModuleLoad: ppolicy
 
-    - name: 7. Applicazione ServerID e caricamento modulo
+    - name: "7. Applicazione ServerID e caricamento moduli"
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_replication_setup.ldif
       register: setup_module_result
       failed_when:
@@ -154,9 +173,9 @@
         - "'already exists' not in setup_module_result.stderr"
         - "'Type or value exists' not in setup_module_result.stderr"
 
-    - name: 8. Generazione LDIF per attivazione overlay syncprov
+    - name: "8. Generazione LDIF per attivazione overlay (syncprov e ppolicy)"
       copy:
-        dest: /tmp/03_enable_syncprov.ldif
+        dest: /tmp/03_enable_overlays.ldif
         content: |
           dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
           changetype: add
@@ -165,13 +184,56 @@
           olcOverlay: syncprov
           olcSpCheckpoint: 100 10
 
-    - name: 9. Applicazione overlay syncprov
-      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_syncprov.ldif
-      register: syncprov_result
+          dn: olcOverlay=ppolicy,olcDatabase={1}mdb,cn=config
+          changetype: add
+          objectClass: olcOverlayConfig
+          objectClass: olcPPolicyConfig
+          olcOverlay: ppolicy
+          olcPPolicyDefault: cn=passwordDefault,ou=policies,{{ ldap_basedn }}
+          olcPPolicyHashInStorage: TRUE
+
+    - name: "9. Applicazione overlay syncprov e ppolicy"
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
+      register: overlay_result
       failed_when: 
-        - syncprov_result.rc != 0 
-        - "'already in list' not in syncprov_result.stderr"
-        - "'Already exists' not in syncprov_result.stderr"
+        - overlay_result.rc != 0 
+        - "'already in list' not in overlay_result.stderr"
+        - "'Already exists' not in overlay_result.stderr"
+
+    - name: "F2. Generazione LDIF per l'oggetto Password Policy nel DIT"
+      copy:
+        dest: /tmp/01f_ppolicy_object.ldif
+        content: |
+          dn: ou=policies,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: policies
+
+          dn: cn=passwordDefault,ou=policies,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: namedObject
+          objectClass: pwdPolicy
+          cn: passwordDefault
+          pwdAttribute: userPassword
+          pwdCheckQuality: 0
+          pwdInHistory: 5
+          pwdMaxAge: 7776000
+          pwdExpireWarning: 432000
+          pwdMaxFailure: 5
+          pwdFailureCountInterval: 900
+          pwdLockout: TRUE
+          pwdLockoutDuration: 600
+          pwdAllowUserChange: TRUE
+          pwdMinAge: 0
+
+    - name: "F3. Applicazione Oggetto Password Policy nel DIT"
+      shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldap://localhost -f /tmp/01f_ppolicy_object.ldif
+      register: ppolicy_dit_result
+      failed_when:
+        - ppolicy_dit_result.rc != 0
+        - "'Already exists' not in ppolicy_dit_result.stderr"
 
     - name: 10. Generazione LDIF per Syncrepl e MultiProvider (Modificato con Privilegi minimi e Tuning WAN)
       copy:
@@ -224,7 +286,7 @@
         - tuning_result.rc != 0
         - "'Type or value exists' not in tuning_result.stderr"
         - "'attribute OR type already exists' not in tuning_result.stderr"
-          
+
     - name: 12. Generazione LDIF per inizializzazione/aggiornamento del backend cn=Monitor
       copy:
         dest: /tmp/05_monitor.ldif
@@ -242,6 +304,7 @@
         - monitor_result.rc != 0
         - "'Already exists' not in monitor_result.stderr"
         - "'Type or value exists' not in monitor_result.stderr"
+        - "'only one monitor database allowed' not in monitor_result.stderr"     
           
     - name: 14. Configurazione ascolto slapd su tutte le interfacce di rete
       lineinfile:
