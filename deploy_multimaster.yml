@@ -1,0 +1,153 @@
+---
+- name: Configurazione Cluster OpenLDAP Multi-Master a 3 vie (Modern N-Way)
+  hosts: cluster
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+
+  tasks:
+    - name: 1. Installazione di OpenLDAP e utility client
+      apt:
+        name:
+          - slapd
+          - ldap-utils
+        state: present
+        update_cache: yes
+
+    - name: 2. Configurazione dei parametri di default in /etc/ldap/ldap.conf
+      blockinfile:
+        path: /etc/ldap/ldap.conf
+        block: |
+          BASE    {{ ldap_basedn }}
+          URI     ldap://localhost
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
+
+    - name: 3. Configurazione della password di Root in formato SSHA
+      shell: slappasswd -s {{ ldap_rootpw }}
+      register: ldap_hashed_pw
+      changed_when: false
+
+    - name: 4. Creazione del file LDIF per la configurazione del Database base
+      copy:
+        dest: /tmp/01_db_init.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSuffix
+          olcSuffix: {{ ldap_basedn }}
+          -
+          replace: olcRootDN
+          olcRootDN: {{ ldap_rootdn }}
+          -
+          replace: olcRootPW
+          olcRootPW: {{ ldap_hashed_pw.stdout }}
+
+    - name: 5. Applicazione configurazione Database di base
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_db_init.ldif
+      register: db_init_result
+      failed_when: "'ERR' in db_init_result.stderr and 'Duplicate' not in db_init_result.stderr"
+
+    - name: 6. Generazione LDIF per ServerID e caricamento modulo syncprov
+      copy:
+        dest: /tmp/02_replication_setup.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 1 ldap://ubuntu24lts1.example.com
+          olcServerID: 2 ldap://ubuntu24lts2.example.com
+          olcServerID: 3 ldap://ubuntu24lts3.example.com
+
+          dn: cn=module{0},cn=config
+          changetype: modify
+          add: olcModuleLoad
+          olcModuleLoad: syncprov
+
+    - name: 7. Applicazione ServerID e caricamento modulo
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_replication_setup.ldif
+      register: setup_module_result
+      failed_when:
+        - setup_module_result.rc != 0
+        - "'already exists' not in setup_module_result.stderr"
+        - "'Type or value exists' not in setup_module_result.stderr"
+
+    - name: 8. Generazione LDIF per attivazione overlay syncprov
+      copy:
+        dest: /tmp/03_enable_syncprov.ldif
+        content: |
+          dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+          changetype: add
+          objectClass: olcOverlayConfig
+          objectClass: olcSyncProvConfig
+          olcOverlay: syncprov
+          olcSpCheckpoint: 100 10
+
+    - name: 9. Applicazione overlay syncprov
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_syncprov.ldif
+      register: syncprov_result
+      failed_when: 
+        - syncprov_result.rc != 0 
+        - "'already in list' not in syncprov_result.stderr"
+        - "'Already exists' not in syncprov_result.stderr"
+
+    - name: 10. Generazione LDIF per Syncrepl e MultiProvider (N-Way Dinamico)
+      copy:
+        dest: /tmp/04_multimaster.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSyncRepl
+          {% if ansible_facts['fqdn'] != 'ubuntu24lts1.example.com' %}
+          olcSyncRepl: rid=001 provider=ldap://ubuntu24lts1.example.com bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 300 5" timeout=1
+          {% endif %}
+          {% if ansible_facts['fqdn'] != 'ubuntu24lts2.example.com' %}
+          olcSyncRepl: rid=002 provider=ldap://ubuntu24lts2.example.com bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 300 5" timeout=1
+          {% endif %}
+          {% if ansible_facts['fqdn'] != 'ubuntu24lts3.example.com' %}
+          olcSyncRepl: rid=003 provider=ldap://ubuntu24lts3.example.com bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 300 5" timeout=1
+          {% endif %}
+          -
+          replace: olcMultiProvider
+          olcMultiProvider: TRUE
+
+    - name: 11. Applicazione configurazione Syncrepl e MultiProvider
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/04_multimaster.ldif
+      register: multimaster_result
+      failed_when: >
+        multimaster_result.rc != 0 and
+        'Already exists' not in multimaster_result.stderr and
+        'Duplicate' not in multimaster_result.stderr and
+        'typeIsCritical' not in multimaster_result.stderr and
+        'Type or value exists' not in multimaster_result.stderr
+
+    - name: 12. Generazione LDIF per attivazione del backend cn=Monitor
+      copy:
+        dest: /tmp/05_monitor.ldif
+        content: |
+          dn: olcDatabase={2}monitor,cn=config
+          changetype: add
+          objectClass: olcDatabaseConfig
+          olcDatabase: {2}monitor
+          olcAccess: {0}to * by dn.base="cn=admin,dc=example,dc=com" read by * none
+
+    - name: 13. Applicazione configurazione backend cn=Monitor
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
+      register: monitor_result
+      failed_when:
+        - monitor_result.rc != 0
+        - "'Already exists' not in monitor_result.stderr"
+
+    - name: 14. Configurazione ascolto slapd su tutte le interfacce di rete
+      lineinfile:
+        path: /etc/default/slapd
+        regexp: '^SLAPD_SERVICES='
+        line: 'SLAPD_SERVICES="ldap:/// ldapi:///"'
+      notify: Riavvia Slapd
+
+  handlers:
+    - name: Riavvia Slapd
+      service:
+        name: slapd
+        state: restarted
