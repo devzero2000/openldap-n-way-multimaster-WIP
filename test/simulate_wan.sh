@@ -15,7 +15,7 @@ IFACE="eth1"
 LATENCY="120ms"      # Latenza tipica tra stati/coast remoti
 JITTER="15ms"       # Fluttuazione della latenza (varianza)
 LOSS="0.5%"         # Percentuale di pacchetti persi (instabilità WAN)
-LOSS="5%"         # Percentuale di pacchetti persi (instabilità WAN) # molto alta
+#LOSS="5%"         # Percentuale di pacchetti persi (instabilità WAN) # molto alta
 BANDWIDTH="10mbit"  # Strozzatura della banda per simulare link saturo
 
 # Funzione di pulizia per resettare le regole in modo sicuro
