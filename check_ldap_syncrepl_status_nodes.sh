@@ -65,7 +65,7 @@ printf "[TEST 1/3] Verifica consistenza: ubuntu24lts2 <-- ubuntu24lts1...\n"
     -P "$ADMIN_PW" \
     -S "$BASE_DN" \
     -I "002" -w 10 -c 15
-
+printf "\n"
 # ------------------------------------------------------------------------------
 # TEST 2: Verifica accoppiata Nodo 3 rispetto al Nodo 2 (Replica ID: 003)
 # ------------------------------------------------------------------------------
@@ -77,7 +77,7 @@ printf "[TEST 2/3] Verifica consistenza: ubuntu24lts3 <-- ubuntu24lts2...\n"
     -P "$ADMIN_PW" \
     -S "$BASE_DN" \
     -I "003" -w 10 -c 15
-
+printf "\n"
 # ------------------------------------------------------------------------------
 # TEST 3: Verifica accoppiata Nodo 1 rispetto al Nodo 3 (Replica ID: 001)
 # ------------------------------------------------------------------------------
@@ -89,6 +89,6 @@ printf "[TEST 3/3] Verifica consistenza: ubuntu24lts1 <-- ubuntu24lts3...\n"
     -P "$ADMIN_PW" \
     -S "$BASE_DN" \
     -I "001" -w 10 -c 15
-
-printf "\n=====================================================================\n"
+printf "\n"
+printf "=====================================================================\n"
 printf "[OK] Ciclo di monitoraggio completato. Tutti i nodi sono coerenti.\n"
