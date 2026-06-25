@@ -34,6 +34,23 @@
 #    - 10s <= Delta <= 15s: Ritorna Exit Code 1 (WARNING). La replica accumula lag.
 #    - Delta > 15s (-c 15) o Fallimento: Ritorna Exit Code 2 (CRITICAL).
 #      Cluster desincronizzato o canale di comunicazione interrotto.
+#
+# 5. CONSIDERAZIONI DI TUNING ENTERPRISE (CALIBRAZIONE SOGLIE WAN VS LAN):
+#    - Le vecchie soglie (W:10s / C:15s) sono fortemente PESSIMISTE e inadatte a una
+#   produzione geografica. Genererebbero falsi positivi a causa della fisica del link.
+#   - Su WAN interstatale ad alta latenza (>120ms) e packet loss fisiologico (0.1% - 1%):
+#    1. Il TCP Retransmission Timeout (RTO) può far slittare una singola sync di qualche secondo.
+#    2. La replica syncrepl è ASINCRONA: un accodamento dovuto a modifiche massive (burst)
+#      è normale e non indica un guasto, ma solo smaltimento del carico nel buffer MDB.
+#    3. La soglia Critical deve essere agganciata al timer massimo di retry di slapd (300s).
+#
+# TARATURA SCELTA PER PRODUZIONE GEOGRAFICA:
+#   - WARNING:  60 secondi  -> Tollera burst applicativi e micro-congestioni di rete.
+#   - CRITICAL: 300 secondi -> Allerta l'operatore solo se il thread fallisce i tentativi
+#                              ed entra nello scalino di blocco permanente dei 5 minuti.
+#
+#
+#
 # ==============================================================================
 
 set -eu
