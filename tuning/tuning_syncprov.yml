@@ -1,0 +1,25 @@
+---
+- name: "LDAP Tuning 2/3: Ottimizzazione dell'Overlay SyncProv"
+  hosts: cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+
+  # Risoluzione automatica della dipendenza Python per il modulo LDAP
+  pre_tasks:
+    - name: "Garantisce la presenza della libreria python3-ldap per l'esecuzione dei moduli"
+      ansible.builtin.apt:
+        name: 
+          - python3-ldap
+        state: present
+        update_cache: yes
+
+  tasks:
+    - name: "Configurazione della Sessionlog e dei Checkpoint su SyncProv"
+      community.general.ldap_attrs:
+        dn: "olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcSpSessionlog: "5000"
+          olcSpCheckpoint: "100 10"
+        state: exact
+        server_uri: "ldapi:///"

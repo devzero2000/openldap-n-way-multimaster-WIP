@@ -1,0 +1,21 @@
+# Modifica alla configurazione di syncrepl per i nodi del cluster
+dn: olcDatabase={1}mdb,cn=config
+changetype: modify
+replace: olcSyncrepl
+olcSyncrepl: {0}rid=001 provider=ldap://ubuntu24lts1.example.com:389
+  binddn="cn=nwayreplicator,ou=system,dc=example,dc=com"
+  bindmethod=simple credentials=nwayreplicator
+  searchbase="dc=example,dc=com"
+  type=refreshAndPersist
+  retry="5 5 10 10 30 30 60 +"
+  timeout=30
+  network-timeout=15
+  keepalive=240:4:15
+#
+#Spiegazione del Tuning:
+
+#network-timeout=15 e timeout=30: Forza il client di replica ad attendere al massimo 15 secondi per l'handshake TCP iniziale e 30 secondi per la risposta applicativa a una query di sincronizzazione. Evita che un pacchetto perso congeli il thread all'infinito.
+
+#keepalive=240:4:15 (Fondamentale per la WAN): Questo parametro mappa direttamente i Keepalive TCP del kernel. Dice al sistema di inviare un probe di controllo dopo 240 secondi di inattività, ripetendo il controllo per 4 volte ogni 15 secondi se non riceve risposta. Se il link cade o i pacchetti si perdono, il socket orfano viene abbattuto e rigenerato subito, impedendo l'errore connection_read: no connection!.
+
+#retry="5 5 10 10 30 30 60 +": Rende il recupero iniziale molto più aggressivo prima di entrare nello scalino di attesa lungo dei 5 minuti.

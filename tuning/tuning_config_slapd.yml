@@ -1,0 +1,34 @@
+---
+- name: "LDAP Tuning 1/3: Ottimizzazione parametri Syncrepl per WAN"
+  hosts: cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ldap_basedn: "dc=example,dc=com"
+    cluster_providers:
+      ubuntu24lts1.example.com:
+        - "rid=002 provider=ldap://ubuntu24lts2.example.com:389 binddn=\"cn=nwayreplicator,ou=system,{{ ldap_basedn }}\" bindmethod=simple credentials=nwayreplicator searchbase=\"{{ ldap_basedn }}\" type=refreshAndPersist retry=\"5 5 10 10 30 30 60 +\" timeout=30 network-timeout=15 keepalive=240:4:15"
+        - "rid=003 provider=ldap://ubuntu24lts3.example.com:389 binddn=\"cn=nwayreplicator,ou=system,{{ ldap_basedn }}\" bindmethod=simple credentials=nwayreplicator searchbase=\"{{ ldap_basedn }}\" type=refreshAndPersist retry=\"5 5 10 10 30 30 60 +\" timeout=30 network-timeout=15 keepalive=240:4:15"
+      ubuntu24lts2.example.com:
+        - "rid=001 provider=ldap://ubuntu24lts1.example.com:389 binddn=\"cn=nwayreplicator,ou=system,{{ ldap_basedn }}\" bindmethod=simple credentials=nwayreplicator searchbase=\"{{ ldap_basedn }}\" type=refreshAndPersist retry=\"5 5 10 10 30 30 60 +\" timeout=30 network-timeout=15 keepalive=240:4:15"
+        - "rid=003 provider=ldap://ubuntu24lts3.example.com:389 binddn=\"cn=nwayreplicator,ou=system,{{ ldap_basedn }}\" bindmethod=simple credentials=nwayreplicator searchbase=\"{{ ldap_basedn }}\" type=refreshAndPersist retry=\"5 5 10 10 30 30 60 +\" timeout=30 network-timeout=15 keepalive=240:4:15"
+      ubuntu24lts3.example.com:
+        - "rid=001 provider=ldap://ubuntu24lts1.example.com:389 binddn=\"cn=nwayreplicator,ou=system,{{ ldap_basedn }}\" bindmethod=simple credentials=nwayreplicator searchbase=\"{{ ldap_basedn }}\" type=refreshAndPersist retry=\"5 5 10 10 30 30 60 +\" timeout=30 network-timeout=15 keepalive=240:4:15"
+        - "rid=002 provider=ldap://ubuntu24lts2.example.com:389 binddn=\"cn=nwayreplicator,ou=system,{{ ldap_basedn }}\" bindmethod=simple credentials=nwayreplicator searchbase=\"{{ ldap_basedn }}\" type=refreshAndPersist retry=\"5 5 10 10 30 30 60 +\" timeout=30 network-timeout=15 keepalive=240:4:15"
+
+  pre_tasks:
+    - name: "Aggiorna la cache apt e installa la libreria python3-ldap richiesta"
+      ansible.builtin.apt:
+        name: 
+          - python3-ldap
+        state: present
+        update_cache: yes
+
+  tasks:
+    - name: "Applicazione configurazione olcSyncrepl asimmetrica a caldo"
+      community.general.ldap_attrs:
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcSyncrepl: "{{ cluster_providers[ansible_facts['fqdn']] }}"
+        state: exact
+        server_uri: "ldapi:///"
