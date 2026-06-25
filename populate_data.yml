@@ -1,0 +1,136 @@
+---
+- name: Popolamento dati avanzato con Sovrascrittura Idempotente (ldapmodify)
+  hosts: ubuntu24lts1.example.com
+  become: false
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+    
+    fictional_groups:
+      - developers
+      - operators
+      - managers
+      - auditors
+      - analysts
+
+  tasks:
+    - name: "1. Generazione file LDIF Strutturale (Radice e OU)"
+      copy:
+        dest: /tmp/01_structure.ldif
+        content: |
+          dn: {{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: dcObject
+          objectClass: organization
+          o: Example Inc.
+          dc: example
+
+          dn: ou=People,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: People
+
+          dn: ou=Groups,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: Groups
+
+          dn: cn=mainstaff,ou=Groups,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: posixGroup
+          cn: mainstaff
+          gidNumber: 200
+
+    - name: "2. Applicazione Struttura di Base (Tollera se già presenti)"
+      shell: ldapmodify -c -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldap://localhost -f /tmp/01_structure.ldif
+      register: struct_result
+      failed_when:
+        - struct_result.rc != 0
+        - "'Already exists' not in struct_result.stderr"
+
+    - name: "3. Generazione file LDIF per inserimento/aggiornamento Utenti"
+      copy:
+        dest: /tmp/02_users_upsert.ldif
+        content: |
+          {% for i in range(1, 11) %}
+          {% set pad = "%02d" | format(i) %}
+          dn: uid=user{{ pad }},ou=People,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: person
+          objectClass: organizationalPerson
+          objectClass: inetOrgPerson
+          objectClass: posixAccount
+          objectClass: shadowAccount
+          cn: Utente Esempio {{ pad }}
+          sn: Esempio {{ pad }}
+          uid: user{{ pad }}
+          uidNumber: {{ 2000 + i }}
+          gidNumber: 200
+          homeDirectory: /home/user{{ pad }}
+          loginShell: /bin/bash
+          userPassword: user{{ pad }}password
+
+          {% endfor %}
+
+    - name: "4. Esecuzione inserimento Utenti (ldapadd nativo)"
+      shell: ldapadd -c -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldap://localhost -f /tmp/02_users_upsert.ldif
+      register: add_users_result
+      changed_when: "'adding new entry' in add_users_result.stdout"
+      failed_when: 
+        - add_users_result.rc != 0
+        - "'Already exists' not in add_users_result.stderr"
+
+    - name: "5. FORZATURA SICUREZZA: Generazione hash SSHA a monte delle password"
+      shell: "slappasswd -s user{{ '%02d' | format(item) }}password"
+      loop: "{{ range(1, 11) | list }}"
+      register: user_hashes
+      changed_when: false
+
+    - name: "5b. Generazione file LDIF Sanato con Password già Hashate"
+      copy:
+        dest: /tmp/03_users_sanitize.ldif
+        content: |
+          {% for res in user_hashes.results %}
+          {% set pad = "%02d" | format(res.item | int) %}
+          dn: uid=user{{ pad }},ou=People,{{ ldap_basedn }}
+          changetype: modify
+          replace: gidNumber
+          gidNumber: 200
+          -
+          replace: userPassword
+          userPassword: {{ res.stdout | trim }}
+
+          {% endfor %}
+
+    - name: "6. Applicazione Sanatoria con Hash Nativo (Sicurezza Certificata)"
+      shell: ldapmodify -c -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldap://localhost -f /tmp/03_users_sanitize.ldif
+
+    - name: "7. Generazione file LDIF per i 5 Gruppi di Fantasia"
+      copy:
+        dest: /tmp/04_groups_upsert.ldif
+        content: |
+          {% for group in fictional_groups %}
+          dn: cn={{ group }},ou=Groups,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: groupOfNames
+          cn: {{ group }}
+          {% for u in range(1, 11) %}
+          {% set upad = "%02d" | format(u) %}
+          member: uid=user{{ upad }},ou=People,{{ ldap_basedn }}
+          {% endfor %}
+
+          {% endfor %}
+
+    - name: "8. Applicazione e sovrascrittura dei Gruppi di Fantasia"
+      shell: ldapmodify -c -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldap://localhost -f /tmp/04_groups_upsert.ldif
+      register: groups_result
+      failed_when:
+        - groups_result.rc != 0
+        - "'Already exists' not in groups_result.stderr"
