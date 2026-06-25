@@ -1,0 +1,67 @@
+---
+- name: "LDAP Stress Test: Scrittura distribuita e verifica convergenza N-Way"
+  hosts: cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ldap_basedn: "dc=example,dc=com"
+    ldap_bind_pw: "openldap"
+    bind_dn: "cn=admin,{{ ldap_basedn }}"
+    target_dn: "cn=test-{{ inventory_hostname }},{{ ldap_basedn }}"
+    unique_description: "Stato OK - Propagato originariamente da {{ inventory_hostname }}"
+
+  pre_tasks:
+    - name: "Garantisce la presenza della libreria python3-ldap"
+      ansible.builtin.apt:
+        name: python3-ldap
+        state: present
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # FASE 1: CREAZIONE/AGGIORNAMENTO DELLA ENTRY PROPRIETARIA DI CIASCUN NODO
+    # --------------------------------------------------------------------------
+    - name: "Fase 1: Creazione della entry di test specifica per il nodo"
+      community.general.ldap_entry:
+        dn: "{{ target_dn }}"
+        objectClass:
+          - top
+          - device
+        attributes:
+          description: "{{ unique_description }}"
+        server_uri: "ldap://127.0.0.1:389"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ ldap_bind_pw }}"
+      register: ldap_res
+
+    # Pausa tecnica per consentire la convergenza su WAN asincrona
+    - name: "Pausa di convergenza per il link WAN"
+      ansible.builtin.pause:
+        seconds: 5
+      when: ldap_res.changed
+
+    # --------------------------------------------------------------------------
+    # FASE 2: VERIFICA DI CONVERGENZA CROCIATA DI TUTTI GLI HOST VIA FILTRO
+    # --------------------------------------------------------------------------
+    # Usiamo il DN di base globale e filtriamo per l'oggetto comune, evitando il crash
+    - name: "Verifica locale delle entry di test complessive nel cluster"
+      community.general.ldap_search:
+        dn: "{{ ldap_basedn }}"
+        scope: onelevel
+        filter: "(cn=test-*)"
+        server_uri: "ldap://127.0.0.1:389"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ ldap_bind_pw }}"
+      register: cluster_search
+
+    # --------------------------------------------------------------------------
+    # FASE 3: ASSERZIONE FINALE (Verifica la presenza di tutti e tre i record)
+    # --------------------------------------------------------------------------
+    - name: "Validazione dell'integrità dell'anello Multi-Master"
+      ansible.builtin.assert:
+        that:
+          # Controlliamo che l'output contenga esattamente i tre record degli host distinti
+          - "cluster_search.results | selectattr('dn', 'search', 'cn=test-ubuntu24lts1') | list | length > 0"
+          - "cluster_search.results | selectattr('dn', 'search', 'cn=test-ubuntu24lts2') | list | length > 0"
+          - "cluster_search.results | selectattr('dn', 'search', 'cn=test-ubuntu24lts3') | list | length > 0"
+        fail_msg: "CRITICAL: Mancata convergenza! Uno o più nodi non hanno ricevuto le modifiche degli altri via WAN."
+        success_msg: "SUCCESS: Ciascun nodo vede localmente tutte e tre le entry del cluster. Sincronizzazione totale OK."
