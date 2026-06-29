@@ -1,0 +1,84 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-24.04"
+
+  # Mappatura dei nodi con i rispettivi IP
+  nodes = {
+    "ubuntu24lts1" => "192.168.1.16",
+    "ubuntu24lts2" => "192.168.1.17",
+    "ubuntu24lts3" => "192.168.1.18"
+  }
+
+  nodes.each_with_index do |(hostname, ip), index|
+    config.vm.define hostname do |node|
+      
+      node.vm.hostname = "#{hostname}.example.com"
+      node.vm.provider "vmware_desktop" do |v|
+        v.gui = false
+        v.vmx["memsize"] = "2048"
+        v.vmx["numvcpus"] = "1"
+      end
+
+      # Rete Bridged
+      node.vm.network "public_network", ip: ip, bridge: "eth0"
+
+      # Provisioning unico per privilegi, rete, Ansible e SSH mesh
+      node.vm.provision "shell", inline: <<-SHELL
+        export DEBIAN_FRONTEND=noninteractive
+        
+        # 1. Privilegi Sudo passwordless
+        echo "vagrant ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-vagrant
+        chmod 440 /etc/sudoers.d/90-vagrant
+
+        # 2. Configurazione locale di /etc/hosts per la risoluzione dei nomi
+        # Inserisce gli IP e gli hostname di tutto il cluster eliminando eventuali duplicati vecchi
+        echo -e "\n# Configurazione Cluster Ansible" >> /etc/hosts
+        echo "192.168.1.16 ubuntu24lts1.example.com ubuntu24lts1" >> /etc/hosts
+        echo "192.168.1.17 ubuntu24lts2.example.com ubuntu24lts2" >> /etc/hosts
+        echo "192.168.1.18 ubuntu24lts3.example.com ubuntu24lts3" >> /etc/hosts
+
+        # 3. Configurazione SSH chiavi incrociate
+        if [ ! -f /home/vagrant/.ssh/id_rsa ]; then
+          sudo -u vagrant ssh-keygen -t rsa -N "" -f /home/vagrant/.ssh/id_rsa
+        fi
+
+        # Condivisione della chiave pubblica via cartella temporanea
+        mkdir -p /vagrant/.cluster_keys
+        cp /home/vagrant/.ssh/id_rsa.pub /vagrant/.cluster_keys/#{hostname}.pub
+        chown vagrant:vagrant /vagrant/.cluster_keys/#{hostname}.pub
+
+        # 4. Installazione Ansible da PPA
+        apt-get update -y
+        apt-get install -y software-properties-common
+        apt-add-repository --yes --update ppa:ansible/ansible
+        apt-get install -y ansible
+
+        # 5. Configurazione dell'inventario Ansible locale
+        echo -e "[cluster]\nubuntu24lts1.example.com\nubuntu24lts2.example.com\nubuntu24lts3.example.com" > /etc/ansible/hosts
+      SHELL
+    end
+  end
+
+  # Secondo stage di provisioning: viene eseguito SOLO quando tutte le chiavi pubbliche sono pronte
+  nodes.each do |hostname, ip|
+    config.vm.define hostname do |node|
+      node.vm.provision "shell", run: "always", inline: <<-SHELL
+        # Popola l'authorized_keys con le chiavi di tutte e 3 le macchine
+        cat /vagrant/.cluster_keys/*.pub >> /home/vagrant/.ssh/authorized_keys
+        
+        # Rimuove i duplicati e sistema i permessi
+        sort -u /home/vagrant/.ssh/authorized_keys -o /home/vagrant/.ssh/authorized_keys
+        chown vagrant:vagrant /home/vagrant/.ssh/authorized_keys
+        chmod 600 /home/vagrant/.ssh/authorized_keys
+
+        # Disabilita il StrictHostKeyChecking per evitare il prompt "yes/no"
+        echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/vagrant/.ssh/config
+        echo -e "Host *.example.com\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/vagrant/.ssh/config
+        chown vagrant:vagrant /home/vagrant/.ssh/config
+        chmod 600 /home/vagrant/.ssh/config
+      SHELL
+    end
+  end
+end
