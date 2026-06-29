@@ -98,7 +98,8 @@
           changetype: modify
           replace: olcAccess
           olcAccess: {0}to attrs=userPassword by self write by group.exact="{{ ldap_admin_group }}" write by dn.exact="{{ ldap_rootdn }}" write by * auth
-          olcAccess: {1}to dn.subtree="{{ ldap_basedn }}" by group.exact="{{ ldap_admin_group }}" write by dn.exact="{{ ldap_rootdn }}" write by self read by users read by * none
+          olcAccess: {1}to attrs=shadowLastChange by self write by * read
+          olcAccess: {2}to dn.subtree="{{ ldap_basedn }}" by group.exact="{{ ldap_admin_group }}" write by dn.exact="{{ ldap_rootdn }}" write by self read by users read by * none
 
     - name: D. [NUOVO] Applicazione ACL Globali
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01c_acl_init.ldif
