@@ -1,0 +1,117 @@
+# ==============================================================================
+# TITOLO:       Ottimizzazione e Tuning Performance OpenLDAP (cn=config)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.1
+# SCOPO:        Ottimizzare OpenLDAP (Back-MDB) per reggere carichi intensivi
+#               di autenticazione (500 utenti/s) e query sui gruppi (500 q/s).
+#               Configura indici critici, pool di thread e overlay memberOf.
+#
+# COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (N-Way Multi-Master Cluster)
+# DIPENDENZE:   Richiede il modulo Python 'python-ldap' sui nodi target.
+#
+# UTILIZZO / ESEMPI DI INVOCAZIONE:
+#
+#   1) Esecuzione Standard (Abilita Ottimizzazioni - Default):
+#      ansible-playbook  tuning_performance.yml
+#
+#   2) Forzare l'Abilitazione (Enable):
+#      ansible-playbook tuning_performance.yml -e "stato=enable"
+#
+#   3) Ripristino dei Default (Disable / Rollback):
+#      ansible-playbook  tuning_performance.yml -e "stato=disable"
+#
+# ==============================================================================
+---
+- name: Ottimizzazione e Configurazione OpenLDAP (cn=config)
+  hosts: cluster
+  become: true
+  vars:
+    stato: "enable"
+    
+    ldap_auth:
+      server_uri: "ldapi:///"
+      sasl_class: "external"
+
+  tasks:
+    # ==========================================
+    # CASO: ABILITAZIONE (stato == "enable")
+    # ==========================================
+    
+    - name: "[ENABLE] Configura i parametri globali di slapd (Threads e Pending)"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "cn=config"
+        attributes:
+          olcThreads: 16
+          olcConnMaxPending: 100
+          olcConnMaxPendingAuth: 50
+        state: exact
+      when: stato == "enable"
+
+    - name: "[ENABLE] Carica il modulo memberof prima di indicizzarlo"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof.la"
+        state: present
+      when: stato == "enable"
+
+    - name: "[ENABLE] Ottimizza MaxSize e Indici sul database mdb"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcDbMaxSize: "2147483648"
+          olcDbIndex:
+            - "objectClass eq"
+            - "uid eq"
+            - "member eq"
+            - "memberUid eq"
+            - "memberOf eq"
+        state: exact
+      when: stato == "enable"
+
+    # ==========================================
+    # CASO: RIPRISTINO (stato == "disable")
+    # ==========================================
+
+    - name: "[DISABLE] Rimuovi i parametri globali per tornare ai default nativi"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "cn=config"
+        attributes:
+          olcThreads: []
+          olcConnMaxPending: []
+          olcConnMaxPendingAuth: []
+        state: absent
+      when: stato == "disable"
+
+    - name: "[DISABLE] Ripristina la dimensione del DB MDB al valore standard"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcDbMaxSize: "1073741824"
+        state: exact
+      when: stato == "disable"
+
+    - name: "[DISABLE] Rimuovi gli indici di ottimizzazione avanzati"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcDbIndex:
+            - "uid eq"
+            - "member eq"
+            - "memberUid eq"
+            - "memberOf eq"
+        state: absent
+      when: stato == "disable"
