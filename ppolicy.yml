@@ -1,0 +1,136 @@
+# ==============================================================================
+# TITOLO:       Configurazione Password Policy (ppolicy) OpenLDAP
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.2
+# SCOPO:        Abilitare l'overlay ppolicy nel cluster OpenLDAP gestendo la
+#               separazione dei privilegi tra cn=config e l'albero dei dati (Fix Error 50).
+# ==============================================================================
+
+---
+- name: Gestione Password Policy OpenLDAP
+  hosts: cluster
+  become: true
+  vars:
+    stato: "enable"
+    suffix: "dc=example,dc=com"
+    
+    # Credenziali per modificare la configurazione dell'infrastruttura (cn=config)
+    ldap_auth_config:
+      server_uri: "ldapi:///"
+      sasl_class: "external"
+
+    # Credenziali per scrivere dentro il database dei dati (dc=example,dc=com)
+    # NOTA: Sostituisci cn=admin con il tuo RootDN e inserisci la password corretta del DB
+    ldap_auth_data:
+      server_uri: "ldapi:///"
+      bind_dn: "cn=admin,dc=example,dc=com"
+      bind_pw: "openldap"
+
+  tasks:
+    # ==========================================================================
+    # PRE-REQUISITI: VERIFICA DIPENDENZE
+    # ==========================================================================
+    
+    - name: "[SETUP] Installa la libreria python3-ldap se non presente"
+      ansible.builtin.apt:
+        name: python3-ldap
+        state: present
+        update_cache: yes
+
+    # ==========================================================================
+    # CASO: ABILITAZIONE (stato == "enable")
+    # ==========================================================================
+    
+    - name: "[ENABLE] Carica il modulo globale ppolicy.la"
+      community.general.ldap_attrs:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "ppolicy.la"
+        state: present
+      when: stato == "enable"
+
+    - name: "[ENABLE] Inizializza e configura l'entry dell'overlay ppolicy sul database mdb"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcPPolicyConfig
+          - olcOverlayConfig
+        attributes:
+          olcOverlay: "ppolicy"
+          olcPPolicyDefault: "cn=default,ou=policies,{{ suffix }}"
+          olcPPolicyForwardUpdates: "FALSE"
+        state: present
+      when: stato == "enable"
+
+    - name: "[ENABLE] Crea l'Unità Organizzativa (OU) per le politiche di sicurezza"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_data.server_uri }}"
+        bind_dn: "{{ ldap_auth_data.bind_dn }}"
+        bind_pw: "{{ ldap_auth_data.bind_pw }}"
+        dn: "ou=policies,{{ suffix }}"
+        objectClass:
+          - top
+          - organizationalUnit
+        attributes:
+          ou: policies
+          description: "Container per le Password Policy di sicurezza"
+        state: present
+      when: stato == "enable"
+
+    - name: "[ENABLE] Configura la entry di Password Policy 'default'"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_data.server_uri }}"
+        bind_dn: "{{ ldap_auth_data.bind_dn }}"
+        bind_pw: "{{ ldap_auth_data.bind_pw }}"
+        dn: "cn=default,ou=policies,{{ suffix }}"
+        objectClass:
+          - top
+          - device
+          - pwdPolicy
+        attributes:
+          cn: default
+          pwdAttribute: userPassword
+          pwdMinLength: 12
+          pwdMaxFailure: 5
+          pwdLockout: "TRUE"
+          pwdLockoutDuration: 1800
+          pwdAllowUserChange: "TRUE"
+          pwdMustChange: "TRUE"
+          pwdInHistory: 5
+        state: present
+      when: stato == "enable"
+
+    # ==========================================================================
+    # CASO: RIPRISTINO (stato == "disable")
+    # ==========================================================================
+
+    - name: "[DISABLE] Rimuovi la entry di Password Policy 'default'"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_data.server_uri }}"
+        bind_dn: "{{ ldap_auth_data.bind_dn }}"
+        bind_pw: "{{ ldap_auth_data.bind_pw }}"
+        dn: "cn=default,ou=policies,{{ suffix }}"
+        state: absent
+      when: stato == "disable"
+
+    - name: "[DISABLE] Rimuovi l'Unità Organizzativa ou=policies"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_data.server_uri }}"
+        bind_dn: "{{ ldap_auth_data.bind_dn }}"
+        bind_pw: "{{ ldap_auth_data.bind_pw }}"
+        dn: "ou=policies,{{ suffix }}"
+        state: absent
+      when: stato == "disable"
+
+    - name: "[DISABLE] Rimuovi l'overlay ppolicy dal database mdb"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
+        state: absent
+      when: stato == "disable"

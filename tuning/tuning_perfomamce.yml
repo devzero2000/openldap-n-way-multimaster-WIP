@@ -2,41 +2,43 @@
 # TITOLO:       Ottimizzazione e Tuning Performance OpenLDAP (cn=config)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.1
-# SCOPO:        Ottimizzare OpenLDAP (Back-MDB) per reggere carichi intensivi
-#               di autenticazione (500 utenti/s) e query sui gruppi (500 q/s).
-#               Configura indici critici, pool di thread e overlay memberOf.
+# VERSIONE:     1.5
+# SCOPO:        Ottimizzare OpenLDAP (Back-MDB) per infrastrutture Cloud ed
+#               ecosistemi di automazione/deploy su 7 stage geografici.
+#               Configura indici, pool di thread e inizializza l'overlay 
+#               memberOf sul DB per supportare le classi di gruppo (Nesting).
 #
 # COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (N-Way Multi-Master Cluster)
-# DIPENDENZE:   Richiede il modulo Python 'python-ldap' sui nodi target.
-#
-# UTILIZZO / ESEMPI DI INVOCAZIONE:
-#
-#   1) Esecuzione Standard (Abilita Ottimizzazioni - Default):
-#      ansible-playbook  tuning_performance.yml
-#
-#   2) Forzare l'Abilitazione (Enable):
-#      ansible-playbook tuning_performance.yml -e "stato=enable"
-#
-#   3) Ripristino dei Default (Disable / Rollback):
-#      ansible-playbook  tuning_performance.yml -e "stato=disable"
-#
+# DIPENDENZE:   Richiega la presenza di 'python3-ldap' (gestita nel SETUP).
 # ==============================================================================
+
 ---
 - name: Ottimizzazione e Configurazione OpenLDAP (cn=config)
   hosts: cluster
   become: true
   vars:
+    # Stato di default: attiva le configurazioni se non diversamente specificato
     stato: "enable"
     
+    # Autenticazione nativa locale tramite Socket Unix (SASL EXTERNAL)
     ldap_auth:
       server_uri: "ldapi:///"
       sasl_class: "external"
 
   tasks:
-    # ==========================================
+    # ==========================================================================
+    # PRE-REQUISITI: INSTALLAZIONE DIPENDENZE
+    # ==========================================================================
+    
+    - name: "[SETUP] Installa la libreria python3-ldap nativa di sistema"
+      ansible.builtin.apt:
+        name: python3-ldap
+        state: present
+        update_cache: yes
+
+    # ==========================================================================
     # CASO: ABILITAZIONE (stato == "enable")
-    # ==========================================
+    # ==========================================================================
     
     - name: "[ENABLE] Configura i parametri globali di slapd (Threads e Pending)"
       community.general.ldap_attrs:
@@ -50,7 +52,7 @@
         state: exact
       when: stato == "enable"
 
-    - name: "[ENABLE] Carica il modulo memberof prima di indicizzarlo"
+    - name: "[ENABLE] Carica il modulo globale memberof"
       community.general.ldap_attrs:
         server_uri: "{{ ldap_auth.server_uri }}"
         sasl_class: "{{ ldap_auth.sasl_class }}"
@@ -60,25 +62,50 @@
         state: present
       when: stato == "enable"
 
+    - name: "[ENABLE] Inizializza l'entry dell'overlay memberOf sul database mdb"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        # FIX: Usiamo ldap_entry con ADD per inserire l'oggetto se non esiste
+        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcMemberOf
+          - olcOverlayConfig
+        attributes:
+          olcOverlay: "memberof"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfRefInt: "TRUE"
+        state: present
+      when: stato == "enable"
+
     - name: "[ENABLE] Ottimizza MaxSize e Indici sul database mdb"
       community.general.ldap_attrs:
         server_uri: "{{ ldap_auth.server_uri }}"
         sasl_class: "{{ ldap_auth.sasl_class }}"
         dn: "olcDatabase={1}mdb,cn=config"
         attributes:
-          olcDbMaxSize: "2147483648"
+          olcDbMaxSize: "4294967296" # Allocazione virtuale di 4GB (Hard Limit per LMDB)
           olcDbIndex:
             - "objectClass eq"
             - "uid eq"
+            - "cn eq,sub"            # Risolve ricerche wildcard sui 30k gruppi nello stage
             - "member eq"
             - "memberUid eq"
-            - "memberOf eq"
+            - "memberOf eq"         # Mappatura virtuale per accelerare i controlli dei Cloud Architect
         state: exact
       when: stato == "enable"
 
-    # ==========================================
+    # ==========================================================================
     # CASO: RIPRISTINO (stato == "disable")
-    # ==========================================
+    # ==========================================================================
+
+    - name: "[DISABLE] Rimuovi l'overlay memberOf dal database mdb"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        state: absent
+      when: stato == "disable"
 
     - name: "[DISABLE] Rimuovi i parametri globali per tornare ai default nativi"
       community.general.ldap_attrs:
@@ -98,7 +125,7 @@
         sasl_class: "{{ ldap_auth.sasl_class }}"
         dn: "olcDatabase={1}mdb,cn=config"
         attributes:
-          olcDbMaxSize: "1073741824"
+          olcDbMaxSize: "1073741824" # Ritorna ad 1GB standard di default
         state: exact
       when: stato == "disable"
 
@@ -110,6 +137,7 @@
         attributes:
           olcDbIndex:
             - "uid eq"
+            - "cn eq,sub"
             - "member eq"
             - "memberUid eq"
             - "memberOf eq"
