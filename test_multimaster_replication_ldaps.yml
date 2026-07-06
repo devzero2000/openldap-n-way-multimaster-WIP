@@ -1,0 +1,117 @@
+---
+- name: Validazione e Test Cluster OpenLDAP Multi-Master 3-Way over LDAPS
+  hosts: cluster
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+    
+    # Parametri TLS per il client di test
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+
+    # Entry di test per verificare la replica
+    test_dn: "cn=tls_test_entry,{{ ldap_basedn }}"
+
+  tasks:
+    # =========================================================================
+    # TEST 1: VERIFICA DELLA CONNESSIOINE LDAPS LOCALE (AUTENTICATA)
+    # =========================================================================
+    - name: "TEST 1: Verifica query LDAPS locale con mTLS (Porta 636)"
+      shell: >
+        LDAPTLS_CACERT={{ ssl_ca_path }}
+        LDAPTLS_CERT={{ ssl_cert_path }}
+        LDAPTLS_KEY={{ ssl_key_path }}
+        ldapsearch -H ldaps://{{ ansible_facts['fqdn'] }}:636
+        -D "{{ ldap_rootdn }}"
+        -w "{{ ldap_rootpw }}"
+        -b "{{ ldap_basedn }}"
+        -s base "objectClass=*" dn
+      register: local_ldaps_result
+      changed_when: false
+
+    - name: "TEST 1 [OUTPUT]: Mostra esito connessione locale protetta"
+      debug:
+        msg: "Connessione LDAPS su {{ ansible_facts['fqdn'] }} RIUSCITA. DN riscontrato: {{ local_ldaps_result.stdout_lines | select('match', '^dn:') | list }}"
+
+    # =========================================================================
+    # TEST 2: INIEZIONE DATI DA NODO 1 E VERIFICA REPLICA SUGLI ALTRI NODI
+    # =========================================================================
+    - name: "TEST 2 [FASE A]: Creazione entry di test su ubuntu24lts1"
+      block:
+        - name: Genera file LDIF temporaneo per il test
+          copy:
+            dest: /tmp/test_replica_entry.ldif
+            # RISOLTO: Utilizzo della sintassi moderna ansible_facts['date_time'] per rimuovere il deprecation warning
+            content: |
+              dn: {{ test_dn }}
+              objectClass: top
+              objectClass: organizationalRole
+              cn: tls_test_entry
+              description: Entry inserita per testare la replica via TLS in data {{ ansible_facts['date_time']['iso8601'] }}
+
+        - name: Applica l'entry su ubuntu24lts1 via LDAPS
+          shell: >
+            LDAPTLS_CACERT={{ ssl_ca_path }}
+            LDAPTLS_CERT={{ ssl_cert_path }}
+            LDAPTLS_KEY={{ ssl_key_path }}
+            ldapadd -H ldaps://ubuntu24lts1.example.com:636
+            -D "{{ ldap_rootdn }}"
+            -w "{{ ldap_rootpw }}"
+            -f /tmp/test_replica_entry.ldif
+          register: insert_result
+          failed_when: 
+            - insert_result.rc != 0
+            - "'Already exists' not in insert_result.stderr"
+      when: ansible_facts['fqdn'] == 'ubuntu24lts1.example.com'
+
+    - name: "TEST 2 [FASE B]: Attesa tecnica per la convergenza della replica (Syncrepl)"
+      pause:
+        seconds: 3
+      run_once: true
+
+    - name: "TEST 2 [FASE C]: Verifica presenza dell'entry replicata via LDAPS su tutti i nodi"
+      shell: >
+        LDAPTLS_CACERT={{ ssl_ca_path }}
+        LDAPTLS_CERT={{ ssl_cert_path }}
+        LDAPTLS_KEY={{ ssl_key_path }}
+        ldapsearch -H ldaps://{{ ansible_facts['fqdn'] }}:636
+        -D "{{ ldap_rootdn }}"
+        -w "{{ ldap_rootpw }}"
+        -b "{{ test_dn }}"
+        -s base "objectClass=*" dn
+      register: replica_search_result
+      until: "'dn: ' in replica_search_result.stdout"
+      retries: 3
+      delay: 2
+      changed_when: false
+
+    - name: "TEST 2 [OUTPUT]: Conferma stato della replica cifrata"
+      debug:
+        msg: "Replica su {{ ansible_facts['fqdn'] }} FUNZIONANTE. Rilevata entry crittografata: {{ replica_search_result.stdout_lines | select('match', '^dn:') | list }}"
+
+    # =========================================================================
+    # PULIZIA FINALE (IDEMPOTENZA)
+    # =========================================================================
+    - name: "PULIZIA: Rimozione dell'entry di test (Solo da ubuntu24lts1, si replicherà il delete)"
+      shell: >
+        LDAPTLS_CACERT={{ ssl_ca_path }}
+        LDAPTLS_CERT={{ ssl_cert_path }}
+        LDAPTLS_KEY={{ ssl_key_path }}
+        ldapdelete -H ldaps://ubuntu24lts1.example.com:636
+        -D "{{ ldap_rootdn }}"
+        -w "{{ ldap_rootpw }}"
+        "{{ test_dn }}"
+      when: ansible_facts['fqdn'] == 'ubuntu24lts1.example.com'
+      register: delete_result
+      failed_when:
+        - delete_result.rc != 0
+        - "'No such object' not in delete_result.stderr"
+
+    - name: Rimuovi il file LDIF temporaneo
+      file:
+        path: /tmp/test_replica_entry.ldif
+        state: absent
+      when: ansible_facts['fqdn'] == 'ubuntu24lts1.example.com'
