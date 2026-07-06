@@ -1,0 +1,110 @@
+# ==============================================================================
+# TITOLO:       Simulazione di Rete WAN MPLS + IPSec via Ansible
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.5
+# SCOPO:        Configurare a livello di Kernel Linux (Traffic Control + Iptables)
+#               una simulazione di latenza, jitter e cap di banda per emulare
+#               un link geografico MPLS protetto da IPSec sulle porte LDAP.
+#               Ottimizzato con variabile interna 'stato' (Default: 'enabled').
+#
+# COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (N-Way Multi-Master Cluster)
+# ==============================================================================
+
+---
+- name: "Configurazione WAN Emulation sul Cluster OpenLDAP"
+  hosts: cluster
+  become: true
+  vars:
+    # Stato di default: ora impostato su "enabled" come richiesto
+    stato: "enabled"
+
+    # Configurazione Interfaccia e Metriche WAN (MPLS + IPSec)
+    iface: "eth1"
+    latency: "50ms"
+    jitter: "2ms"
+    loss: "0.1%"
+    bandwidth: "45mbit"
+    mark_id: "10"
+
+  tasks:
+
+    # ==========================================================================
+    # BLOCCO 1: CLEANUP COMPLETO E IDEMPOTENTE
+    # ==========================================================================
+    
+    - name: "[CLEANUP] Rimuovi la marcatura IPTables per la porta 389"
+      ansible.builtin.iptables:
+        table: mangle
+        chain: POSTROUTING
+        protocol: tcp
+        destination_port: 389
+        jump: MARK
+        state: absent
+
+    - name: "[CLEANUP] Rimuovi la marcatura IPTables per la porta 636"
+      ansible.builtin.iptables:
+        table: mangle
+        chain: POSTROUTING
+        protocol: tcp
+        destination_port: 636
+        jump: MARK
+        state: absent
+
+    - name: "[CLEANUP] Svuota le regole residue orfane nella tabella mangle"
+      ansible.builtin.command: "iptables -t mangle -F POSTROUTING"
+      changed_when: true
+
+    - name: "[CLEANUP] Controlla lo stato delle discipline tc attive sulla scheda"
+      ansible.builtin.command: "tc qdisc show dev {{ iface }}"
+      register: tc_status
+      changed_when: false
+
+    - name: "[CLEANUP] Resetta la radice qdisc di Traffic Control"
+      ansible.builtin.command: "tc qdisc del dev {{ iface }} root"
+      when: "'htb' in tc_status.stdout or 'netem' in tc_status.stdout"
+      failed_when: false
+
+    # ==========================================================================
+    # BLOCCO 2: ATTIVAZIONE WAN SIMULATION (Se lo stato è abilitato)
+    # ==========================================================================
+
+    - name: "[ENABLE] Configura la coda radice HTB su Traffic Control"
+      ansible.builtin.command: "tc qdisc add dev {{ iface }} root handle 1: htb default 1"
+      when: stato in ['enable', 'enabled']
+
+    - name: "[ENABLE] Alloca la banda simmetrica MPLS (Classe 1:10)"
+      ansible.builtin.command: "tc class add dev {{ iface }} parent 1: classid 1:10 htb rate {{ bandwidth }}"
+      when: stato in ['enable', 'enabled']
+
+    - name: "[ENABLE] Applica le metriche di latenza, jitter e loss (Netem)"
+      ansible.builtin.command: "tc qdisc add dev {{ iface }} parent 1:10 handle 10: netem delay {{ latency }} {{ jitter }} loss {{ loss }}"
+      when: stato in ['enable', 'enabled']
+
+    - name: "[ENABLE] Associa il filtro fwmark per intercettare il traffico marcato"
+      ansible.builtin.command: "tc filter add dev {{ iface }} protocol ip parent 1:0 prio 1 handle {{ mark_id }} fw flowid 1:10"
+      when: stato in ['enable', 'enabled']
+
+    - name: "[ENABLE] Applica marcatura IPTables Mangle in uscita sulla porta 389"
+      ansible.builtin.command: "iptables -t mangle -A POSTROUTING -p tcp --dport 389 -j MARK --set-mark {{ mark_id }}"
+      when: stato in ['enable', 'enabled']
+      changed_when: true
+
+    - name: "[ENABLE] Applica marcatura IPTables Mangle in uscita sulla porta 636"
+      ansible.builtin.command: "iptables -t mangle -A POSTROUTING -p tcp --dport 636 -j MARK --set-mark {{ mark_id }}"
+      when: stato in ['enable', 'enabled']
+      changed_when: true
+
+    # ==========================================================================
+    # BLOCCO 3: VERIFICA FINALE DELLO STATO
+    # ==========================================================================
+
+    - name: "[STATUS] Conferma attivazione simulazione"
+      ansible.builtin.debug:
+        msg: "Simulazione WAN MPLS+IPSec CONFIGURATA su {{ iface }}. Latenza: {{ latency }}."
+      when: stato in ['enable', 'enabled']
+
+    - name: "[STATUS] Conferma disattivazione e ripristino LAN"
+      ansible.builtin.debug:
+        msg: "Simulazione WAN RIMOSSA. La rete del cluster è tornata a piena velocità LAN nativa."
+      when: stato in ['disable', 'disabled']
