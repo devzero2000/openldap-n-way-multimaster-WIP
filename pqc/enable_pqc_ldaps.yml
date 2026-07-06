@@ -1,0 +1,105 @@
+---
+- name: Gestione Ciclo di Vita Crittografia Post-Quantum (PQC) su Cluster OpenLDAP
+  hosts: cluster
+  become: true
+  vars:
+    pqc_state: "enable" # Accetta "enable" o "disable"
+
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+
+  tasks:
+    # =========================================================================
+    # BLOCCO 1: CONFIGURAZIONE A LIVELLO OS (OPENSSL.CNF)
+    # =========================================================================
+
+    - name: "[PQC - OS] Abilita i gruppi di scambio chiavi ibridi in OpenSSL"
+      blockinfile:
+        path: /etc/ssl/openssl.cnf
+        insertafter: '^\[default_sect\]'
+        block: |
+          # Forza l'uso prioritario ed esclusivo di scambi chiavi ibridi PQC per TLS 1.3
+          Groups = x25519_kyber768:p256_kyber768:X25519:P-256
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - PQC KEY EXCHANGE GROUPS"
+      notify: Riavvia Slapd
+      when: pqc_state == "enable"
+
+    - name: "[PQC - OS] Disabilita i gruppi di scambio chiavi ibridi in OpenSSL (Ripristino)"
+      blockinfile:
+        path: /etc/ssl/openssl.cnf
+        state: absent
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - PQC KEY EXCHANGE GROUPS"
+      notify: Riavvia Slapd
+      when: pqc_state == "disable"
+
+    # =========================================================================
+    # BLOCCO 2: GENERAZIONE UNICA ED IDEMPOTENTE DEL FILE LDIF
+    # =========================================================================
+
+    - name: "[PQC - SERVICE] Generazione dinamica del file LDIF di transizione crittografica"
+      copy:
+        dest: /tmp/pqc_toggle.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcTLSProtocolMin
+          {% if pqc_state == 'enable' %}
+          olcTLSProtocolMin: 3.3
+          {% else %}
+          olcTLSProtocolMin: 3.2
+          {% endif %}
+
+    - name: "[PQC - SERVICE] Applicazione della configurazione crittografica in cn=config"
+      shell: "ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/pqc_toggle.ldif"
+      register: ldif_apply_result
+      failed_when:
+        - ldif_apply_result.rc != 0
+        - "'Type or value exists' not in ldif_apply_result.stderr"
+      notify: Riavvia Slapd
+
+    - name: Pulizia del file LDIF temporaneo
+      file:
+        path: /tmp/pqc_toggle.ldif
+        state: absent
+
+    # Forza il riavvio immediato per istanziare i nuovi socket TLS prima dei controlli
+    - name: "Forza l'esecuzione dei gestori per rendere effettive le modifiche crittografiche"
+      meta: flush_handlers
+
+    # =========================================================================
+    # BLOCCO 3: VERIFICA AUTOMATIZZATA IN LINEA CON LO STATO IMPOSTATO
+    # =========================================================================
+
+    - name: "[VALIDAZIONE] Esegui un handshake TLS di test per catturare l'esito crittografico"
+      shell: >
+        echo "Q" | openssl s_client -connect 127.0.0.1:636 \
+          -CAfile {{ ssl_ca_path }} \
+          -cert {{ ssl_cert_path }} \
+          -key {{ ssl_key_path }} \
+          2>&1
+      register: test_handshake_result
+      changed_when: false
+
+    - name: "[VALIDAZIONE] Verifica conformità per stato ABILITATO"
+      assert:
+        that:
+          - "'Protocol  : TLSv1.3' in test_handshake_result.stdout"
+          - "('kyber768' in test_handshake_result.stdout) or ('ML-KEM' in test_handshake_result.stdout)"
+        fail_msg: "ERRORE: Lo stato PQC risulta parziale o non abilitato correttamente!"
+        success_msg: "SUCCESSO: Il cluster risponde con i parametri Ibridi Post-Quantum attesi."
+      when: pqc_state == "enable"
+
+    - name: "[VALIDAZIONE] Verifica conformità per stato DISABILITATO"
+      assert:
+        that:
+          - "not (('kyber768' in test_handshake_result.stdout) or ('ML-KEM' in test_handshake_result.stdout))"
+        fail_msg: "ERRORE: Gli algoritmi PQC sono ancora negoziati dal demone slapd!"
+        success_msg: "SUCCESSO: Gli algoritmi PQC sono stati rimossi. Ripristinata crittografia classica."
+      when: pqc_state == "disable"
+
+  handlers:
+    - name: Riavvia Slapd
+      service:
+        name: slapd
+        state: restarted
