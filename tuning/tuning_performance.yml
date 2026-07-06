@@ -1,15 +1,14 @@
 # ==============================================================================
-# TITOLO:       Ottimizzazione e Tuning Performance OpenLDAP (cn=config)
+# TITOLO:       Ottimizzazione, Tuning Performance e Nesting OpenLDAP (cn=config)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.5
+# VERSIONE:     1.6
 # SCOPO:        Ottimizzare OpenLDAP (Back-MDB) per infrastrutture Cloud ed
 #               ecosistemi di automazione/deploy su 7 stage geografici.
 #               Configura indici, pool di thread e inizializza l'overlay 
-#               memberOf sul DB per supportare le classi di gruppo (Nesting).
+#               memberOf abilitando il nesting ricorsivo reale dei gruppi.
 #
 # COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (N-Way Multi-Master Cluster)
-# DIPENDENZE:   Richiega la presenza di 'python3-ldap' (gestita nel SETUP).
 # ==============================================================================
 
 ---
@@ -17,8 +16,8 @@
   hosts: cluster
   become: true
   vars:
-    # Stato di default: attiva le configurazioni se non diversamente specificato
-    stato: "enable"
+    # Stato di default: attivato
+    stato: "enabled"
     
     # Autenticazione nativa locale tramite Socket Unix (SASL EXTERNAL)
     ldap_auth:
@@ -37,7 +36,7 @@
         update_cache: yes
 
     # ==========================================================================
-    # CASO: ABILITAZIONE (stato == "enable")
+    # CASO: ABILITAZIONE (stato == "enable" o "enabled")
     # ==========================================================================
     
     - name: "[ENABLE] Configura i parametri globali di slapd (Threads e Pending)"
@@ -50,7 +49,7 @@
           olcConnMaxPending: 100
           olcConnMaxPendingAuth: 50
         state: exact
-      when: stato == "enable"
+      when: stato in ['enable', 'enabled']
 
     - name: "[ENABLE] Carica il modulo globale memberof"
       community.general.ldap_attrs:
@@ -60,23 +59,24 @@
         attributes:
           olcModuleLoad: "memberof.la"
         state: present
-      when: stato == "enable"
+      when: stato in ['enable', 'enabled']
 
-    - name: "[ENABLE] Inizializza l'entry dell'overlay memberOf sul database mdb"
+    - name: "[ENABLE] Inizializza l'entry dell'overlay memberOf con supporto NESTING"
       community.general.ldap_entry:
         server_uri: "{{ ldap_auth.server_uri }}"
         sasl_class: "{{ ldap_auth.sasl_class }}"
-        # FIX: Usiamo ldap_entry con ADD per inserire l'oggetto se non esiste
         dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcMemberOf
           - olcOverlayConfig
         attributes:
           olcOverlay: "memberof"
-          olcMemberOfGroupOC: "groupOfNames"
           olcMemberOfRefInt: "TRUE"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
         state: present
-      when: stato == "enable"
+      when: stato in ['enable', 'enabled']
 
     - name: "[ENABLE] Ottimizza MaxSize e Indici sul database mdb"
       community.general.ldap_attrs:
@@ -84,19 +84,19 @@
         sasl_class: "{{ ldap_auth.sasl_class }}"
         dn: "olcDatabase={1}mdb,cn=config"
         attributes:
-          olcDbMaxSize: "4294967296" # Allocazione virtuale di 4GB (Hard Limit per LMDB)
+          olcDbMaxSize: "4294967296"
           olcDbIndex:
             - "objectClass eq"
             - "uid eq"
-            - "cn eq,sub"            # Risolve ricerche wildcard sui 30k gruppi nello stage
+            - "cn eq,sub"
             - "member eq"
             - "memberUid eq"
-            - "memberOf eq"         # Mappatura virtuale per accelerare i controlli dei Cloud Architect
+            - "memberOf eq"
         state: exact
-      when: stato == "enable"
+      when: stato in ['enable', 'enabled']
 
     # ==========================================================================
-    # CASO: RIPRISTINO (stato == "disable")
+    # CASO: RIPRISTINO (stato == "disable" o "disabled")
     # ==========================================================================
 
     - name: "[DISABLE] Rimuovi l'overlay memberOf dal database mdb"
@@ -105,7 +105,7 @@
         sasl_class: "{{ ldap_auth.sasl_class }}"
         dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
         state: absent
-      when: stato == "disable"
+      when: stato in ['disable', 'disabled']
 
     - name: "[DISABLE] Rimuovi i parametri globali per tornare ai default nativi"
       community.general.ldap_attrs:
@@ -117,7 +117,7 @@
           olcConnMaxPending: []
           olcConnMaxPendingAuth: []
         state: absent
-      when: stato == "disable"
+      when: stato in ['disable', 'disabled']
 
     - name: "[DISABLE] Ripristina la dimensione del DB MDB al valore standard"
       community.general.ldap_attrs:
@@ -125,9 +125,9 @@
         sasl_class: "{{ ldap_auth.sasl_class }}"
         dn: "olcDatabase={1}mdb,cn=config"
         attributes:
-          olcDbMaxSize: "1073741824" # Ritorna ad 1GB standard di default
+          olcDbMaxSize: "1073741824"
         state: exact
-      when: stato == "disable"
+      when: stato in ['disable', 'disabled']
 
     - name: "[DISABLE] Rimuovi gli indici di ottimizzazione avanzati"
       community.general.ldap_attrs:
@@ -142,4 +142,4 @@
             - "memberUid eq"
             - "memberOf eq"
         state: absent
-      when: stato == "disable"
+      when: stato in ['disable', 'disabled']
