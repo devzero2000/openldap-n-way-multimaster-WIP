@@ -1,25 +1,76 @@
+# ==============================================================================
+# TITOLO:       LDAP Tuning 2/3: Ottimizzazione dell'Overlay SyncProv
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.2
+# SCOPO:        Inizializzare e ottimizzare l'overlay SyncProv per la replica
+#               N-Way Multi-Master. Risolve l'errore 32 (No such object) omettendo
+#               gli indici numerici espliciti in fase di ADD.
+# ==============================================================================
+
 ---
 - name: "LDAP Tuning 2/3: Ottimizzazione dell'Overlay SyncProv"
   hosts: cluster
   become: true
   vars:
-    ansible_python_interpreter: /usr/bin/python3
+    stato: "enable"
+    
+    ldap_auth:
+      server_uri: "ldapi:///"
+      sasl_class: "external"
 
-  # Risoluzione automatica della dipendenza Python per il modulo LDAP
-  pre_tasks:
+  tasks:
+    # ==========================================================================
+    # PRE-REQUISITI
+    # ==========================================================================
+    
     - name: "Garantisce la presenza della libreria python3-ldap per l'esecuzione dei moduli"
       ansible.builtin.apt:
-        name: 
-          - python3-ldap
+        name: python3-ldap
         state: present
         update_cache: yes
 
-  tasks:
-    - name: "Configurazione della Sessionlog e dei Checkpoint su SyncProv"
+    # ==========================================================================
+    # CASO: ABILITAZIONE (stato == "enable")
+    # ==========================================================================
+
+    - name: "[ENABLE] Carica il modulo globale syncprov.la"
       community.general.ldap_attrs:
-        dn: "olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config"
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        dn: "cn=module{0},cn=config"
         attributes:
-          olcSpSessionlog: "5000"
+          olcModuleLoad: "syncprov.la"
+        state: present
+      when: stato == "enable"
+
+    - name: "[ENABLE] Inizializza e configura l'overlay syncprov sul database mdb"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        # FIX: Rimosso {0} dal DN. Lasciamo che OpenLDAP indicizzi l'overlay automaticamente
+        dn: "olcOverlay=syncprov,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcSyncProvConfig
+          - olcOverlayConfig
+        attributes:
+          olcOverlay: "syncprov"
+          # Mantiene in RAM le ultime 5000 modifiche per la sincronizzazione rapida (Delta)
+          olcSpSessionlog: 5000
+          # Scrive il punto di controllo su disco ogni 100 operazioni o 10 minuti
           olcSpCheckpoint: "100 10"
-        state: exact
-        server_uri: "ldapi:///"
+        state: present
+      when: stato == "enable"
+
+    # ==========================================================================
+    # CASO: RIPRISTINO (stato == "disable")
+    # ==========================================================================
+
+    - name: "[DISABLE] Rimuovi l'overlay syncprov e i relativi parametri di tuning"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        sasl_class: "{{ ldap_auth.sasl_class }}"
+        # Allineato senza indice anche per la rimozione ordinata
+        dn: "olcOverlay=syncprov,olcDatabase={1}mdb,cn=config"
+        state: absent
+      when: stato == "disable"
