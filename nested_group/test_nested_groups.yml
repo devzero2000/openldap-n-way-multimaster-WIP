@@ -1,0 +1,208 @@
+# ==============================================================================
+# TITOLO:       Automazione Test Gruppi Annidati (Nested Groups) via Ansible
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.1
+# SCOPO:        Iniettare un dataset di test nel ramo 'ou=People' e 'ou=groups',
+#               eseguire una batteria di 4 query autenticate di controllo per
+#               validare la ricorsione di 'memberOf' e gestire lo stato (start/stop).
+#
+# COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (Cluster OpenLDAP N-Way Multi-Master)
+# ==============================================================================
+
+---
+- name: "Test e Validazione dei Nested Groups sul Cluster OpenLDAP"
+  hosts: cluster
+  become: true
+  vars:
+    # Stato del ciclo di vita: 'start' (crea e testa) oppure 'stop' (pulisce)
+    stato: "start"
+
+    suffix: "dc=example,dc=com"
+
+    # Credenziali amministrative obbligatorie per TUTTE le operazioni e le query
+    ldap_auth:
+      server_uri: "ldapi:///"
+      bind_dn: "cn=admin,dc=example,dc=com"
+      bind_pw: "openldap"
+
+  tasks:
+
+    # ==========================================================================
+    # BLOCCO 1: STATO = STOP (PULIZIA EX-POST COERENTE)
+    # ==========================================================================
+
+    - name: "[STOP] Rimuovi il gruppo padre Cloud-Architect"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        state: absent
+      when: stato == "stop"
+
+    - name: "[STOP] Rimuovi il sottogruppo Deploy-Stage1"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        state: absent
+      when: stato == "stop"
+
+    - name: "[STOP] Rimuovi l'utente di test Giovanni Bianchi"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        state: absent
+      when: stato == "stop"
+
+    - name: "[STOP] Rimuovi l'utente di test Mario Rossi"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=mario.rossi,ou=People,{{ suffix }}"
+        state: absent
+      when: stato == "stop"
+
+    # ==========================================================================
+    # BLOCCO 2: STATO = START (POPOLAMENTO DATASET DI TEST)
+    # ==========================================================================
+
+    - name: "[START] Crea l'utente di test: Mario Rossi (Membro del Sottogruppo)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=mario.rossi,ou=People,{{ suffix }}"
+        objectClass:
+          - top
+          - inetOrgPerson
+        attributes:
+          uid: "mario.rossi"
+          cn: "Mario Rossi"
+          sn: "Rossi"
+          userPassword: "{SSHA}d3m0Xdfgklm12345!"
+        state: present
+      when: stato == "start"
+
+    - name: "[START] Crea l'utente di test: Giovanni Bianchi (Membro Diretto del Padre)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        objectClass:
+          - top
+          - inetOrgPerson
+        attributes:
+          uid: "giovanni.bianchi"
+          cn: "Giovanni Bianchi"
+          sn: "Bianchi"
+          userPassword: "{SSHA}d3m0Ydfgklm67890!"
+        state: present
+      when: stato == "start"
+
+    - name: "[START] Crea il Sottogruppo: Deploy-Stage1"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        objectClass:
+          - top
+          - groupOfNames
+        attributes:
+          cn: "Deploy-Stage1"
+          description: "Sottogruppo operativo per il deploy del primo stage"
+          member:
+            - "uid=mario.rossi,ou=People,{{ suffix }}"
+        state: present
+      when: stato == "start"
+
+    - name: "[START] Crea il Gruppo Padre: Cloud-Architect (Nesting)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        objectClass:
+          - top
+          - groupOfNames
+        attributes:
+          cn: "Cloud-Architect"
+          description: "Ruolo Cloud Architect Globale (Contiene utenti e sottogruppi)"
+          member:
+            - "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+            - "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        state: present
+      when: stato == "start"
+
+    # ==========================================================================
+    # BLOCCO 3: BATTERIA DEI 4 TEST DI VALIDAZIONE AUTENTICATI
+    # ==========================================================================
+
+    - name: "[TEST 1/4] Estrai gli utenti (ereditati e diretti) appartenenti a Cloud-Architect"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "ou=People,{{ suffix }}"
+        -s sub "(&(objectClass=inetOrgPerson)(memberOf=cn=Cloud-Architect,ou=groups,{{ suffix }}))" dn
+      register: test_1_res
+      when: stato == "start"
+      changed_when: false
+
+    - name: "[TEST 2/4] Verifica quali utenti appartengono al sottogruppo di base Deploy-Stage1"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "ou=People,{{ suffix }}"
+        -s sub "(&(objectClass=inetOrgPerson)(memberOf=cn=Deploy-Stage1,ou=groups,{{ suffix }}))" dn
+      register: test_2_res
+      when: stato == "start"
+      changed_when: false
+
+    - name: "[TEST 3/4] Ispezione record completo di Mario Rossi per verificare l'attributo virtuale memberOf"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "uid=mario.rossi,ou=People,{{ suffix }}"
+        -s base "(objectClass=*)" memberOf
+      register: test_3_res
+      when: stato == "start"
+      changed_when: false
+
+    - name: "[TEST 4/4] Estrai i membri strutturali dichiarati dentro l'oggetto Cloud-Architect"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        -s base "(objectClass=*)" member
+      register: test_4_res
+      when: stato == "start"
+      changed_when: false
+
+    # ==========================================================================
+    # BLOCCO 4: OUTPUT COMPLETO DEI LOG DI AUDITING
+    # ==========================================================================
+
+    - name: "[REGISTRO] Visualizzazione risultati dei 4 test di conformità"
+      ansible.builtin.debug:
+        msg:
+          - "----------------------------------------------------------------"
+          - "TEST 1: Utenti totali risolti nel ruolo Cloud-Architect (Ereditati + Diretti):"
+          - "{{ test_1_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+          - "TEST 2: Utenti mappati nel sottogruppo operativo Deploy-Stage1:"
+          - "{{ test_2_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+          - "TEST 3: Mapping degli attributi virtuali nel record di Mario Rossi:"
+          - "{{ test_3_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+          - "TEST 4: Membri reali (Raw Object) scritti dentro Cloud-Architect:"
+          - "{{ test_4_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+      when: stato == "start"
