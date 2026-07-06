@@ -256,7 +256,7 @@
       lineinfile:
         path: /etc/default/slapd
         regexp: '^SLAPD_SERVICES='
-        line: 'SLAPD_SERVICES="ldap:/// ldapi:///"'
+        line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
       notify: Riavvia Slapd
 
   handlers:
