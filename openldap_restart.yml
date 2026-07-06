@@ -1,0 +1,45 @@
+# ==============================================================================
+# TITOLO:       Riavvio Controllato del Cluster OpenLDAP (LDAP + LDAPS Check)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.1
+# SCOPO:        Eseguire il restart del servizio slapd su tutti i nodi del cluster
+#               e verificarne l'effettivo stato operativo post-riavvio sia sulla
+#               porta standard 389 che sulla porta sicura 636 (LDAPS).
+# ==============================================================================
+
+---
+- name: "Gestione Cluster: Riavvio OpenLDAP"
+  hosts: cluster
+  become: true
+  gather_facts: false # Velocizza l'esecuzione saltando il recupero dei facts
+
+  tasks:
+    - name: "[RESTART] Riavvia il servizio slapd su tutti i nodi"
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: restarted
+        enabled: yes
+
+    - name: "[VERIFICA] Attendi che OpenLDAP torni in ascolto sulla porta standard 389 (LDAP)"
+      ansible.builtin.wait_for:
+        port: 389
+        delay: 1          # Aspetta 1 secondo prima del primo controllo
+        timeout: 10       # Timeout massimo di 10 secondi per nodo
+        state: started
+
+    - name: "[VERIFICA] Attendi che OpenLDAP torni in ascolto sulla porta sicura 636 (LDAPS)"
+      ansible.builtin.wait_for:
+        port: 636
+        delay: 0          # Controllo immediato sulla porta sicura
+        timeout: 10
+        state: started
+
+    - name: "[VERIFICA] Controlla lo stato del servizio systemd"
+      ansible.builtin.command: "systemctl is-active slapd"
+      register: slapd_status
+      changed_when: false
+
+    - name: "[STATUS] Mostra la conferma visiva dello stato del servizio"
+      ansible.builtin.debug:
+        msg: "Il nodo {{ inventory_hostname }} ha riavviato slapd con successo. Porte 389/636 attive. Stato: {{ slapd_status.stdout }}."
