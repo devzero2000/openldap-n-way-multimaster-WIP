@@ -189,13 +189,13 @@
           changetype: modify
           replace: olcSyncRepl
           {% if ansible_facts['fqdn'] != 'ubuntu24lts1.example.com' %}
-          olcSyncRepl: rid=001 provider=ldap://ubuntu24lts1.example.com bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=15 keepalive=240:4:15
+          olcSyncRepl: rid=001 provider=ldap://ubuntu24lts1.example.com bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15
           {% endif %}
           {% if ansible_facts['fqdn'] != 'ubuntu24lts2.example.com' %}
-          olcSyncRepl: rid=002 provider=ldap://ubuntu24lts2.example.com bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=15 keepalive=240:4:15
+          olcSyncRepl: rid=002 provider=ldap://ubuntu24lts2.example.com bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15
           {% endif %}
           {% if ansible_facts['fqdn'] != 'ubuntu24lts3.example.com' %}
-          olcSyncRepl: rid=003 provider=ldap://ubuntu24lts3.example.com bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=15 keepalive=240:4:15
+          olcSyncRepl: rid=003 provider=ldap://ubuntu24lts3.example.com bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15
           {% endif %}
           -
           replace: olcMultiProvider
