@@ -1,0 +1,62 @@
+---
+- name: Rimozione selettiva di Utenti e Gruppi di Test via LDAPS
+  hosts: ubuntu24lts1.example.com
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+    
+    # Path dei certificati distribuiti sul nodo
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+
+    fictional_groups:
+      - developers
+      - operators
+      - managers
+      - auditors
+      - analysts
+
+  tasks:
+    - name: "1. Generazione file LDIF di rimozione (Cancellazione selettiva)"
+      copy:
+        dest: /tmp/cleanup_entries.ldif
+        content: |
+          # Rimozione Gruppi di Fantasia
+          {% for group in fictional_groups %}
+          dn: cn={{ group }},ou=Groups,{{ ldap_basedn }}
+          changetype: delete
+
+          {% endfor %}
+
+          # Rimozione Gruppo Strutturale mainstaff
+          dn: cn=mainstaff,ou=Groups,{{ ldap_basedn }}
+          changetype: delete
+
+          # Rimozione dei 10 Utenti di Test
+          {% for i in range(1, 11) %}
+          {% set pad = "%02d" | format(i) %}
+          dn: uid=user{{ pad }},ou=People,{{ ldap_basedn }}
+          changetype: delete
+
+          {% endfor %}
+
+    - name: "2. Esecuzione rimozione tramite ldapmodify su canale protetto LDAPS"
+      shell: >
+        LDAPTLS_CACERT={{ ssl_ca_path }}
+        LDAPTLS_CERT={{ ssl_cert_path }}
+        LDAPTLS_KEY={{ ssl_key_path }}
+        ldapmodify -c -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}"
+        -H ldaps://localhost:636 -f /tmp/cleanup_entries.ldif
+      register: cleanup_result
+      # Il parametro -c continua l'esecuzione. Tolleriamo l'errore se l'oggetto è già stato rimosso (errore 32: No such object)
+      failed_when:
+        - cleanup_result.rc != 0
+        - "'No such object' not in cleanup_result.stderr"
+
+    - name: "3. Pulizia file temporaneo LDIF"
+      file:
+        path: /tmp/cleanup_entries.ldif
+        state: absent
