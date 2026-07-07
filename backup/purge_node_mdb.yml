@@ -1,0 +1,75 @@
+# ==============================================================================
+# TITOLO:       Svuotamento Selettivo Database MDB per Riallineamento Nodo
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Ripulisce i file MDB locali di un singolo nodo SPECIFICO e OBBLIGATORIO
+#               senza toccare i binari né la configurazione (cn=config).
+# USAGE:        ansible-playbook purge_node_mdb.yml -e "target_host=ubuntu24lts2.example.com"
+# ==============================================================================
+
+---
+- name: Verifica Vincoli di Sicurezza e Parametri Obbligatori
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "VALIDAZIONE: Verifica che la variabile 'target_host' sia stata definita"
+      fail:
+        msg: >
+          [-] ERRORE BLOCCANTE: Devi specificare un nodo target singolo.
+          Uso corretto: ansible-playbook purge_node_mdb.yml -e "target_host=NOME_NODO"
+      when: target_host is not defined or target_host == 'all' or target_host == ''
+
+- name: Svuotamento MDB Locale per Reset Sincronizzazione (Scenario A)
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    ldap_data_dir: "/var/lib/ldap"
+
+  tasks:
+    - name: "Filtro di Sicurezza - Richiedi conferma definitiva per l'host selezionato"
+      pause:
+        prompt: "[!] ATTENZIONE: Questo playbook azzererà i dati MDB SOLO ed ESCLUSIVAMENTE su {{ inventory_hostname }}. Premere INVIO per confermare o Ctrl+C per abortire."
+
+    - name: 1. Arresto del servizio slapd sul nodo target
+      service:
+        name: slapd
+        state: stopped
+
+    - name: 2. Rimozione fisica dei soli file di database MDB (Dati e Lock)
+      file:
+        path: "{{ ldap_data_dir }}/{{ item }}"
+        state: absent
+      with_items:
+        - "data.mdb"
+        - "lock.mdb"
+
+    - name: 3. Rigenerazione directory dati con permessi hardened (openldap:openldap)
+      file:
+        path: "{{ ldap_data_dir }}"
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: '0700'
+
+    - name: 4. Avvio del servizio slapd
+      service:
+        name: slapd
+        state: started
+
+    - name: 5. Attesa tecnica per l'avvio e l'innesco di Syncrepl
+      pause:
+        seconds: 5
+
+    - name: 6. Verifica dello stato di salute del demone locale
+      command: systemctl is-active slapd
+      register: slapd_status
+      changed_when: false
+      failed_when: slapd_status.rc != 0
+
+    - name: "OUTPUT [INFO]"
+      debug:
+        msg: >
+          [+] Reset completato con successo su {{ ansible_facts['fqdn'] }}.
+          Il motore syncrepl sta scaricando il DIT aggiornato dagli altri nodi sani via LDAPS.
