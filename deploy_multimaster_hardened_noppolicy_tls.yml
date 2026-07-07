@@ -231,10 +231,21 @@
       failed_when:
         - acl_result.rc != 0
 
-    - name: E. Generazione LDIF per OUs di Sistema, Gruppo e Utente Replicator
+    # =========================================================================
+    # INIZIALIZZAZIONE STRUTTURA DEL DIT: SOLO SUL PRIMO NODO (Garantisce UUID identici)
+    # =========================================================================
+
+    - name: E. Generazione LDIF per Entry Base, OUs di Sistema, Gruppo e Utente Replicator
       copy:
         dest: /tmp/01e_bootstrap_dit.ldif
         content: |
+          # 1. Radice Dinamica Universale per lo Schema Core
+          dn: {{ ldap_basedn }}
+          objectClass: top
+          objectClass: domain
+          dc: {{ ldap_basedn.split(',')[0].split('=')[1] }}
+
+          # 2. Struttura e Utenze di Sistema
           dn: ou=system,{{ ldap_basedn }}
           changetype: add
           objectClass: top
@@ -263,13 +274,17 @@
           objectClass: groupOfNames
           cn: administrators
           member: {{ ldap_repl_user }}
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
 
-    - name: F. Applicazione Struttura DIT Iniziale
+    - name: F. Applicazione Struttura DIT Iniziale (Solo sul primo nodo)
       shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
       register: dit_result
       failed_when:
         - dit_result.rc != 0
         - "'Already exists' not in dit_result.stderr"
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
 
     # =========================================================================
     # INIEZIONE PARAMETRI TLS IN cn=config & RIAVVIO STRUTTURALE CLIENT
