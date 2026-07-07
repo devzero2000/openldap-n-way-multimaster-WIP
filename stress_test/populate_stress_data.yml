@@ -1,0 +1,102 @@
+# ==============================================================================
+# TITOLO:       Generatore di Carico Dimensionale per Cluster OpenLDAP
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Generare un dataset reale di 30k utenti con password in formato
+#               hash SSHA calcolato dinamicamente (<uid>.1), 30k gruppi e 40 ruoli.
+#               Fixes: Iniezione automatica delle OU radice (People/groups).
+# ==============================================================================
+
+---
+- name: "Generazione Dataset Massivo per Stress Test"
+  hosts: ubuntu24lts1.example.com
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_path: "/tmp/stress_test_data.ldif"
+    ldap_pw: "openldap"
+
+  tasks:
+    - name: "[TEMPLATING] Genera lo script Python locale per creare l'LDIF massivo"
+      ansible.builtin.copy:
+        dest: /tmp/generate_ldif.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import hashlib
+          import base64
+          import os
+
+          suffix = "{{ suffix }}"
+
+          def make_ssha_password(password_plain):
+              salt = os.urandom(4)
+              ctx = hashlib.sha1(password_plain.encode('utf-8'))
+              ctx.update(salt)
+              ssha_hash = base64.b64encode(ctx.digest() + salt).decode('utf-8')
+              return f"{% raw %}{{SSHA}}{% endraw %}{ssha_hash}"
+
+          with open("{{ ldif_path }}", "w") as f:
+              # FIX STRUTTURALE: Iniezione delle OU contenitore se non create dal bootstrap core
+              f.write(f"dn: ou=People,{suffix}\n")
+              f.write("changetype: add\n")
+              f.write("objectClass: top\nobjectClass: organizationalUnit\n")
+              f.write("ou: People\n\n")
+
+              f.write(f"dn: ou=groups,{suffix}\n")
+              f.write("changetype: add\n")
+              f.write("objectClass: top\nobjectClass: organizationalUnit\n")
+              f.write("ou: groups\n\n")
+
+              # 1. Generazione 30.000 Utenti (Password con Hash SSHA crittografico)
+              for i in range(1, 30001):
+                  username = f"user.{i}"
+                  plain_password = f"{username}.1"
+                  ssha_password = make_ssha_password(plain_password)
+                  
+                  f.write(f"dn: uid={username},ou=People,{suffix}\n")
+                  f.write("changetype: add\n")
+                  f.write("objectClass: top\nobjectClass: inetOrgPerson\n")
+                  f.write(f"uid: {username}\ncn: Test User{i}\nsn: User{i}\n")
+                  f.write(f"userPassword: {ssha_password}\n\n")
+              
+              # 2. Generazione 30.000 Gruppi Periferici (con 10 utenti ciascuno)
+              for i in range(1, 30001):
+                  f.write(f"dn: cn=group.{i},ou=groups,{suffix}\n")
+                  f.write("changetype: add\n")
+                  f.write("objectClass: top\nobjectClass: groupOfNames\n")
+                  f.write(f"cn: group.{i}\ndescription: Gruppo periferico {i}\n")
+                  start_user = ((i * 10) % 30000) + 1
+                  for u in range(start_user, start_user + 10):
+                      f.write(f"member: uid=user.{u if u <= 30000 else u - 30000},ou=People,{suffix}\n")
+                  f.write("\n")
+              
+              # 3. Generazione 40 Gruppi Cloud Architect (con 10.000 sottogruppi ciascuno)
+              for i in range(1, 41):
+                  f.write(f"dn: cn=architect.{i},ou=groups,{suffix}\n")
+                  f.write("changetype: add\n")
+                  f.write("objectClass: top\nobjectClass: groupOfNames\n")
+                  f.write(f"cn: architect.{i}\ndescription: Ruolo Cloud Architect Trasversale {i}\n")
+                  start_group = ((i * 500) % 20000) + 1
+                  for g in range(start_group, start_group + 10000):
+                      f.write(f"member: cn=group.{g},ou=groups,{suffix}\n")
+                  f.write("\n")
+
+    - name: "[EXECUTE] Esegui lo script Python per generare l'LDIF su disco"
+      ansible.builtin.command: python3 /tmp/generate_ldif.py
+      changed_when: true
+
+    - name: "[IMPORT] Inietta il dataset di massa nel cluster OpenLDAP"
+      ansible.builtin.command: >
+        ldapmodify -a -c -H ldapi:/// -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
+      register: ldapadd_res
+      changed_when: true
+      failed_when: "ldapadd_res.rc != 0 and 'Already exists' not in ldapadd_res.stderr"
+
+    - name: "[CLEANUP] Rimuovi i file temporanei di staging"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_ldif.py"
+        - "{{ ldif_path }}"

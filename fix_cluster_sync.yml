@@ -1,0 +1,124 @@
+# ==============================================================================
+# TITOLO:       Sanatoria Cluster Multi-Master (Risolto Path Transfer)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Risolvere il conflitto di replica forzando il database del
+#               primo nodo del cluster come unica sorgente valida.
+# ==============================================================================
+
+---
+- name: "Sanatoria Cluster: Esportazione Master della Verità"
+  hosts: cluster
+  become: true
+  gather_facts: false
+  vars:
+    local_tmp_file: "{{ playbook_dir }}/cluster_master_truth.ldif"
+
+  tasks:
+    - name: "[BACKUP] Genera il dump LDIF pulito dal primo nodo"
+      ansible.builtin.command: "slapcat -b 'dc=example,dc=com' -l /tmp/cluster_master_truth.ldif"
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
+
+    - name: "[FETCH] Scarica il dump dal primo nodo alla macchina Ansible"
+      ansible.builtin.fetch:
+        src: /tmp/cluster_master_truth.ldif
+        dest: "{{ local_tmp_file }}"
+        flat: yes
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
+
+    - name: "[CLEANUP] Rimuovi il file temporaneo remoto dal primo nodo"
+      ansible.builtin.file:
+        path: /tmp/cluster_master_truth.ldif
+        state: absent
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
+
+
+- name: "Sanatoria Cluster: Allineamento Forzato Nodi Corrotti"
+  hosts: cluster
+  become: true
+  gather_facts: false
+  vars:
+    local_tmp_file: "{{ playbook_dir }}/cluster_master_truth.ldif"
+
+  tasks:
+    - name: "[STOP] Ferma il servizio slapd per evitare lock di scrittura"
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: stopped
+      when: inventory_hostname != groups['cluster'][0]
+
+    - name: "[PURGE] Elimina i file del database MDB corrotti"
+      ansible.builtin.file:
+        path: "/var/lib/ldap/{{ item }}"
+        state: absent
+      loop:
+        - data.mdb
+        - lock.mdb
+      when: inventory_hostname != groups['cluster'][0]
+
+    - name: "[TRANSFER] Copia il dump LDIF della verità sul nodo"
+      ansible.builtin.copy:
+        src: "{{ local_tmp_file }}"
+        dest: /tmp/cluster_master_truth.ldif
+        mode: '0600'
+      when: inventory_hostname != groups['cluster'][0]
+
+    - name: "[RESTORE] Inietta il database pulito tramite slapadd"
+      ansible.builtin.command: "slapadd -b 'dc=example,dc=com' -l /tmp/cluster_master_truth.ldif"
+      changed_when: true
+      when: inventory_hostname != groups['cluster'][0]
+
+    - name: "[PERMISSIONS] Ripristina la corretta proprietà dei file"
+      ansible.builtin.file:
+        path: /var/lib/ldap/
+        owner: openldap
+        group: openldap
+        recurse: true
+      when: inventory_hostname != groups['cluster'][0]
+
+    - name: "[CLEANUP] Rimuovi il file LDIF temporaneo remoto"
+      ansible.builtin.file:
+        path: /tmp/cluster_master_truth.ldif
+        state: absent
+      when: inventory_hostname != groups['cluster'][0]
+
+    - name: "[START] Avvia il servizio slapd riallineato"
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: started
+      when: inventory_hostname != groups['cluster'][0]
+
+
+- name: "Sanatoria Cluster: Reset Finale e Pulizia Controller"
+  hosts: cluster
+  become: true
+  gather_facts: false
+  vars:
+    local_tmp_file: "{{ playbook_dir }}/cluster_master_truth.ldif"
+
+  tasks:
+    - name: "[RESTART] Riavvia slapd su tutti i nodi per riallineare i thread di replica"
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: restarted
+
+    - name: "[VERIFICA] Attendi la stabilità dei socket di rete"
+      ansible.builtin.wait_for:
+        port: "{{ item }}"
+        timeout: 10
+        state: started
+      loop:
+        - 389
+        - 636
+
+    - name: "[CLEANUP CONTROLLER] Rimuovi il file temporaneo locale dal Controller"
+      ansible.builtin.file:
+        path: "{{ local_tmp_file }}"
+        state: absent
+      run_once: true
+      delegate_to: localhost
+      become: false

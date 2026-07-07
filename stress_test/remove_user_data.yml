@@ -1,0 +1,61 @@
+# ==============================================================================
+# TITOLO:       Svuotamento Idempotente Dataset di Stress Test
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Rimuovere in blocco i 30k utenti, 30k gruppi e 40 architetti
+#               creati precedentemente, operando su un solo nodo in modo idempotente.
+# ==============================================================================
+
+---
+- name: "Rimozione Massiva e Idempotente del Dataset di Stress Test"
+  hosts: ubuntu24lts1.example.com
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    delete_ldif_path: "/tmp/delete_stress_test_data.ldif"
+    ldap_pw: "openldap"
+
+  tasks:
+    - name: "[TEMPLATING] Genera lo script Python per l'LDIF di cancellazione"
+      ansible.builtin.copy:
+        dest: /tmp/generate_delete_ldif.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          suffix = "{{ suffix }}"
+          
+          with open("{{ delete_ldif_path }}", "w") as f:
+              # 1. Rimozione dei 40 Gruppi Cloud Architect
+              for i in range(1, 41):
+                  f.write(f"dn: cn=architect.{i},ou=groups,{suffix}\n")
+                  f.write("changetype: delete\n\n")
+              
+              # 2. Rimozione dei 30.000 Gruppi Periferici
+              for i in range(1, 30001):
+                  f.write(f"dn: cn=group.{i},ou=groups,{suffix}\n")
+                  f.write("changetype: delete\n\n")
+              
+              # 3. Rimozione dei 30.000 Utenti
+              for i in range(1, 30001):
+                  f.write(f"dn: uid=user.{i},ou=People,{suffix}\n")
+                  f.write("changetype: delete\n\n")
+
+    - name: "[EXECUTE] Genera il file LDIF di sfoltimento su disco"
+      ansible.builtin.command: python3 /tmp/generate_delete_ldif.py
+      changed_when: true
+
+    - name: "[PURGE] Elimina massivamente le entry dal database OpenLDAP"
+      ansible.builtin.command: >
+        ldapmodify -c -H ldapi:/// -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ delete_ldif_path }}"
+      register: ldapdelete_res
+      # Il flag -c di ldapmodify ignora gli errori se gli oggetti sono già stati eliminati (Idempotenza)
+      changed_when: "'deleting entry' in ldapdelete_res.stdout"
+      failed_when: "ldapdelete_res.rc != 0 and 'No such object' not in ldapdelete_res.stderr"
+
+    - name: "[CLEANUP] Rimuovi i file temporanei generati sul nodo"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_delete_ldif.py"
+        - "{{ delete_ldif_path }}"
