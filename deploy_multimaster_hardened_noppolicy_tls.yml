@@ -1,3 +1,11 @@
+# ==============================================================================
+# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 vie (N-Way)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Deploy corazzato e hardened con LDAPS, ottimizzazioni MDB
+#               e inizializzazione del DIT protetta da conflitti di replica.
+# ==============================================================================
+
 ---
 - name: Configurazione Cluster OpenLDAP Multi-Master a 3 vie (Modern N-Way) - HARDENED con LDAPS
   hosts: cluster
@@ -59,7 +67,6 @@
             creates: /tmp/ca.crt
       when: ansible_facts['fqdn'] == ca_server
 
-    # RISOLTO: I cicli sono stati spostati direttamente sui singoli task interni al posto del blocco esterno
     - name: Server Cert - Genera chiave per ciascun nodo del cluster
       command: "openssl genrsa -out /tmp/{{ item }}.key 2048"
       args:
@@ -137,7 +144,7 @@
       run_once: true
 
     # =========================================================================
-    # FASE CLUSTER: LOGICA ORIGINALE RIPRISTINATA E AGGIORNATA
+    # FASE CLUSTER: LOGICA DI CONFIGURAZIONE BASE
     # =========================================================================
 
     - name: 1. Installazione di OpenLDAP e utility client
@@ -199,7 +206,6 @@
           -
           add: olcDisallows
           olcDisallows: bind_anon
-      register: create_anon_ldif
 
     - name: B. Applicazione blocco anonimi
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01b_disable_anon.ldif
@@ -227,10 +233,22 @@
       failed_when:
         - acl_result.rc != 0
 
-    - name: E. Generazione LDIF per OUs di Sistema, Gruppo e Utente Replicator
+    # =========================================================================
+    # SOLUZIONE: CREAZIONE ENTRY RADICE DEL DIT E ALBERATURA INIZIALE
+    # PROTEZIONE DA CONFLITTI: Gira solo sul primo nodo, replica per gli altri.
+    # =========================================================================
+
+    - name: E. Generazione LDIF per Entry Base, OUs di Sistema, Gruppo e Utente Replicator
       copy:
         dest: /tmp/01e_bootstrap_dit.ldif
         content: |
+          # 1. Radice Dinamica Universale (Funziona con qualsiasi dc=...,dc=...)
+          dn: {{ ldap_basedn }}
+          objectClass: top
+          objectClass: domain
+          dc: {{ ldap_basedn.split(',')[0].split('=')[1] }}
+
+          # 2. Unità Organizzative e Utenze del Cluster
           dn: ou=system,{{ ldap_basedn }}
           changetype: add
           objectClass: top
@@ -259,13 +277,16 @@
           objectClass: groupOfNames
           cn: administrators
           member: {{ ldap_repl_user }}
-
-    - name: F. Applicazione Struttura DIT Iniziale (Con privilegi cn=admin)
+          run_once: true
+          delegate_to: "{{ groups['cluster'][0] }}"
+    - name: F. Applicazione Struttura DIT Iniziale (Solo sul primo nodo)
       shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
       register: dit_result
       failed_when:
         - dit_result.rc != 0
         - "'Already exists' not in dit_result.stderr"
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
 
     # =========================================================================
     # INIEZIONE PARAMETRI TLS IN cn=config
@@ -277,6 +298,9 @@
         content: |
           dn: cn=config
           changetype: modify
+          replace: olcTLSVerifyClient
+          olcTLSVerifyClient: try
+          -
           replace: olcTLSCACertificateFile
           olcTLSCACertificateFile: {{ ssl_ca_path }}
           -
@@ -285,9 +309,6 @@
           -
           replace: olcTLSCertificateKeyFile
           olcTLSCertificateKeyFile: {{ ssl_key_path }}
-          -
-          replace: olcTLSVerifyClient
-          olcTLSVerifyClient: try
 
     - name: "[LDAPS] Applicazione chiavi e parametri TLS in cn=config"
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_tls_config.ldif
