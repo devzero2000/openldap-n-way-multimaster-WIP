@@ -1,0 +1,56 @@
+# ==============================================================================
+# TITOLO:       Verifica Performance e Validazione Tuning (Autenticazione Utenti Reali)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Rilevare i tempi di risposta forzando ricerche molo con bind
+#               eseguito da utenze non amministrative campionate dal dataset.
+# ==============================================================================
+
+---
+- name: "Validazione Metriche di Tuning e Performance"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    # Utenze campione usate per il test di bind e ricerca interna
+    test_user_1: "uid=user.500,ou=People,dc=example,dc=com"
+    test_user_1_pw: "user.500.1"
+    test_user_2: "uid=user.25000,ou=People,dc=example,dc=com"
+    test_user_2_pw: "user.25000.1"
+
+  tasks:
+    - name: "[METRICA 1] Query Densità come Utente Ordinario: Estrazione membri reali da Cloud Architect"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "cn=architect.1,ou=groups,{{ suffix }}" -s base "(objectClass=*)" member
+      register: query_1_time
+      changed_when: false
+
+    - name: "[METRICA 2] Query Wildcard come Utente Ordinario: Ricerca su 30.000 gruppi (Cn eq,sub)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_2 }}" -w "{{ test_user_2_pw }}"
+        -b "ou=groups,{{ suffix }}" -s sub "(cn=*group.255*)" dn
+      register: query_2_time
+      changed_when: false
+
+    - name: "[DIAGNOSTICA] Verifica lo spazio occupato dall'MDB su disco"
+      ansible.builtin.command: "ls -lh /var/lib/ldap/data.mdb"
+      register: mdb_disk_size
+      changed_when: false
+
+    - name: "[REPORT] Visualizza i risultati dei test prestazionali"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " VERIFICA DEI PARAMETRI DI TUNING CON DATASET REALE"
+          - "=================================================================="
+          - "1. Dimensione fisica attuale del DB MDB su disco:"
+          - "{{ mdb_disk_size.stdout }}"
+          - "   (Il limite massimo impostato è di 4GB)"
+          - "------------------------------------------------------------------"
+          - "2. Tempo e output della query Wildcard (Bind: user.25000):"
+          - "{{ query_2_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "3. Tempo di estrazione membri ruolo Architect (Bind: user.500):"
+          - "{{ query_1_time.stderr_lines }}"
+          - "=================================================================="

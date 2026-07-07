@@ -1,0 +1,45 @@
+---
+- name: "Correzione Timeout Syncrepl per Basi Dati Massive over WAN"
+  hosts: cluster
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+    
+    # Parametri comuni di tuning ottimizzati (timeout azzerato per flussi massivi)
+    syncrepl_tuning_params: 'type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=0 keepalive=240:4:15 tls_cacert=/etc/ldap/sasl2/ca.crt tls_cert=/etc/ldap/sasl2/ldap-server.crt tls_key=/etc/ldap/sasl2/ldap-server.key tls_reqcert=demand'
+
+  tasks:
+    - name: "Generazione dinamica dei vettori olcSyncRepl asimmetrici"
+      set_fact:
+        syncrepl_lines: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSyncRepl
+          {% for host in groups['cluster'] %}
+          {% if host != inventory_hostname %}
+          olcSyncRepl: rid={{ '%03d' % (loop.index) }} provider=ldaps://{{ host }}:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" {{ syncrepl_tuning_params }}
+          {% endif %}
+          {% endfor %}
+
+    - name: "Scrittura del file LDIF temporaneo di riallineamento"
+      copy:
+        content: "{{ syncrepl_lines }}"
+        dest: "/tmp/fix_syncrepl_timeout.ldif"
+        mode: '0600'
+
+    - name: "Applicazione a caldo della nuova configurazione (replace)"
+      shell: "ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/fix_syncrepl_timeout.ldif"
+      register: ldapmodify_result
+      changed_when: "'modifying entry' in ldapmodify_result.stdout"
+
+    - name: "Riavvio del servizio slapd per rigenerare i thread ed azzerare i loop"
+      systemd:
+        name: slapd
+        state: restarted
+
+    - name: "Rimozione del file LDIF temporaneo"
+      file:
+        path: "/tmp/fix_syncrepl_timeout.ldif"
+        state: absent
