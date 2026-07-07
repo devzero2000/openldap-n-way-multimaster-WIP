@@ -1,0 +1,54 @@
+# ==============================================================================
+# TITOLO:       Epurazione Radicale OpenLDAP per Re-inizializzazione Clean
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Rimuovere pacchetti, database e configurazioni cn=config corrotti
+#               su tutti i nodi per permettere il re-deploy da zero.
+# ==============================================================================
+
+---
+- name: "Reset Totale: Epurazione Nodi Cluster OpenLDAP"
+  hosts: cluster
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: "[STOP] Ferma il servizio slapd se ancora attivo"
+      ansible.builtin.service:
+        name: slapd
+        state: stopped
+      failed_when: false
+
+    - name: "[PURGE] Rimuovi i pacchetti con cancellazione delle configurazioni"
+      ansible.builtin.apt:
+        name:
+          - slapd
+          - ldap-utils
+        state: absent
+        purge: true
+
+    - name: "[CLEANUP] Elimina fisicamente i residui di cn=config e runtime"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/ldap/slapd.d
+        - /var/lib/ldap
+        - /tmp/01_db_init.ldif
+        - /tmp/01b_disable_anon.ldif
+        - /tmp/01c_acl_init.ldif
+        - /tmp/01e_bootstrap_dit.ldif
+        - /tmp/01_tls_config.ldif
+        - /tmp/02_replication_setup.ldif
+        - /tmp/03_enable_overlays.ldif
+        - /tmp/04_multimaster.ldif
+        - /tmp/05_monitor.ldif
+        - /tmp/06_db_tuning.ldif
+
+    - name: "[RECREATE] Ricrea la directory del database vuota"
+      ansible.builtin.file:
+        path: /var/lib/ldap
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
