@@ -377,13 +377,13 @@
           replace: olcSyncRepl
           {% endraw %}
           {% if ansible_facts['fqdn'] != 'ubuntu24lts1.example.com' %}
-          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
           {% endif %}
           {% if ansible_facts['fqdn'] != 'ubuntu24lts2.example.com' %}
-          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
           {% endif %}
           {% if ansible_facts['fqdn'] != 'ubuntu24lts3.example.com' %}
-          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
           {% endif %}
           {% raw %}
           -
