@@ -44,7 +44,7 @@
         dn: olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config
         changetype: modify
         replace: olcSpSessionlog
-        olcSpSessionlog: 100000
+        olcSpSessionlog: 5000
         -
         replace: olcSpCheckpoint
         olcSpCheckpoint: 10000 10
