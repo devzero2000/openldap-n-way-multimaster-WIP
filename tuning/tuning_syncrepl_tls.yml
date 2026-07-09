@@ -2,9 +2,9 @@
 # TITOLO:       LDAP Tuning 3/3: Ottimizzazione parametri Syncrepl via LDAPS
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.4 (TLS Hardened)
+# VERSIONE:     1.7 (Fix Parsing LDIF Multi-valore)
 # SCOPO:        Applicazione del tuning dei vettori di replica forzando l'uso
-#               di LDAPS protetto e mutua autenticazione del certificato.
+#               di LDAPS protetto e abilitazione contestuale del MultiProvider.
 # ==============================================================================
 
 ---
@@ -12,7 +12,6 @@
   hosts: cluster
   become: true
   vars:
-    ansible_python_interpreter: /usr/bin/python3
     ldap_basedn: "dc=example,dc=com"
     ldap_rootdn: "cn=admin,dc=example,dc=com"
     ldap_rootpw: "openldap"
@@ -22,30 +21,32 @@
     ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
     ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
 
-    # Configurazione asimmetrica: ogni nodo punta in modo protetto via LDAPS agli altri due
+    # Configurazione asimmetrica pulita: gli indici numerici li gestisce OpenLDAP internamente
     cluster_providers:
       ubuntu24lts1.example.com:
-        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15  tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15  tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
       ubuntu24lts2.example.com:
-        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15   tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15  tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
       ubuntu24lts3.example.com:
-        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15  tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15  tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-
-  pre_tasks:
-    - name: "Garantisce la presenza della libreria python3-ldap per l'esecuzione dei moduli"
-      ansible.builtin.apt:
-        name: python3-ldap
-        state: present
-        update_cache: yes
+        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
 
   tasks:
-    - name: "Applicazione configurazione olcSyncrepl asimmetrica a caldo via LDAPS"
-      community.general.ldap_attrs:
-        dn: "olcDatabase={1}mdb,cn=config"
-        attributes:
-          olcSyncrepl: "{{ cluster_providers[ansible_facts['fqdn']] }}"
-        state: present
-        server_uri: "ldapi:///"
+    - name: "Applicazione configurazione repliche ed attivazione olcMultiProvider via LDIF"
+      ansible.builtin.shell: |
+        ldapmodify -Y EXTERNAL -H ldapi:/// <<EOF
+        dn: olcDatabase={1}mdb,cn=config
+        changetype: modify
+        replace: olcMultiProvider
+        olcMultiProvider: TRUE
+        -
+        replace: olcSyncRepl
+        {% for line in cluster_providers[ansible_facts['fqdn']] %}
+        olcSyncRepl: {{ line }}
+        {% endfor %}
+        EOF
+      register: ldif_repl_result
+      changed_when: "'modifying entry' in ldif_repl_result.stdout"
+      failed_when: ldif_repl_result.rc != 0
