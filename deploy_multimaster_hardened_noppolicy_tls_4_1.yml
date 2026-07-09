@@ -371,7 +371,7 @@
           objectClass: olcOverlayConfig
           objectClass: olcSyncProvConfig
           olcOverlay: syncprov
-          olcSpCheckpoint: 100 10
+          olcSpCheckpoint: 1000 10
 
     - name: "9. Applicazione overlay syncprov"
       shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
