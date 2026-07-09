@@ -76,8 +76,8 @@ printf "=====================================================================\n\
 # ------------------------------------------------------------------------------
 printf "[TEST 1/3] Verifica consistenza: ubuntu24lts2 <-- ubuntu24lts1...\n"
 "$SCRIPT_PERL" \
-    -H "ldap://ubuntu24lts2.example.com" \
-    -U "ldap://ubuntu24lts1.example.com" \
+    -H "ldaps://ubuntu24lts2.example.com" \
+    -U "ldaps://ubuntu24lts1.example.com" \
     -D "$ADMIN_DN" \
     -P "$ADMIN_PW" \
     -S "$BASE_DN" \
@@ -88,8 +88,8 @@ printf "\n"
 # ------------------------------------------------------------------------------
 printf "[TEST 2/3] Verifica consistenza: ubuntu24lts3 <-- ubuntu24lts2...\n"
 "$SCRIPT_PERL" \
-    -H "ldap://ubuntu24lts3.example.com" \
-    -U "ldap://ubuntu24lts2.example.com" \
+    -H "ldaps://ubuntu24lts3.example.com" \
+    -U "ldaps://ubuntu24lts2.example.com" \
     -D "$ADMIN_DN" \
     -P "$ADMIN_PW" \
     -S "$BASE_DN" \
@@ -100,8 +100,8 @@ printf "\n"
 # ------------------------------------------------------------------------------
 printf "[TEST 3/3] Verifica consistenza: ubuntu24lts1 <-- ubuntu24lts3...\n"
 "$SCRIPT_PERL" \
-    -H "ldap://ubuntu24lts1.example.com" \
-    -U "ldap://ubuntu24lts3.example.com" \
+    -H "ldaps://ubuntu24lts1.example.com" \
+    -U "ldaps://ubuntu24lts3.example.com" \
     -D "$ADMIN_DN" \
     -P "$ADMIN_PW" \
     -S "$BASE_DN" \

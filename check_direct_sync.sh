@@ -21,7 +21,7 @@ CLUSTER_OK=0
 
 printf -- "--- VERIFICA DIRETTA NODO 2 <-- NODO 1 ---\n"
 # -I "001" estrae il CSN del Nodo 1 sul database del Nodo 2 e lo confronta con il Nodo 1 originale
-if "$SCRIPT_PERL" -H "ldap://ubuntu24lts2.example.com" -U "ldap://ubuntu24lts1.example.com" -D "$ADMIN_DN" -P "$ADMIN_PW" -S "$BASE_DN" -I "001" -w 10 -c 15 > /dev/null 2>&1; then
+if "$SCRIPT_PERL" -H "ldaps://ubuntu24lts2.example.com" -U "ldaps://ubuntu24lts1.example.com" -D "$ADMIN_DN" -P "$ADMIN_PW" -S "$BASE_DN" -I "001" -w 10 -c 15 > /dev/null 2>&1; then
     printf -- "[OK] Nodo 2 è in sync con Nodo 1.\n"
 else
     printf -- "[ERR] Nodo 2 NON è in sync con Nodo 1.\n"
@@ -30,7 +30,7 @@ fi
 
 printf -- "\n--- VERIFICA DIRETTA NODO 3 <-- NODO 1 ---\n"
 # CORRETTO: Cambiato da -I "002" a -I "001" per tracciare sempre la propagazione del Nodo 1
-if "$SCRIPT_PERL" -H "ldap://ubuntu24lts3.example.com" -U "ldap://ubuntu24lts1.example.com" -D "$ADMIN_DN" -P "$ADMIN_PW" -S "$BASE_DN" -I "001" -w 10 -c 15 > /dev/null 2>&1; then
+if "$SCRIPT_PERL" -H "ldaps://ubuntu24lts3.example.com" -U "ldaps://ubuntu24lts1.example.com" -D "$ADMIN_DN" -P "$ADMIN_PW" -S "$BASE_DN" -I "001" -w 10 -c 15 > /dev/null 2>&1; then
     printf -- "[OK] Nodo 3 è in sync con Nodo 1.\n"
 else
     printf -- "[ERR] Nodo 3 NON è in sync con Nodo 1.\n"
