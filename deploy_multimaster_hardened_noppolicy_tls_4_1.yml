@@ -382,7 +382,7 @@
         - "'already in list' not in overlay_result.stderr"
         - "'Already exists' not in overlay_result.stderr"
 
-   - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (Con indici di riga rigidi)
+    - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (Con indici di riga rigidi)
       copy:
         dest: /tmp/04_multimaster.ldif
         content: |
