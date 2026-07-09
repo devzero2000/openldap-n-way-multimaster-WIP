@@ -1,0 +1,10 @@
+sudo sh -x ../*CSN*.sh
+sudo systemctl stop slapd
+sudo mkdir /tmp/mybackup
+sudo cp /var/lib/ldap/* /tmp/mybackup
+ansible-playbook purge_node_mdb.yml
+
+sudo systemctl start slapd 
+sleep 5
+sh -x ../*CSN*.sh
+

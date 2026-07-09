@@ -1,0 +1,12 @@
+dn: ou=People,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: People
+structuralObjectClass: organizationalUnit
+entryUUID: 4d92a1e8-0e50-1041-8c07-87b1a5dbfa75
+creatorsName: cn=admin,dc=example,dc=com
+createTimestamp: 20260707130542Z
+entryCSN: 20260707130542.282046Z#000000#001#000000
+modifiersName: cn=admin,dc=example,dc=com
+modifyTimestamp: 20260707130542Z
+
