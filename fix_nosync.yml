@@ -1,6 +1,6 @@
 # ==============================================================================
 # TITOLO:       Ripristino Scrittura Sincrona (Garanzia di Consistenza MDB)
-# SCOPO:        Imposta olcDbNoSync: FALSE e riavvia slapd nel cluster
+# SCOPO:        Imposta olcDbNoSync: TRUE e riavvia slapd nel cluster
 # ==============================================================================
 
 ---
@@ -16,7 +16,7 @@
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
           replace: olcDbNoSync
-          olcDbNoSync: FALSE
+          olcDbNoSync: TRUE
 
     - name: 2. Applicazione modifica olcDbNoSync via SASL EXTERNAL
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/08_fix_nosync.ldif
