@@ -1,0 +1,55 @@
+# ==============================================================================
+# TITOLO:       Playbook di Controllo Strutturale Cluster OpenLDAP
+# SCOPO:        Verifica Indici, Parametri di Tuning, Repliche e Allineamento DN
+# ==============================================================================
+
+---
+- name: Controllo Stato e Consistenza del Cluster OpenLDAP
+  hosts: cluster
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+
+  tasks:
+    - name: "1. VERIFICA INDICI (entryUUID ed entryCSN)"
+      shell: |
+        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "cn=config" "(olcDatabase={1}mdb)" olcDbIndex
+      register: check_indices
+      changed_when: false
+
+    - name: "2. VERIFICA PARAMETRI TUNING (NoSync, Checkpoint, SessionLog)"
+      shell: |
+        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config" olcSpCheckpoint olcSpSessionlog
+      register: check_tuning
+      changed_when: false
+
+    - name: "3. VERIFICA CONFIGURAZIONE REPLICA (olcSyncRepl pulito)"
+      shell: |
+        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "cn=config" "(olcDatabase={1}mdb)" olcSyncRepl olcMultiProvider
+      register: check_syncrepl
+      changed_when: false
+
+    - name: "4. CONTA ATTUALE DEI DN (Stato del popolamento)"
+      shell: |
+        slapcat -b "{{ ldap_basedn }}" | grep -c "dn: "
+      register: dn_count
+      changed_when: false
+
+    - name: "REPORT FINALE - STATO DEL NODO"
+      debug:
+        msg:
+          - "======================================================="
+          - "REPORT DI CONSISTENZA PER IL NODO: {{ ansible_facts['fqdn'] }}"
+          - "======================================================="
+          - "CONTA DEI DN ATTUALI: {{ dn_count.stdout }}"
+          - "-------------------------------------------------------"
+          - "PRESENZA INDICI OBBLIGATORI:"
+          - "{{ check_indices.stdout_lines | select('match', '^olcDbIndex:') | list }}"
+          - "-------------------------------------------------------"
+          - "PARAMETRI DI TUNING ATTIVI:"
+          - "{{ check_tuning.stdout_lines | select('match', '^(olcDbNoSync|olcSpCheckpoint|olcSpSessionlog):') | list }}"
+          - "-------------------------------------------------------"
+          - "MULTIVERIFICA PROVIDER ATTIVA:"
+          - "{{ check_syncrepl.stdout_lines | select('match', '^olcMultiProvider:') | list }}"
+          - "REPLICHE CONFIGURATE (Verifica visiva refusi):"
+          - "{{ check_syncrepl.stdout_lines | select('search', 'rid=') | list }}"

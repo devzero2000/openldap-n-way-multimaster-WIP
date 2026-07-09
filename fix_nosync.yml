@@ -1,0 +1,39 @@
+# ==============================================================================
+# TITOLO:       Ripristino Scrittura Sincrona (Garanzia di Consistenza MDB)
+# SCOPO:        Imposta olcDbNoSync: FALSE e riavvia slapd nel cluster
+# ==============================================================================
+
+---
+- name: Hardening e Allineamento Disco OpenLDAP Cluster
+  hosts: cluster
+  become: true
+
+  tasks:
+    - name: 1. Generazione LDIF per disattivare olcDbNoSync
+      copy:
+        dest: /tmp/08_fix_nosync.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcDbNoSync
+          olcDbNoSync: FALSE
+
+    - name: 2. Applicazione modifica olcDbNoSync via SASL EXTERNAL
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/08_fix_nosync.ldif
+      register: ldapmodify_result
+      changed_when: "'modifying entry' in ldapmodify_result.stdout"
+      failed_when: ldapmodify_result.rc != 0
+
+    - name: 3. Rimozione file LDIF temporaneo
+      file:
+        path: /tmp/08_fix_nosync.ldif
+        state: absent
+
+    - name: 4. Riavvio controllato di slapd per forzare il ricalcolo e la rinegoziazione
+      systemd:
+        name: slapd
+        state: restarted
+
+    - name: 5. Attesa tecnica per il riavvio del socket e l'avvio del syncrepl
+      pause:
+        seconds: 5

@@ -406,7 +406,7 @@
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
           add: olcDbNoSync
-          olcDbNoSync: TRUE
+          olcDbNoSync: FALSE
 
           dn: cn=config
           changetype: modify
