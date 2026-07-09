@@ -37,32 +37,32 @@
         state: exact
       when: stato in ['enable', 'enabled']
 
-    - name: "[ENABLE] Carica il modulo globale memberof"
-      community.general.ldap_attrs:
-        server_uri: "{{ ldap_auth.server_uri }}"
-        sasl_class: "{{ ldap_auth.sasl_class }}"
-        dn: "cn=module{0},cn=config"
-        attributes:
-          olcModuleLoad: "memberof.la"
-        state: present
-      when: stato in ['enable', 'enabled']
+#    - name: "[ENABLE] Carica il modulo globale memberof"
+##     community.general.ldap_attrs:
+#        server_uri: "{{ ldap_auth.server_uri }}"
+#        sasl_class: "{{ ldap_auth.sasl_class }}"
+#        dn: "cn=module{0},cn=config"
+#        attributes:
+#          olcModuleLoad: "memberof.la"
+#        state: present
+#      when: stato in ['enable', 'enabled']
 
-    - name: "[ENABLE] Inizializza l'entry dell'overlay memberOf con supporto NESTING"
-      community.general.ldap_entry:
-        server_uri: "{{ ldap_auth.server_uri }}"
-        sasl_class: "{{ ldap_auth.sasl_class }}"
-        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
-        objectClass:
-          - olcMemberOf
-          - olcOverlayConfig
-        attributes:
-          olcOverlay: "memberof"
-          olcMemberOfRefInt: "TRUE"
-          olcMemberOfGroupOC: "groupOfNames"
-          olcMemberOfMemberAD: "member"
-          olcMemberOfMemberOfAD: "memberOf"
-        state: present
-      when: stato in ['enable', 'enabled']
+#    - name: "[ENABLE] Inizializza l'entry dell'overlay memberOf con supporto NESTING"
+#      community.general.ldap_entry:
+#      server_uri: "{{ ldap_auth.server_uri }}"
+#      sasl_class: "{{ ldap_auth.sasl_class }}"
+#      dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+#      objectClass:
+#       - olcMemberOf
+#       - olcOverlayConfig
+#      attributes:
+#       olcOverlay: "memberof"
+#       olcMemberOfRefInt: "TRUE"
+#       olcMemberOfGroupOC: "groupOfNames"
+#       olcMemberOfMemberAD: "member"
+#       olcMemberOfMemberOfAD: "memberOf"
+#       state: present
+#       when: stato in ['enable', 'enabled']
 
     - name: "[ENABLE] Ottimizza MaxSize e Indici sul database mdb"
       community.general.ldap_attrs:
