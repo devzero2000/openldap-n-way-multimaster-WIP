@@ -77,6 +77,6 @@
             - "cn eq,sub"
             - "member eq"
             - "memberUid eq"
-            - "memberOf eq"
+      #    - "memberOf eq"
         state: exact
       when: stato in ['enable', 'enabled']
