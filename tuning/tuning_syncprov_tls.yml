@@ -46,7 +46,7 @@
           olcOverlay: "syncprov"
           # Mantiene in RAM le ultime 5000 modifiche per la sincronizzazione rapida (Delta)
           olcSpSessionlog: 5000
-          # Scrive il punto di controllo su disco ogni 100 operazioni o 10 minuti
-          olcSpCheckpoint: "100 10"
+          # Scrive il punto di controllo su disco ogni 1000 operazioni o 10 minuti
+          olcSpCheckpoint: "1000 10"
         state: present
       when: stato == "enable"
