@@ -1,0 +1,26 @@
+---
+- name: Sblocco e Convergenza Cluster OpenLDAP Multi-Master
+  hosts: cluster
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Arresto controllato e simultaneo del servizio slapd su tutto il cluster
+      systemd:
+        name: slapd
+        state: stopped
+
+- name: Sequenziamento e Avvio per il Consolidamento dei Cookie di Sincronizzazione
+  hosts: cluster
+  become: true
+  serial: 1  # Esegue un nodo alla volta
+
+  tasks:
+    - name: Avvio sequenziale del nodo
+      systemd:
+        name: slapd
+        state: started
+
+    - name: Pausa tecnica per stabilizzazione sessioni mTLS e ripresa Syncrepl
+      pause:
+        seconds: 15

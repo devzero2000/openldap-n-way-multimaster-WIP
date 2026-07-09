@@ -1,0 +1,33 @@
+---
+- name: Configurazione Livello Log OpenLDAP su Tutto il Cluster
+  hosts: cluster
+  become: true
+  gather_facts: false
+
+  vars:
+    # Definiamo i livelli di log: 
+    # 'stats' per connessioni/operazioni e 'sync' per il dettaglio del motore Syncrepl
+    ldap_log_level: "stats sync"
+
+  tasks:
+    - name: Generazione del file LDIF temporaneo per olcLogLevel
+      copy:
+        dest: "/tmp/modify_loglevel.ldif"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcLogLevel
+          olcLogLevel: {{ ldap_log_level }}
+        owner: root
+        group: root
+        mode: '0600'
+
+    - name: Applicazione del livello di log a caldo via ldapmodify
+      shell: "ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/modify_loglevel.ldif"
+      register: log_result
+      changed_when: "'modifying entry' in log_result.stdout"
+
+    - name: Rimozione del file LDIF temporaneo
+      file:
+        path: "/tmp/modify_loglevel.ldif"
+        state: absent

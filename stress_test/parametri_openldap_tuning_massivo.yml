@@ -30,7 +30,7 @@
         dn: olcDatabase={1}mdb,cn=config
         changetype: modify
         replace: olcDbNoSync
-        olcDbNoSync: TRUE
+        olcDbNoSync: FALSE
         EOF
       register: tuning_prima_result
       changed_when: "'modifying entry' in tuning_prima_result.stdout"
@@ -55,7 +55,7 @@
         dn: olcDatabase={1}mdb,cn=config
         changetype: modify
         replace: olcDbNoSync
-        olcDbNoSync: TRUE
+        olcDbNoSync: FALSE
         EOF
       register: tuning_dopo_result
       changed_when: "'modifying entry' in tuning_dopo_result.stdout"
