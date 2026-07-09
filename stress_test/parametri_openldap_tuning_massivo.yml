@@ -1,0 +1,69 @@
+# ==============================================================================
+# TITOLO:       Playbook Temporaneo - Tuning Ottimizzato per Inserimento Massivo
+# VERSIONE:     1.1 (FIXED DN & NATIVE LDIF)
+# SCOPO:        Gestione a caldo dei parametri di tuning per import massivo
+# ==============================================================================
+
+---
+- name: Playbook Temporaneo - Tuning Ottimizzato per Inserimento Massivo
+  hosts: cluster
+  become: true
+  vars:
+    # Valori di default se non passati da riga di comando (prima / dopo)
+    fase: "prima"
+
+  tasks:
+    # ==========================================================================
+    # FASE 1: CONFIGURAZIONE PRIMA DEL CARICAMENTO MASSIVO
+    # ==========================================================================
+    - name: "[TUNING MASSIVO] Applicazione parametri estremi e NoSync (fase: PRIMA)"
+      ansible.builtin.shell: |
+        ldapmodify -Y EXTERNAL -H ldapi:/// <<EOF
+        dn: olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config
+        changetype: modify
+        replace: olcSpSessionlog
+        olcSpSessionlog: 100000
+        -
+        replace: olcSpCheckpoint
+        olcSpCheckpoint: 10000 10
+        -
+        dn: olcDatabase={1}mdb,cn=config
+        changetype: modify
+        replace: olcDbNoSync
+        olcDbNoSync: TRUE
+        EOF
+      register: tuning_prima_result
+      changed_when: "'modifying entry' in tuning_prima_result.stdout"
+      failed_when: tuning_prima_result.rc != 0
+      when: fase == "prima"
+
+
+    # ==========================================================================
+    # FASE 2: RIPRISTINO PARAMETRI PER PRODUZIONE REGOLARE
+    # ==========================================================================
+    - name: "[TUNING PRODUZIONE] Ripristino parametri bilanciati (fase: DOPO)"
+      ansible.builtin.shell: |
+        ldapmodify -Y EXTERNAL -H ldapi:/// <<EOF
+        dn: olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config
+        changetype: modify
+        replace: olcSpSessionlog
+        olcSpSessionlog: 5000
+        -
+        replace: olcSpCheckpoint
+        olcSpCheckpoint: 1000 10
+        -
+        dn: olcDatabase={1}mdb,cn=config
+        changetype: modify
+        replace: olcDbNoSync
+        olcDbNoSync: TRUE
+        EOF
+      register: tuning_dopo_result
+      changed_when: "'modifying entry' in tuning_dopo_result.stdout"
+      failed_when: tuning_dopo_result.rc != 0
+      when: fase == "dopo"
+
+  handlers:
+    - name: Riavvia Slapd
+      service:
+        name: slapd
+        state: restarted
