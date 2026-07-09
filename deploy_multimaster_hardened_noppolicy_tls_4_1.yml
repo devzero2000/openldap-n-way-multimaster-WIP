@@ -150,6 +150,7 @@
         name:
           - slapd
           - ldap-utils
+          - python-is-python3
         state: present
         update_cache: yes
 
