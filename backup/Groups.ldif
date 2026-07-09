@@ -1,0 +1,25 @@
+dn: ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: organizationalUnit
+ou: groups
+structuralObjectClass: organizationalUnit
+creatorsName: cn=admin,dc=example,dc=com
+entryUUID: 38f664b4-0e4f-1041-95e3-69429b116d38
+createTimestamp: 20260707125758Z
+entryCSN: 20260707125758.206957Z#000000#000#000000
+modifiersName: cn=admin,dc=example,dc=com
+modifyTimestamp: 20260707125758Z
+
+dn: cn=administrators,ou=groups,dc=example,dc=com
+objectClass: top
+objectClass: groupOfNames
+cn: administrators
+member: cn=nwayreplicator,ou=system,dc=example,dc=com
+structuralObjectClass: groupOfNames
+creatorsName: cn=admin,dc=example,dc=com
+entryUUID: 38f76526-0e4f-1041-95e5-69429b116d38
+createTimestamp: 20260707125758Z
+entryCSN: 20260707125758.213522Z#000000#000#000000
+modifiersName: cn=admin,dc=example,dc=com
+modifyTimestamp: 20260707125758Z
+
