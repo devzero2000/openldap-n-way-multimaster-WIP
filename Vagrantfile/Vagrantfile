@@ -17,7 +17,7 @@ Vagrant.configure("2") do |config|
       node.vm.hostname = "#{hostname}.example.com"
       node.vm.provider "vmware_desktop" do |v|
         v.gui = false
-        v.vmx["memsize"] = "2048"
+        v.vmx["memsize"] = "4096"
         v.vmx["numvcpus"] = "1"
       end
 
@@ -27,6 +27,12 @@ Vagrant.configure("2") do |config|
       # Provisioning unico per privilegi, rete, Ansible e SSH mesh
       node.vm.provision "shell", inline: <<-SHELL
         export DEBIAN_FRONTEND=noninteractive
+        # Impostazione Timezone su Europa/Rom
+        timedatectl set-timezone Europe/Rome
+
+        # Configurazione e attivazione di systemd-timesyncd per l'NTP
+        timedatectl set-ntp true
+        systemctl restart systemd-timesyncd
         
         # 1. Privilegi Sudo passwordless
         echo "vagrant ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-vagrant
