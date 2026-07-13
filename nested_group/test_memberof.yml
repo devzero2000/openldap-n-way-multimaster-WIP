@@ -1,0 +1,220 @@
+# ==============================================================================
+# TITOLO:       Automazione Test slapo-memberof (Risolto con OU e Vincolo Master)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.3
+# SCOPO:        Validare l'iniezione fisica e la query diretta/inversa dell'attributo
+#               memberOf configurando correttamente i nodi di origine.
+# ==============================================================================
+
+---
+- name: "Test e Validazione slapo-memberof sul Cluster OpenLDAP"
+  hosts: cluster
+  become: true
+  vars:
+    stato: "start"
+    suffix: "dc=example,dc=com"
+    ldap_auth:
+      server_uri: "ldapi:///"
+      bind_dn: "cn=admin,dc=example,dc=com"
+      bind_pw: "openldap"
+
+  tasks:
+
+    # ==========================================================================
+    # BLOCCO 1: STATO = STOP (PULIZIA STRUTTURA)
+    # ==========================================================================
+    - name: "[STOP] Rimozione degli oggetti foglia dal DIT"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "{{ item }}"
+        state: absent
+      loop:
+        - "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        - "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        - "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        - "uid=mario.rossi,ou=People,{{ suffix }}"
+      when: 
+        - stato == "stop"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[CLUSTER] Attendi la rimozione degli oggetti foglia su tutto il cluster"
+      ansible.builtin.pause:
+        seconds: 2
+      when: 
+        - stato == "stop"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[STOP] Rimozione delle Unità Organizzative vuote"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "{{ item }}"
+        state: absent
+      loop:
+        - "ou=groups,{{ suffix }}"
+        - "ou=People,{{ suffix }}"
+      when: 
+        - stato == "stop"
+        - inventory_hostname == groups['cluster'][0]
+
+    # ==========================================================================
+    # BLOCCO 2: STATO = START (PREPARAZIONE OU - SOLO COORDINATORE)
+    # ==========================================================================
+    - name: "[PREPARE] Crea la Unità Organizzativa People"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "ou=People,{{ suffix }}"
+        objectClass: [top, organizationalUnit]
+        attributes:
+          ou: "People"
+        state: present
+      when: 
+        - stato == "start"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[PREPARE] Crea la Unità Organizzativa groups"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "ou=groups,{{ suffix }}"
+        objectClass: [top, organizationalUnit]
+        attributes:
+          ou: "groups"
+        state: present
+      when: 
+        - stato == "start"
+        - inventory_hostname == groups['cluster'][0]
+
+    # ==========================================================================
+    # BLOCCO 3: STATO = START (POPOLAMENTO DATASET - SOLO COORDINATORE)
+    # ==========================================================================
+    - name: "[START] Crea l'utente: Mario Rossi"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=mario.rossi,ou=People,{{ suffix }}"
+        objectClass: [top, inetOrgPerson]
+        attributes:
+          uid: "mario.rossi"
+          cn: "Mario Rossi"
+          sn: "Rossi"
+          userPassword: "{SSHA}d3m0Xdfgklm12345!"
+        state: present
+      when: 
+        - stato == "start"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[START] Crea l'utente: Giovanni Bianchi"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        objectClass: [top, inetOrgPerson]
+        attributes:
+          uid: "giovanni.bianchi"
+          cn: "Giovanni Bianchi"
+          sn: "Bianchi"
+          userPassword: "{SSHA}d3m0Ydfgklm67890!"
+        state: present
+      when: 
+        - stato == "start"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[START] Crea il gruppo: Deploy-Stage1 (Assegna Mario)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        objectClass: [top, groupOfNames]
+        attributes:
+          cn: "Deploy-Stage1"
+          description: "Gruppo statico flat"
+          member: "uid=mario.rossi,ou=People,{{ suffix }}"
+        state: present
+      when: 
+        - stato == "start"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[START] Crea il gruppo: Cloud-Architect (Assegna sia Giovanni che Mario)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        objectClass: [top, groupOfNames]
+        attributes:
+          cn: "Cloud-Architect"
+          description: "Membri piatti espliciti per memberof"
+          member:
+            - "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+            - "uid=mario.rossi,ou=People,{{ suffix }}"
+        state: present
+      when: 
+        - stato == "start"
+        - inventory_hostname == groups['cluster'][0]
+
+    - name: "[CLUSTER] Attendi la convergenza della replica syncrepl"
+      ansible.builtin.pause:
+        seconds: 2
+      when: stato == "start"
+
+    # ==========================================================================
+    # BLOCCO 4: BATTERIA DI TEST SPECIFICA (SU TUTTI I NODI DEL CLUSTER)
+    # ==========================================================================
+    - name: "[TEST 1/3] Query inversa filtrata su Cloud-Architect"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "ou=People,{{ suffix }}"
+        -s sub "(&(objectClass=inetOrgPerson)(memberOf=cn=Cloud-Architect,ou=groups,{{ suffix }}))" dn
+      register: test_1_res
+      when: stato == "start"
+      changed_when: false
+
+    - name: "[TEST 2/3] Query secca BASE sul record di Mario Rossi (Verifica attributo fisico)"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "uid=mario.rossi,ou=People,{{ suffix }}"
+        -s base "(objectClass=*)" memberOf
+      register: test_2_res
+      when: stato == "start"
+      changed_when: false
+
+    - name: "[TEST 3/3] Query secca BASE sul record di Giovanni Bianchi"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        -s base "(objectClass=*)" memberOf
+      register: test_3_res
+      when: stato == "start"
+      changed_when: false
+
+    # ==========================================================================
+    # BLOCCO 5: AUDITING
+    # ==========================================================================
+    - name: "[REGISTRO] Risultati di conformità per slapo-memberof sul nodo {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg:
+          - "----------------------------------------------------------------"
+          - "TEST 1: Utenti con filtro memberOf=Cloud-Architect (Mario e Giovanni):"
+          - "{{ test_1_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+          - "TEST 2: Gruppi fisici nel record di Mario Rossi (Entrambi i gruppi):"
+          - "{{ test_2_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+          - "TEST 3: Gruppi fisici nel record di Giovanni Bianchi (Solo Cloud-Architect):"
+          - "{{ test_3_res.stdout_lines | default(['Skipped']) }}"
+          - "----------------------------------------------------------------"
+      when: stato == "start"
