@@ -1,8 +1,9 @@
 # ==============================================================================
-# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 vie (N-Way)
-# AUTORE:       Elia Pinto
-# DATA:         Luglio 2026
-# SCOPO:        Deploy corazzato con LDAPS basato sulla logica nativa a 3 CSN
+# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 via (N-Way)
+# AUTORE:       Elia Pinto[cite: 4]
+# DATA:         Luglio 2026[cite: 4]
+# SCOPO:        Deploy corazzato con LDAPS basato sulla logica nativa a 3 CSN[cite: 4]
+#               VERSIONE: 1.10 (Risolto errore utente replica, limiti e db sync)
 # ==============================================================================
 
 ---
@@ -150,6 +151,7 @@
         name:
           - slapd
           - ldap-utils
+          - python-is-python3
         state: present
         update_cache: yes
 
@@ -167,6 +169,20 @@
           TLS_CACERT {{ ssl_ca_path }}
           TLS_REQCERT demand
         marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
+
+    - name: 2b. Generazione LDIF configurazione livello Log avanzato (stats sync)
+      copy:
+        dest: /tmp/01_loglevel.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcLogLevel
+          olcLogLevel: stats sync
+
+    - name: 2c. Applicazione livello di log a cn=config
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
+      register: log_init_result
+      failed_when: log_init_result.rc != 0
 
     - name: 3. Configurazione della password di Root in formato SSHA
       shell: slappasswd -s {{ ldap_rootpw }}
@@ -278,13 +294,29 @@
       delegate_to: "{{ groups['cluster'][0] }}"
 
     - name: F. Applicazione Struttura DIT Iniziale (Solo sul primo nodo)
-      shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
       register: dit_result
       failed_when:
         - dit_result.rc != 0
         - "'Already exists' not in dit_result.stderr"
       run_once: true
       delegate_to: "{{ groups['cluster'][0] }}"
+
+    - name: F2. Generazione e applicazione Limiti Illimitati per utente di replica
+      copy:
+        dest: /tmp/01f_limits_repl.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          add: olcLimits
+          olcLimits: dn.exact="{{ ldap_repl_user }}" size.soft=unlimited size.hard=unlimited time.soft=unlimited time.hard=unlimited
+
+    - name: F3. Applicazione Limiti Replica
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01f_limits_repl.ldif
+      register: limits_result
+      failed_when:
+        - limits_result.rc != 0
+        - "'Type or value exists' not in limits_result.stderr"
 
     # =========================================================================
     # INIEZIONE PARAMETRI TLS IN cn=config & RIAVVIO STRUTTURALE CLIENT
@@ -356,7 +388,7 @@
           objectClass: olcOverlayConfig
           objectClass: olcSyncProvConfig
           olcOverlay: syncprov
-          olcSpCheckpoint: 100 10
+          olcSpCheckpoint: 1000 10
 
     - name: "9. Applicazione overlay syncprov"
       shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
@@ -366,21 +398,22 @@
         - "'already in list' not in overlay_result.stderr"
         - "'Already exists' not in overlay_result.stderr"
 
-    - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (Con credenziali RootDN stabili)
+    - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (Corretto BindDN)
       copy:
         dest: /tmp/04_multimaster.ldif
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
           replace: olcSyncRepl
-          {% if ansible_facts['fqdn'] != 'ubuntu24lts1.example.com' %}
-          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          {% endif %}
-          {% if ansible_facts['fqdn'] != 'ubuntu24lts2.example.com' %}
-          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          {% endif %}
-          {% if ansible_facts['fqdn'] != 'ubuntu24lts3.example.com' %}
-          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com bindmethod=simple binddn="{{ ldap_rootdn }}" credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          {% if ansible_facts['fqdn'] == 'ubuntu24lts1.example.com' %}
+          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          {% elif ansible_facts['fqdn'] == 'ubuntu24lts2.example.com' %}
+          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          {% elif ansible_facts['fqdn'] == 'ubuntu24lts3.example.com' %}
+          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=simple binddn="{{ ldap_repl_user }}" credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
           {% endif %}
           -
           replace: olcMultiProvider
@@ -397,15 +430,15 @@
         'Type or value exists' not in multimaster_result.stderr
 
     # =========================================================================
-    # CORREZIONE TUNING: DIVISIONE DEL BLOCCO IN DUE DN SEPARATI
+    # PARAMETRI DI TUNING: ATTIVAZIONE DB SYNC
     # =========================================================================
-    - name: G. Generazione LDIF per parametri di Tuning Database MDB e cn=config
+    - name: G. Generazione LDIF per parametri di Tuning Database MDB e cn=config (DB SYNC ATTIVO)
       copy:
         dest: /tmp/06_db_tuning.ldif
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
-          add: olcDbNoSync
+          replace: olcDbNoSync
           olcDbNoSync: TRUE
 
           dn: cn=config
