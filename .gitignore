@@ -1,0 +1,5 @@
+# Ignora il file di log nohup
+nohup.out
+
+# Ignora qualsiasi file con nome di esattamente due caratteri e qualunque estensione
+??.*
