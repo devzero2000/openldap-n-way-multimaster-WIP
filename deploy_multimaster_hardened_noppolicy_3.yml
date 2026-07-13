@@ -38,6 +38,20 @@
           URI     ldap://localhost
         marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
 
+    - name: 2b. Generazione LDIF configurazione livello Log avanzato (stats sync)
+      copy:
+        dest: /tmp/01_loglevel.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcLogLevel
+          olcLogLevel: stats sync
+
+    - name: 2c. Applicazione livello di log a cn=config
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
+      register: log_init_result
+      failed_when: log_init_result.rc != 0
+
     - name: 3. Configurazione della password di Root in formato SSHA
       shell: slappasswd -s {{ ldap_rootpw }}
       register: ldap_hashed_pw
