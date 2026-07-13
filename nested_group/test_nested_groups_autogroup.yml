@@ -1,0 +1,173 @@
+# ==============================================================================
+# TITOLO:       Validazione Nested Groups via slapo-autogroup (Multi-Master Safe)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Iniettare un dataset dinamico sul coordinatore, validare
+#               la ricorsione reale di memberOf su tutti i nodi e pulire.
+# COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (Cluster OpenLDAP N-Way Multi-Master)
+# ==============================================================================
+
+---
+- name: "Test e Validazione dei Nested Groups via Autogroup"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldap_auth:
+      server_uri: "ldapi:///"
+      bind_dn: "cn=admin,dc=example,dc=com"
+      bind_pw: "openldap"
+
+  tasks:
+
+    # ==========================================================================
+    # BLOCCO 1: POPOLAMENTO DATASET (SOLO SUL COORDINATORE)
+    # ==========================================================================
+
+    - name: "[COORDINATORE] Crea l'utente di test: Mario Rossi (Sottogruppo)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=mario.rossi,ou=People,{{ suffix }}"
+        objectClass: [top, inetOrgPerson]
+        attributes:
+          uid: "mario.rossi"
+          cn: "Mario Rossi"
+          sn: "Rossi"
+          userPassword: "{SSHA}d3m0Xdfgklm12345!"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Crea l'utente di test: Giovanni Bianchi (Membro Diretto)"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        objectClass: [top, inetOrgPerson]
+        attributes:
+          uid: "giovanni.bianchi"
+          cn: "Giovanni Bianchi"
+          sn: "Bianchi"
+          userPassword: "{SSHA}d3m0Ydfgklm67890!"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Crea il Sottogruppo statico: Deploy-Stage1"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        objectClass: [top, groupOfNames]
+        attributes:
+          cn: "Deploy-Stage1"
+          description: "Sottogruppo operativo statico"
+          member: "uid=mario.rossi,ou=People,{{ suffix }}"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Crea il Gruppo Padre DINAMICO: Cloud-Architect"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        objectClass: 
+          - top
+          - groupOfURLs
+          - extensibleObject
+        attributes:
+          cn: "Cloud-Architect"
+          description: "Ruolo Cloud Architect Globale (Risoluzione dinamica)"
+          # Unisce il membro statico diretto e interroga autogroup per raccogliere i membri del sottogruppo
+          memberURL: 
+            - "ldap:///ou=People,{{ suffix }}??sub?(uid=giovanni.bianchi)"
+            - "ldap:///ou=People,{{ suffix }}??sub?(memberOf=cn=Deploy-Stage1,ou=groups,{{ suffix }})"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    # Pausa per permettere a syncrepl di distribuire i record e far elaborare gli overlay locali
+    - name: "[CLUSTER] Attendi la convergenza della replica"
+      ansible.builtin.pause:
+        seconds: 2
+
+    # ==========================================================================
+    # BLOCCO 2: BATTERIA DEI 4 TEST DI VALIDAZIONE LOCALI (SU TUTTI I NODI)
+    # ==========================================================================
+
+    - name: "[TEST 1/4] Estrai gli utenti che risultano memberOf di Cloud-Architect"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "ou=People,{{ suffix }}"
+        -s sub "(&(objectClass=inetOrgPerson)(memberOf=cn=Cloud-Architect,ou=groups,{{ suffix }}))" dn
+      register: test_1_res
+      changed_when: false
+
+    - name: "[TEST 2/4] Verifica quali utenti appartengono al sottogruppo di base Deploy-Stage1"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "ou=People,{{ suffix }}"
+        -s sub "(&(objectClass=inetOrgPerson)(memberOf=cn=Deploy-Stage1,ou=groups,{{ suffix }}))" dn
+      register: test_2_res
+      changed_when: false
+
+    - name: "[TEST 3/4] Ispezione attributi virtuali nel record di Mario Rossi (Nesting Check)"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "uid=mario.rossi,ou=People,{{ suffix }}"
+        -s base "(objectClass=*)" memberOf
+      register: test_3_res
+      changed_when: false
+
+    - name: "[TEST 4/4] Estrai i membri scritti dinamicamente dentro Cloud-Architect"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        -s base "(objectClass=*)" member
+      register: test_4_res
+      changed_when: false
+
+    # ==========================================================================
+    # BLOCCO 3: PULIZIA COMPLETA CENTRALIZZATA (SOLO SUL COORDINATORE)
+    # ==========================================================================
+
+    - name: "[CLEANUP] Rimuovi il dataset di test dal cluster"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "{{ item }}"
+        state: absent
+      loop:
+        - "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        - "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        - "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        - "uid=mario.rossi,ou=People,{{ suffix }}"
+      when: inventory_hostname == groups['cluster'][0]
+
+    # ==========================================================================
+    # BLOCCO 4: OUTPUT DI VALIDAZIONE
+    # ==========================================================================
+
+    - name: "[REGISTRO] Visualizzazione risultati dei test sul nodo {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg:
+          - "----------------------------------------------------------------"
+          - "TEST 1: Utenti totali nel ruolo Cloud-Architect (Ora deve contenere SIA Bianchi SIA Rossi):"
+          - "{{ test_1_res.stdout_lines | select('match', '^dn:') | list }}"
+          - "----------------------------------------------------------------"
+          - "TEST 2: Utenti mappati nel sottogruppo operativo Deploy-Stage1 (Solo Rossi):"
+          - "{{ test_2_res.stdout_lines | select('match', '^dn:') | list }}"
+          - "----------------------------------------------------------------"
+          - "TEST 3: Elenco completo dei 'memberOf' generati nel record di Mario Rossi:"
+          - "{{ test_3_res.stdout_lines | select('match', '^memberOf:') | list }}"
+          - "----------------------------------------------------------------"
+          - "TEST 4: Membri generati in RAM dall'overlay autogroup dentro Cloud-Architect:"
+          - "{{ test_4_res.stdout_lines | select('match', '^member:') | list }}"
+          - "----------------------------------------------------------------"

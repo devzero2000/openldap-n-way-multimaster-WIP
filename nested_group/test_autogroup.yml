@@ -1,0 +1,154 @@
+# ==============================================================================
+# TITOLO:       Test Coordinato e Performance Benchmarking per slapo-autogroup
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Validazione e misurazione esatta in millisecondi dei tempi LDAP.
+# ==============================================================================
+
+---
+- name: "Test e Performance Benchmarking slapo-autogroup"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldap_auth:
+      server_uri: "ldapi:///"
+      bind_dn: "cn=admin,dc=example,dc=com"
+      bind_pw: "openldap"
+
+  tasks:
+
+    # ==========================================================================
+    # FASE 1: BENCHMARK SCRITTURA (SOLO COORDINATORE)
+    # ==========================================================================
+
+    - name: "[COORDINATORE] Prendi timestamp inizio scrittura (Epoch)"
+      ansible.builtin.shell: "date +%s%N"
+      register: t_start_write
+      when: inventory_hostname == groups['cluster'][0]
+      changed_when: false
+
+    - name: "[COORDINATORE] Inietta l'utente Mario Rossi"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=mario.rossi,ou=People,{{ suffix }}"
+        objectClass: [top, inetOrgPerson]
+        attributes:
+          uid: "mario.rossi"
+          cn: "Mario Rossi"
+          sn: "Rossi"
+          userPassword: "{SSHA}d3m0Xdfgklm12345!"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Inietta l'utente Giovanni Bianchi"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        objectClass: [top, inetOrgPerson]
+        attributes:
+          uid: "giovanni.bianchi"
+          cn: "Giovanni Bianchi"
+          sn: "Bianchi"
+          userPassword: "{SSHA}d3m0Ydfgklm67890!"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Crea il Sottogruppo statico Deploy-Stage1"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        objectClass: [top, groupOfNames]
+        attributes:
+          cn: "Deploy-Stage1"
+          description: "Sottogruppo statico operativo"
+          member: "uid=mario.rossi,ou=People,{{ suffix }}"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Crea il Gruppo Padre Dinamico Cloud-Architect"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        objectClass: [top, groupOfURLs, extensibleObject]
+        attributes:
+          cn: "Cloud-Architect"
+          description: "Gruppo dinamico padre autogroup"
+          memberURL: "ldap:///ou=People,{{ suffix }}??sub?(memberOf=cn=Deploy-Stage1,ou=groups,{{ suffix }})"
+        state: present
+      when: inventory_hostname == groups['cluster'][0]
+
+    - name: "[COORDINATORE] Prendi timestamp fine scrittura (Epoch)"
+      ansible.builtin.shell: "date +%s%N"
+      register: t_end_write
+      when: inventory_hostname == groups['cluster'][0]
+      changed_when: false
+
+    - name: "[CLUSTER] Attendi la convergenza della replica"
+      ansible.builtin.pause:
+        seconds: 2
+
+    # ==========================================================================
+    # FASE 2: BENCHMARK LETTURA DISTRIBUITA (TUTTI I NODI)
+    # ==========================================================================
+
+    - name: "[TEST 1/2] Misura millisecondi di risoluzione query memberOf"
+      ansible.builtin.shell: |
+        T_START=$(date +%s%N)
+        ldapsearch -Q -H ldap://localhost -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}' -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf=cn=Cloud-Architect,ou=groups,{{ suffix }}))" dn > /dev/null
+        T_END=$(date +%s%N)
+        echo "$(( (T_END - T_START) / 1000000 ))"
+      register: test_read_ms
+      changed_when: false
+
+    - name: "[TEST 2/2] Ispezione locale dei membri scritti dall'overlay"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost
+        -D '{{ ldap_auth.bind_dn }}' -w '{{ ldap_auth.bind_pw }}'
+        -b "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        -s base "(objectClass=*)" member
+      register: test_read_2
+      changed_when: false
+
+    # ==========================================================================
+    # FASE 3: CLEANUP CENTRALIZZATO (SOLO COORDINATORE)
+    # ==========================================================================
+
+    - name: "[CLEANUP] Rimuovi il dataset di test in modo centralizzato"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth.server_uri }}"
+        bind_dn: "{{ ldap_auth.bind_dn }}"
+        bind_pw: "{{ ldap_auth.bind_pw }}"
+        dn: "{{ item }}"
+        state: absent
+      loop:
+        - "cn=Cloud-Architect,ou=groups,{{ suffix }}"
+        - "cn=Deploy-Stage1,ou=groups,{{ suffix }}"
+        - "uid=giovanni.bianchi,ou=People,{{ suffix }}"
+        - "uid=mario.rossi,ou=People,{{ suffix }}"
+      when: inventory_hostname == groups['cluster'][0]
+
+    # ==========================================================================
+    # FASE 4: REPORT FINALE PULITO
+    # ==========================================================================
+
+    - name: "[AUDIT] Risultati del benchmark sul nodo corrente"
+      ansible.builtin.debug:
+        msg:
+          - "================================================================"
+          - "TEMPO DI INIEZIONE DATASET (SOLO COORDINATORE):"
+          - "Durata totale: {% if t_end_write.stdout is defined and t_start_write.stdout is defined %}{{ (((t_end_write.stdout | int) - (t_start_write.stdout | int)) / 1000000) | round(2) }} ms{% else %}N/A - Nodo Consumer{% endif %}"
+          - "================================================================"
+          - "RISULTATI LETTURA SUL NODO {{ inventory_hostname }}:"
+          - "Tempo di risoluzione query LDAP: {{ test_read_ms.stdout | default('0') | trim }} ms"
+          - "Membri espansi localmente in RAM:"
+          - "{{ test_read_2.stdout_lines | default([]) | select('match', '^member:') | list }}"
+          - "================================================================"
