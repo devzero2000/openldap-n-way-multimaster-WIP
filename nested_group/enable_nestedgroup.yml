@@ -1,9 +1,7 @@
 # ==============================================================================
-# TITOLO:       Configurazione/Sconfigurazione Infrastruttura slapo-nestgroup
+# TITOLO:       Configurazione Infrastruttura slapo-nestgroup (Risolto)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# SCOPO:        Caricare o rimuovere l'overlay nestgroup in cn=config
-#               su TUTTI i nodi del cluster (No cn=config replication).
 # ==============================================================================
 
 ---
@@ -11,7 +9,6 @@
   hosts: cluster
   become: true
   vars:
-    # Stato accettato: 'enable' oppure 'disable'
     stato: "enable"
     suffix: "dc=example,dc=com"
     target_db: "olcDatabase={1}mdb,cn=config"
@@ -19,7 +16,7 @@
   tasks:
 
     # ==========================================================================
-    # CASO: STATO = DISABLE (SU TUTTI I NODI)
+    # CASO: STATO = DISABLE (RIMOZIONE SU TUTTI I NODI)
     # ==========================================================================
     - name: "[DISABLE] Rimuovi l'overlay nestgroup dal database"
       community.general.ldap_entry:
@@ -30,7 +27,7 @@
       when: stato in ['disable', 'disabled']
 
     # ==========================================================================
-    # CASO: STATO = ENABLE (SU TUTTI I NODI)
+    # CASO: STATO = ENABLE (ATTIVAZIONE SU TUTTI I NODI)
     # ==========================================================================
     - name: "[ENABLE] Carica il modulo globale nestgroup"
       community.general.ldap_attrs:
@@ -42,7 +39,7 @@
         state: present
       when: stato in ['enable', 'enabled']
 
-    - name: "[ENABLE] Inizializza e configura l'overlay nestgroup su MDB"
+    - name: "[ENABLE] Inizializza, Configura e Attiva i Flag di slapo-nestgroup"
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
@@ -55,5 +52,11 @@
           olcNestgroupMember: "member"
           olcNestgroupMemberOf: "memberOf"
           olcNestgroupBase: "ou=groups,{{ suffix }}"
+          # ATTIVAZIONE DELLE FUNZIONALITÀ (Flags)
+          olcNestgroupFlags:
+            - "member-filter"
+            - "memberof-filter"
+            - "member-values"
+            - "memberof-values"
         state: present
       when: stato in ['enable', 'enabled']
