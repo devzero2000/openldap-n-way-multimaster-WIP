@@ -1,0 +1,59 @@
+# ==============================================================================
+# TITOLO:       Configurazione/Sconfigurazione Infrastruttura slapo-nestgroup
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Caricare o rimuovere l'overlay nestgroup in cn=config
+#               su TUTTI i nodi del cluster (No cn=config replication).
+# ==============================================================================
+
+---
+- name: "Gestione Infrastruttura slapo-nestgroup su tutto il Cluster"
+  hosts: cluster
+  become: true
+  vars:
+    # Stato accettato: 'enable' oppure 'disable'
+    stato: "enable"
+    suffix: "dc=example,dc=com"
+    target_db: "olcDatabase={1}mdb,cn=config"
+
+  tasks:
+
+    # ==========================================================================
+    # CASO: STATO = DISABLE (SU TUTTI I NODI)
+    # ==========================================================================
+    - name: "[DISABLE] Rimuovi l'overlay nestgroup dal database"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}nestgroup,{{ target_db }}"
+        state: absent
+      when: stato in ['disable', 'disabled']
+
+    # ==========================================================================
+    # CASO: STATO = ENABLE (SU TUTTI I NODI)
+    # ==========================================================================
+    - name: "[ENABLE] Carica il modulo globale nestgroup"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "nestgroup"
+        state: present
+      when: stato in ['enable', 'enabled']
+
+    - name: "[ENABLE] Inizializza e configura l'overlay nestgroup su MDB"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}nestgroup,{{ target_db }}"
+        objectClass:
+          - olcOverlayConfig
+          - olcNestGroupConfig
+        attributes:
+          olcOverlay: "{0}nestgroup"
+          olcNestgroupMember: "member"
+          olcNestgroupMemberOf: "memberOf"
+          olcNestgroupBase: "ou=groups,{{ suffix }}"
+        state: present
+      when: stato in ['enable', 'enabled']
