@@ -1,0 +1,136 @@
+---
+- name: "LDAP Cluster Deep Consistency Audit"
+  hosts: all
+  become: true
+  serial: 0 # Esegue le attività di raccolta in parallelo su tutti i nodi
+  vars:
+    # --------------------------------------------------------------------------
+    # CONFIGURAZIONE VARIABILI DI BASE
+    # --------------------------------------------------------------------------
+    root_dse: "dc=example,dc=com"
+    ou_people: "ou=People,dc=example,dc=com"
+    ou_groups: "ou=groups,dc=example,dc=com"
+    
+    # Percorsi di staging sui nodi remoti
+    stage_dir: "/tmp/ldap_audit"
+    
+  tasks:
+    - name: "[PREPARE] Crea la directory di staging locale su ogni nodo"
+      ansible.builtin.file:
+        path: "{{ stage_dir }}"
+        state: directory
+        mode: '0700'
+
+    # ==========================================================================
+    # FASE 1: VERIFICA QUANTITATIVA (COUNTING)
+    # ==========================================================================
+    - name: "[COUNT] Calcola il numero totale di utenti attuali"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "{{ ou_people }}" -s one "(objectClass=*)" dn 2>/dev/null | grep -c "^dn:" || echo 0
+      register: remote_user_count
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: "[COUNT] Calcola il numero totale di gruppi attuali"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "{{ ou_groups }}" -s one "(objectClass=*)" dn 2>/dev/null | grep -c "^dn:" || echo 0
+      register: remote_group_count
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    # ==========================================================================
+    # FASE 2: ESTRAZIONE E DISINFESTAZIONE DEI DATI (SLAPCAT)
+    # ==========================================================================
+    - name: "[DUMP] Estrae e normalizza i DN degli Utenti via slapcat"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        slapcat -b "{{ root_dse }}" -a "(objectClass=inetOrgPerson)" 2>/dev/null | 
+        grep "^dn: " | sort > "{{ stage_dir }}/users_dn.txt"
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: "[DUMP] Estrae e normalizza i DN dei Gruppi via slapcat"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        slapcat -b "{{ root_dse }}" -a "(objectClass=groupOfNames)" 2>/dev/null | 
+        grep "^dn: " | sort > "{{ stage_dir }}/groups_dn.txt"
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    # ==========================================================================
+    # FASE 3: CENTRALIZZAZIONE DEI DATI SUL CONTROLLER
+    # ==========================================================================
+    - name: "[FETCH] Centralizza i report sul server di controllo Ansible"
+      ansible.builtin.fetch:
+        src: "{{ stage_dir }}/{{ item }}"
+        dest: "/tmp/ldap_audit_master/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+      loop:
+        - "users_dn.txt"
+        - "groups_dn.txt"
+
+    - name: "[CLEANUP] Rimuove la directory di staging sui nodi remoti"
+      ansible.builtin.file:
+        path: "{{ stage_dir }}"
+        state: absent
+
+# ==============================================================================
+# FASE 4: ANALISI DELLE DISCREPANZE (ELABORAZIONE LOCALE SUL CONTROLLER)
+# ==============================================================================
+- name: "Consolida ed Elabora le Discrepanze del Cluster"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "[ANALYSIS] Verifica l'omogeneità dei conteggi quantitativi"
+      ansible.builtin.assert:
+        that:
+          - "hostvars[item]['remote_user_count']['stdout'] == hostvars[groups['all'][0]]['remote_user_count']['stdout']"
+          - "hostvars[item]['remote_group_count']['stdout'] == hostvars[groups['all'][0]]['remote_group_count']['stdout']"
+        fail_msg: >
+          CRITICAL: Disallineamento quantitativo rilevato! 
+          Il nodo {{ item }} ha {{ hostvars[item]['remote_user_count']['stdout'] }} utenti e {{ hostvars[item]['remote_group_count']['stdout'] }} gruppi.
+          Il nodo di riferimento {{ groups['all'][0] }} ha {{ hostvars[groups['all'][0]]['remote_user_count']['stdout'] }} utenti e {{ hostvars[groups['all'][0]]['remote_group_count']['stdout'] }} gruppi.
+        success_msg: "Allineamento quantitativo OK per il nodo {{ item }}."
+      loop: "{{ groups['all'] }}"
+
+    - name: "[ANALYSIS] Genera i file di Diff incrociati per gli Utenti"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        diff -u /tmp/ldap_audit_master/{{ groups['all'][0] }}/users_dn.txt /tmp/ldap_audit_master/{{ item }}/users_dn.txt || true
+      register: users_diff_output
+      loop: "{{ groups['all'] }}"
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: "[ANALYSIS] Genera i file di Diff incrociati per i Gruppi"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        diff -u /tmp/ldap_audit_master/{{ groups['all'][0] }}/groups_dn.txt /tmp/ldap_audit_master/{{ item }}/groups_dn.txt || true
+      register: groups_diff_output
+      loop: "{{ groups['all'] }}"
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: "[REPORT] Mostra in modo chiaro le entry orfane o mancanti"
+      ansible.builtin.debug:
+        msg: >
+          {% set index = ansible_loop.index0 %}
+          === CONFRONTO NODI: RIFERIMENTO [{{ groups['all'][0] }}] vs TARGET [{{ item }}] ===
+          
+          --- DISCREPANZE UTENTI ---
+          {{ users_diff_output.results[index].stdout | default('Nessuna discrepanza (100% allineati)') }}
+          
+          --- DISCREPANZE GRUPPI ---
+          {{ groups_diff_output.results[index].stdout | default('Nessuna discrepanza (100% allineati)') }}
+      loop: "{{ groups['all'] }}"
+      loop_control:
+        extended: true
+
