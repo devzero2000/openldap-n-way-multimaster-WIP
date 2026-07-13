@@ -22,28 +22,7 @@
         mode: '0700'
 
     # ==========================================================================
-    # FASE 1: VERIFICA QUANTITATIVA (COUNTING)
-    # ==========================================================================
-    - name: "[COUNT] Calcola il numero totale di utenti attuali"
-      ansible.builtin.shell: >
-        set -o pipefail &&
-        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "{{ ou_people }}" -s one "(objectClass=*)" dn 2>/dev/null | grep -c "^dn:" || echo 0
-      register: remote_user_count
-      changed_when: false
-      args:
-        executable: /bin/bash
-
-    - name: "[COUNT] Calcola il numero totale di gruppi attuali"
-      ansible.builtin.shell: >
-        set -o pipefail &&
-        ldapsearch -Q -Y EXTERNAL -H ldapi:/// -b "{{ ou_groups }}" -s one "(objectClass=*)" dn 2>/dev/null | grep -c "^dn:" || echo 0
-      register: remote_group_count
-      changed_when: false
-      args:
-        executable: /bin/bash
-
-    # ==========================================================================
-    # FASE 2: ESTRAZIONE E DISINFESTAZIONE DEI DATI (SLAPCAT)
+    # FASE 1 & 2: ESTRAZIONE DATI VIA SLAPCAT (BYPASS SIZELIMIT)
     # ==========================================================================
     - name: "[DUMP] Estrae e normalizza i DN degli Utenti via slapcat"
       ansible.builtin.shell: >
@@ -64,7 +43,28 @@
         executable: /bin/bash
 
     # ==========================================================================
-    # FASE 3: CENTRALIZZAZIONE DEI DATI SUL CONTROLLER
+    # FASE 3: CONTEGGIO STRUTTURATO SUI DN ESTRATTI
+    # ==========================================================================
+    - name: "[COUNT] Calcola il numero totale di utenti contando i DN"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        grep -c "^dn: " "{{ stage_dir }}/users_dn.txt" || echo 0
+      register: remote_user_count
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    - name: "[COUNT] Calcola il numero totale di gruppi contando i DN"
+      ansible.builtin.shell: >
+        set -o pipefail &&
+        grep -c "^dn: " "{{ stage_dir }}/groups_dn.txt" || echo 0
+      register: remote_group_count
+      changed_when: false
+      args:
+        executable: /bin/bash
+
+    # ==========================================================================
+    # FASE 4: CENTRALIZZAZIONE DEI DATI SUL CONTROLLER
     # ==========================================================================
     - name: "[FETCH] Centralizza i report sul server di controllo Ansible"
       ansible.builtin.fetch:
@@ -81,7 +81,7 @@
         state: absent
 
 # ==============================================================================
-# FASE 4: ANALISI DELLE DISCREPANZE (ELABORAZIONE LOCALE SUL CONTROLLER)
+# FASE 5: ANALISI DELLE DISCREPANZE (ELABORAZIONE LOCALE SUL CONTROLLER)
 # ==============================================================================
 - name: "Consolida ed Elabora le Discrepanze del Cluster"
   hosts: localhost
@@ -90,12 +90,12 @@
     - name: "[ANALYSIS] Verifica l'omogeneità dei conteggi quantitativi"
       ansible.builtin.assert:
         that:
-          - "hostvars[item]['remote_user_count']['stdout'] == hostvars[groups['all'][0]]['remote_user_count']['stdout']"
-          - "hostvars[item]['remote_group_count']['stdout'] == hostvars[groups['all'][0]]['remote_group_count']['stdout']"
+          - "hostvars[item]['remote_user_count']['stdout'] | trim == hostvars[groups['all'][0]]['remote_user_count']['stdout'] | trim"
+          - "hostvars[item]['remote_group_count']['stdout'] | trim == hostvars[groups['all'][0]]['remote_group_count']['stdout'] | trim"
         fail_msg: >
           CRITICAL: Disallineamento quantitativo rilevato! 
-          Il nodo {{ item }} ha {{ hostvars[item]['remote_user_count']['stdout'] }} utenti e {{ hostvars[item]['remote_group_count']['stdout'] }} gruppi.
-          Il nodo di riferimento {{ groups['all'][0] }} ha {{ hostvars[groups['all'][0]]['remote_user_count']['stdout'] }} utenti e {{ hostvars[groups['all'][0]]['remote_group_count']['stdout'] }} gruppi.
+          Il nodo {{ item }} ha {{ hostvars[item]['remote_user_count']['stdout'] | trim }} utenti e {{ hostvars[item]['remote_group_count']['stdout'] | trim }} gruppi.
+          Il nodo di riferimento {{ groups['all'][0] }} ha {{ hostvars[groups['all'][0]]['remote_user_count']['stdout'] | trim }} utenti e {{ hostvars[groups['all'][0]]['remote_group_count']['stdout'] | trim }} gruppi.
         success_msg: "Allineamento quantitativo OK per il nodo {{ item }}."
       loop: "{{ groups['all'] }}"
 
@@ -119,10 +119,14 @@
       args:
         executable: /bin/bash
 
-    - name: "[REPORT] Mostra in modo chiaro le entry orfane o mancanti"
+    - name: "[REPORT] Mostra in modo chiaro le entry orfane o mancanti e i totali per nodo"
       ansible.builtin.debug:
         msg: >
           {% set index = ansible_loop.index0 %}
+          === STATISTICHE NODO TARGET: [{{ item }}] ===
+          Totale Utenti validi (corrispondenza DN): {{ hostvars[item]['remote_user_count']['stdout'] | trim }}
+          Totale Gruppi validi (corrispondenza DN): {{ hostvars[item]['remote_group_count']['stdout'] | trim }}
+          
           === CONFRONTO NODI: RIFERIMENTO [{{ groups['all'][0] }}] vs TARGET [{{ item }}] ===
           
           --- DISCREPANZE UTENTI ---
@@ -133,4 +137,3 @@
       loop: "{{ groups['all'] }}"
       loop_control:
         extended: true
-
