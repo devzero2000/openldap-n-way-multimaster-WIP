@@ -13,8 +13,9 @@
   become: true
   vars:
     ldap_basedn: "dc=example,dc=com"
-    ldap_rootdn: "cn=admin,dc=example,dc=com"
-    ldap_rootpw: "openldap"
+    ldap_repl_user: "cn=nwayreplicator,ou=system,dc=example,dc=com"
+    ldap_repl_pass: "nwayreplicator"
+  
     
     # Asset della PKI locale definiti nel deploy hardened principale
     ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
@@ -24,14 +25,14 @@
     # Configurazione asimmetrica pulita: gli indici numerici li gestisce OpenLDAP internamente
     cluster_providers:
       ubuntu24lts1.example.com:
-        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_repl_user }}" bindmethod=simple credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_repl_user }}" bindmethod=simple credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
       ubuntu24lts2.example.com:
-        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_repl_user }}" bindmethod=simple credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=003 provider=ldaps://ubuntu24lts3.example.com:636 binddn="{{ ldap_repl_user }}" bindmethod=simple credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
       ubuntu24lts3.example.com:
-        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
-        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_rootdn }}" bindmethod=simple credentials={{ ldap_rootpw }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=001 provider=ldaps://ubuntu24lts1.example.com:636 binddn="{{ ldap_repl_user }}" bindmethod=simple credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
+        - 'rid=002 provider=ldaps://ubuntu24lts2.example.com:636 binddn="{{ ldap_repl_user }}" bindmethod=simple credentials={{ ldap_repl_pass }} searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 5 10 10 30 30 60 +" timeout=0 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand'
 
   tasks:
     - name: "Applicazione configurazione repliche ed attivazione olcMultiProvider via LDIF"
