@@ -1,5 +1,5 @@
 # ==============================================================================
-# TITOLO:       Configurazione Infrastruttura slapo-memberof (Risolto)
+# TITOLO:       Configurazione Infrastruttura slapo-memberof (Risolto per Replica)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
 # SCOPO:        Caricamento modulo e configurazione corretta di memberof statico.
@@ -37,10 +37,10 @@
           olcMemberOfGroupOC: "groupOfNames"
           olcMemberOfMemberAD: "member"
           olcMemberOfMemberOfAD: "memberOf"
-          # Sintassi corretta per il DN di controllo
           olcMemberOfDN: "cn=admin,{{ suffix }}"
-          # Vincolo fondamentale per ambienti Multi-Master/Syncrepl
-          olcMemberOfRefInt: "TRUE"
+          # Configurazione necessaria per ambienti replicati
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
         state: present
 
     - name: "[RESTART] Riavvia slapd per applicare l'overlay"
