@@ -1,0 +1,100 @@
+# ==============================================================================
+# TITOLO:       Verifica Performance e Validazione Stabilità slapo-memberof (Esteso)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Verificare i tempi delle query dirette e inverse, l'I/O di LMDB,
+#               e monitorare lo stato di salute e sincronizzazione del cluster.
+# ==============================================================================
+
+---
+- name: "Validazione Metriche di Tuning e Performance"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    # Campioni per bind e query dirette
+    test_user_1: "uid=user.500,ou=People,dc=example,dc=com"
+    test_user_1_pw: "user.500.1"
+    test_user_2: "uid=user.25000,ou=People,dc=example,dc=com"
+    test_user_2_pw: "user.25000.1"
+    
+    # Nuovi target per test strutturati
+    test_group_small: "cn=group.500,ou=groups,{{ suffix }}"
+    test_group_large: "cn=architect.1,ou=groups,{{ suffix }}"
+
+  tasks:
+
+    - name: "[METRICA 1] Estrazione diretta dell'attributo memberOf (Verifica indici statici)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "{{ test_user_1 }}" -s base "(objectClass=*)" memberOf
+      register: query_1_time
+      changed_when: false
+
+    - name: "[METRICA 2] Query inversa filtrata su un ruolo da 10.000 membri"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_2 }}" -w "{{ test_user_2_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ test_group_large }}))" dn
+      register: query_2_time
+      changed_when: false
+
+    - name: "[METRICA 3] Estrazione diretta attributo member da un gruppo periferico (10 utenti)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "{{ test_group_small }}" -s base "(objectClass=*)" member
+      register: query_3_time
+      changed_when: false
+
+    - name: "[METRICA 4] Query inversa filtrata su un gruppo periferico (10 membri)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ test_group_small }}))" dn
+      register: query_4_time
+      changed_when: false
+
+    - name: "[METRICA 5] Ricerca wildcard su sottoalbero gruppi (cn=group.15*)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_2 }}" -w "{{ test_user_2_pw }}"
+        -b "ou=groups,{{ suffix }}" -s sub "(cn=group.15*)" dn
+      register: query_5_time
+      changed_when: false
+
+    - name: "[STABILITÀ] Controllo dello stato di sincronizzazione del cluster (contextCSN)"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost -D "cn=admin,{{ suffix }}" -w "openldap"
+        -b "{{ suffix }}" -s base "(objectClass=*)" contextCSN
+      register: context_csn_res
+      changed_when: false
+
+    - name: "[DIAGNOSTICA] Monitora l'I/O fisico del DB di backend LMDB"
+      ansible.builtin.command: "ls -lh /var/lib/ldap/data.mdb"
+      register: mdb_disk_size
+      changed_when: false
+
+    - name: "[REPORT] Generazione del report di impatto"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " METRICHE PRESTAZIONALI E COMPORTAMENTO STRUTTURALE MEMBEROF"
+          - "=================================================================="
+          - "1. Dimensione reale del database LMDB su disco:"
+          - "{{ mdb_disk_size.stdout }}"
+          - "------------------------------------------------------------------"
+          - "2. Tempo di estrazione diretta di memberOf (Query Base Utente):"
+          - "{{ query_1_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "3. Tempo di estrazione diretta dei membri di un gruppo (10 utenti):"
+          - "{{ query_3_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "4. Tempo di risoluzione inversa filtrata su ruolo Large (10k utenti):"
+          - "{{ query_2_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "5. Tempo di risoluzione inversa filtrata su gruppo Small (10 utenti):"
+          - "{{ query_4_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "6. Tempo di ricerca parziale Wildcard su 30.000 gruppi (cn=group.15*):"
+          - "{{ query_5_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "7. Stato dei contatori di replica (contextCSN) sul nodo {{ inventory_hostname }}:"
+          - "{{ context_csn_res.stdout_lines | select('match', '^contextCSN:') | list }}"
+          - "=================================================================="
