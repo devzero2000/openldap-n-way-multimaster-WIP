@@ -1,0 +1,121 @@
+# ==============================================================================
+# SCOPO: Test essenziale di creazione, cambio e sincronizzazione password su
+#        cluster OpenLDAP Multi-Master con Password Policy globale attiva.
+# ==============================================================================
+
+---
+- name: Test Semplice Sincronizzazione Password OpenLDAP
+  hosts: cluster
+  gather_facts: false
+  vars:
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+    
+    test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
+    
+    node1: "{{ groups['cluster'][0] }}"
+    other_nodes: "{{ groups['cluster'][1:] }}"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # 1. CLEANUP INIZIALE (NODO 1)
+    # --------------------------------------------------------------------------
+    - name: "[STEP 1] Cancella l'utente di test su node1 (se gia' presente)"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Crea la OU users se non presente"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "ou=users,{{ suffix }}"
+        objectClass: [top, organizationalUnit]
+        attributes: { ou: users }
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 2. CREAZIONE E CAMBIO PASSWORD (NODO 1)
+    # --------------------------------------------------------------------------
+    - name: "[STEP 2a] Genera hash SSHA per la password iniziale valida"
+      ansible.builtin.command: "slappasswd -s PasswordTemp123!"
+      register: initial_pw_hash
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[STEP 2b] Crea l'utente con password temporanea hashata su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        objectClass: [top, person, organizationalPerson, inetOrgPerson]
+        attributes:
+          cn: testuser
+          sn: Test
+          userPassword: "{{ initial_pw_hash.stdout }}"
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[STEP 2c] L'utente si cambia la password rispettando PPolicy su node1"
+      ansible.builtin.command: >
+        ldappasswd -H ldap://127.0.0.1/
+        -D "{{ test_user_dn }}"
+        -w "PasswordTemp123!"
+        -s "NuovaPasswordSegreta456!"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 3. PAUSA E VERIFICA SINCRONIZZAZIONE SUGLI ALTRI NODI
+    # --------------------------------------------------------------------------
+    - name: "[PAUSA] Attesa per la sincronizzazione syncrepl Multi-Master"
+      ansible.builtin.pause:
+        seconds: 2
+      run_once: true
+
+    - name: "[STEP 3] Verifica la nuova password effettuando il login mirato sugli altri nodi"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ item }}/
+        -D "{{ test_user_dn }}"
+        -w "NuovaPasswordSegreta456!"
+        -b "{{ test_user_dn }}"
+        -s base "dn"
+      loop: "{{ other_nodes }}"
+      register: sync_results
+      ignore_errors: true
+      run_once: true
+
+    - name: "[VERIFICA] Esito della sincronizzazione"
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+        fail_msg: "ERRORE: La nuova password non e' stata sincronizzata sul nodo {{ item.item }}"
+        success_msg: "OK: La password si e' sincronizzata correttamente con il nodo {{ item.item }}"
+      loop: "{{ sync_results.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 4. CLEANUP FINALE (NODO 1)
+    # --------------------------------------------------------------------------
+    - name: "[STEP 4] Cancella l'utente di test su node1 a fine test"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
