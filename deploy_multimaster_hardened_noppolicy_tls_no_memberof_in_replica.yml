@@ -231,7 +231,7 @@
         - anon_result.rc != 0
         - "'Type or value exists' not in anon_result.stderr"
 
-    - name: C. Generazione LDIF per ACL Globali (olcAccess)
+    - name: C. Generazione LDIF per ACL Globali Corrette (olcAccess)
       copy:
         dest: /tmp/01c_acl_init.ldif
         content: |
@@ -240,9 +240,28 @@
           replace: olcAccess
           olcAccess: {0}to dn.base="" by anonymous read by * read
           olcAccess: {1}to dn.base="cn=Subschema" by anonymous read by * read
-          olcAccess: {2}to attrs=userPassword by self write by group.exact="{{ ldap_admin_group }}" write by dn.exact="{{ ldap_rootdn }}" write by * auth
-          olcAccess: {3}to attrs=shadowLastChange by self write by * read
-          olcAccess: {4}to dn.subtree="{{ ldap_basedn }}" by group.exact="{{ ldap_admin_group }}" write by dn.exact="{{ ldap_rootdn }}" write by self write by users read by * none
+          olcAccess: {2}to attrs=userPassword,pwdReset
+            by self write
+            by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.exact="{{ ldap_repl_user }}" read
+            by * auth
+          olcAccess: {3}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
+            by self read
+            by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.exact="{{ ldap_repl_user }}" read
+            by * none
+          olcAccess: {4}to dn.subtree="{{ ldap_basedn }}"
+            by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.exact="{{ ldap_repl_user }}" read
+            by self write
+            by users read
+            by * none
 
     - name: D. Applicazione ACL Globali
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01c_acl_init.ldif
