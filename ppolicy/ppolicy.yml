@@ -63,7 +63,7 @@
         attributes:
           olcOverlay: "ppolicy"
           olcPPolicyDefault: "cn=default,ou=policies,{{ suffix }}"
-          olcPPolicyForwardUpdates: "FALSE"
+          olcPPolicyForwardUpdates: "TRUE"
         state: present
       when: stato == "enable"
 
