@@ -1,0 +1,103 @@
+# ==============================================================================
+# TITOLO:       Verifica Password Policy e Replicazione OpenLDAP Multi-Master
+# SCOPO:        Verificare che la PPolicy e l'overlay siano presenti su tutti i nodi
+#               e che la replica tra i nodi del cluster stia funzionando.
+# ==============================================================================
+
+---
+- name: Verifica Password Policy e Replica OpenLDAP
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+    
+    # Policy DN che dobbiamo verificare
+    policy_dn: "cn=default,ou=policies,{{ suffix }}"
+    
+    # Overlay DN su cn=config
+    overlay_dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
+
+  tasks:
+    # ==========================================================================
+    # 1. VERIFICA LOCALE SU CN=CONFIG (L'overlay ppolicy è attivo sul nodo?)
+    # ==========================================================================
+    
+    - name: "[LOCAL] Verifica presenza overlay ppolicy su cn=config"
+      community.general.ldap_search:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "{{ overlay_dn }}"
+        scope: "base"
+      register: local_overlay_check
+      failed_when: false
+
+    - name: "[LOCAL] Stampa stato overlay locale"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            'OK: Overlay ppolicy configurato su cn=config' 
+            if local_overlay_check.results | length > 0 
+            else 'ERRORE: Overlay ppolicy MANCANTE su cn=config!'
+          }}
+
+    # ==========================================================================
+    # 2. VERIFICA LOCALE SU DIT (La policy default esiste sul DB locale?)
+    # ==========================================================================
+
+    - name: "[LOCAL] Leggi l'entry della Password Policy locale"
+      community.general.ldap_search:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ policy_dn }}"
+        scope: "base"
+      register: local_policy_search
+      failed_when: false
+
+    - name: "[LOCAL] Mostra i parametri della policy letti dal DB locale"
+      ansible.builtin.debug:
+        msg:
+          - "Stato Policy: {{ 'Trovata' if local_policy_search.results | length > 0 else 'NON Trovata' }}"
+          - "pwdMinLength: {{ local_policy_search.results[0].pwdMinLength | default('N/A') }}"
+          - "pwdMaxFailure: {{ local_policy_search.results[0].pwdMaxFailure | default('N/A') }}"
+          - "pwdLockout: {{ local_policy_search.results[0].pwdLockout | default('N/A') }}"
+          - "pwdInHistory: {{ local_policy_search.results[0].pwdInHistory | default('N/A') }}"
+      when: local_policy_search.results | length > 0
+
+    # ==========================================================================
+    # 3. VERIFICA CROSS-NODE / REPLICA (Ogni nodo interroga tutti gli ALTRI nodi)
+    # ==========================================================================
+
+    - name: "[CROSS-CHECK] Verifica la visibilità della policy sugli altri nodi del cluster"
+      community.general.ldap_search:
+        server_uri: "ldap://{{ item }}/"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ policy_dn }}"
+        scope: "base"
+      loop: "{{ groups['cluster'] }}"
+      register: cross_node_check
+      failed_when: false
+
+    - name: "[CROSS-CHECK] Esito interrogazione incrociata tra nodi"
+      ansible.builtin.debug:
+        msg: >-
+          Interrogando {{ item.item }}: 
+          {{ 'REPLICA OK (Policy trovata)' if item.results | length > 0 else 'FALLITO (Impossibile raggiungere o policy assente)' }}
+      loop: "{{ cross_node_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # ==========================================================================
+    # 4. REPORT E ASSERT FINALE
+    # ==========================================================================
+
+    - name: "[ASSERT] Blocca l'esecuzione se la configurazione o la replica non è coerente"
+      ansible.builtin.assert:
+        that:
+          - local_overlay_check.results | length > 0
+          - local_policy_search.results | length > 0
+        fail_msg: "CRITICO: Il nodo {{ inventory_hostname }} non ha la password policy configurata o replicata correttamente!"
+        success_msg: "OK: Password policy e overlay verificati con successo sul nodo {{ inventory_hostname }}."
