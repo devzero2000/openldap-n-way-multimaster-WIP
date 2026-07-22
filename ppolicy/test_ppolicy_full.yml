@@ -1,0 +1,198 @@
+# ==============================================================================
+# TITOLO:       Test Completo Password Policy e Replicazione Multi-Master
+# SCOPO:        1. Cleanup e creazione utente su Node1.
+#               2. Test vincolo Lunghezza Minima (pwdMinLength).
+#               3. Test Cronologia Password (pwdInHistory) verificata su Node2/3.
+#               4. Test Lockout Distribuito (pwdMaxFailure) su nodi incrociati.
+#               5. Cleanup finale.
+# ==============================================================================
+
+---
+- name: Test Completo Password Policy OpenLDAP Multi-Master
+  hosts: cluster
+  gather_facts: false
+  vars:
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+    
+    test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
+    
+    node1: "{{ groups['cluster'][0] }}"
+    other_nodes: "{{ groups['cluster'][1:] }}"
+
+  tasks:
+    # ==========================================================================
+    # FASE 0: CLEANUP PREVENTIVO E CREAZIONE UTENTE
+    # ==========================================================================
+
+    - name: "[SETUP] Cleanup utente residuo da esecuzioni precedenti su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Crea la OU users se non presente"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "ou=users,{{ suffix }}"
+        objectClass: [top, organizationalUnit]
+        attributes: { ou: users }
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Genera hash SSHA per la password iniziale"
+      ansible.builtin.command: "slappasswd -s PasswordIniziale123!"
+      register: initial_pw_hash
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Crea l'utente di test con password hashata su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        objectClass: [top, person, organizationalPerson, inetOrgPerson]
+        attributes:
+          cn: testuser
+          sn: Test
+          userPassword: "{{ initial_pw_hash.stdout }}"
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 1: TEST LUNGHEZZA MINIMA (pwdMinLength = 12)
+    # ==========================================================================
+
+    - name: "[TEST 1 - LUNGHEZZA] Tenta di impostare una password troppo corta (< 12 car.) su node1"
+      ansible.builtin.command: >
+        ldappasswd -H ldap://127.0.0.1/
+        -D "{{ test_user_dn }}"
+        -w "PasswordIniziale123!"
+        -s "Corta1!"
+      register: short_pw_test
+      ignore_errors: true
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[VERIFICA 1] Valida che PPolicy blocchi la password troppo corta"
+      ansible.builtin.assert:
+        that:
+          - short_pw_test.rc != 0
+          - "'Constraint violation' in short_pw_test.stdout or 'Constraint violation' in short_pw_test.stderr or 'Password fails quality' in short_pw_test.stdout or short_pw_test.rc == 19"
+        fail_msg: "ERRORE: La password troppo corta (< 12 car.) e' stata accettata da PPolicy!"
+        success_msg: "OK: PPolicy ha rifiutato correttamente la password troppo corta."
+      run_once: true
+
+    # ==========================================================================
+    # FASE 2: CAMBIO PASSWORD REGOLARE E TEST CRONOLOGIA (pwdInHistory = 5)
+    # ==========================================================================
+
+    - name: "[FASE 2] L'utente esegue un cambio password REGOLARE su node1"
+      ansible.builtin.command: >
+        ldappasswd -H ldap://127.0.0.1/
+        -D "{{ test_user_dn }}"
+        -w "PasswordIniziale123!"
+        -s "NuovaPasswordValida456!"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[PAUSA] Pausa per sincronizzazione syncrepl della nuova password e di pwdHistory"
+      ansible.builtin.pause:
+        seconds: 2
+      run_once: true
+
+    - name: "[TEST 2 - CRONOLOGIA] Tenta di riutilizzare la password VECCHIA ('PasswordIniziale123!') su un NODO SECONDARIO"
+      ansible.builtin.command: >
+        ldappasswd -H ldap://{{ item }}/
+        -D "{{ test_user_dn }}"
+        -w "NuovaPasswordValida456!"
+        -s "PasswordIniziale123!"
+      loop: "{{ other_nodes }}"
+      register: history_pw_test
+      ignore_errors: true
+      run_once: true
+
+    - name: "[VERIFICA 2] Valida che l'attributo pwdHistory sia stato replicato e la vecchia password rifiutata sui nodi secondari"
+      ansible.builtin.assert:
+        that:
+          - item.rc != 0
+          - "'Constraint violation' in item.stdout or 'Constraint violation' in item.stderr or 'Password is in history' in item.stdout or 'Password is in history' in item.stderr or item.rc == 19"
+        fail_msg: "ERRORE: Il nodo {{ item.item }} ha permesso il riutilizzo della vecchia password! pwdHistory non si e' replicato."
+        success_msg: "OK: Replicazione pwdHistory verificata! Il nodo {{ item.item }} ha bloccato il riutilizzo della vecchia password."
+      loop: "{{ history_pw_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 3: TEST LOCKOUT DISTRIBUITO (pwdMaxFailure = 5 e pwdLockout = TRUE)
+    # ==========================================================================
+
+    - name: "[TEST 3 - LOCKOUT] Genera fallimenti di login distribuiti su tutti i nodi del cluster"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ item }}/
+        -D "{{ test_user_dn }}"
+        -w "PasswordSbagliataErrata!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      loop: "{{ groups['cluster'] }}"
+      register: failures_test
+      ignore_errors: true
+      run_once: true
+
+    - name: "[TEST 3 - LOCKOUT] Completa i tentativi falliti per superare la soglia (pwdMaxFailure=5) su node1"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ node1 }}/
+        -D "{{ test_user_dn }}"
+        -w "PasswordSbagliataErrata!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      loop: [1, 2]
+      ignore_errors: true
+      run_once: true
+
+    - name: "[PAUSA] Pausa per propagazione syncrepl dell'attributo pwdAccountLockedTime"
+      ansible.builtin.pause:
+        seconds: 2
+      run_once: true
+
+    - name: "[TEST 3 - LOCKOUT] Tenta il login con la password CORRETTA su un NODO SECONDARIO"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ other_nodes[0] }}/
+        -D "{{ test_user_dn }}"
+        -w "NuovaPasswordValida456!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      register: lockout_check
+      ignore_errors: true
+      run_once: true
+
+    - name: "[VERIFICA 3] Valida che l'account risulti BLOCCATO sul nodo secondario"
+      ansible.builtin.assert:
+        that:
+          - lockout_check.rc != 0
+          - "'Account locked' in lockout_check.stderr or 'Account locked' in lockout_check.stdout or lockout_check.rc == 49"
+        fail_msg: "ERRORE CRITICO: L'utente e' stato bloccato su node1 ma riesce ancora ad accedere su {{ other_nodes[0] }}!"
+        success_msg: "OK: Replicazione pwdAccountLockedTime verificata! L'account risulta BLOCCATO anche sul nodo {{ other_nodes[0] }}."
+      run_once: true
+
+    # ==========================================================================
+    # FASE 4: CLEANUP FINALE
+    # ==========================================================================
+
+    - name: "[CLEANUP] Rimuovi l'utente di test a fine esecuzione su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
