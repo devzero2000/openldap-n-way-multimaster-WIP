@@ -1,0 +1,106 @@
+# ==============================================================================
+# TITOLO:       Test Validazione Replicazione Password Multi-Master OpenLDAP
+# SCOPO:        1. Cleanup preventivo dell'utente di test su node1.
+#               2. Creazione utente e cambio password autonomo su node1.
+#               3. Validazione BIND con nuova password su node2 e node3.
+#               4. Cleanup finale.
+# ==============================================================================
+
+---
+- name: Test Sincronizzazione Password OpenLDAP Multi-Master
+  hosts: cluster
+  gather_facts: false
+  vars:
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+    
+    test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
+    
+    node1: "{{ groups['cluster'][0] }}"
+    other_nodes: "{{ groups['cluster'][1:] }}"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # 1. CLEANUP PREVENTIVO (NODO 1)
+    # --------------------------------------------------------------------------
+    - name: "[STEP 1] Cleanup utente residuo da esecuzioni precedenti su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 2. CREAZIONE UTENTE E CAMBIO PASSWORD AUTONOMO (NODO 1)
+    # --------------------------------------------------------------------------
+    - name: "[STEP 2a] Crea utente con password temporanea su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        objectClass: [top, person, organizationalPerson, inetOrgPerson]
+        attributes:
+          cn: testuser
+          sn: Test
+          userPassword: "PasswordTemp123!"
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[STEP 2b] L'utente modifica la propria password via ldappasswd su node1"
+      ansible.builtin.command: >
+        ldappasswd -H ldapi:///
+        -D "{{ test_user_dn }}"
+        -w "PasswordTemp123!"
+        -s "NuovaPasswordSegreta456!"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[PAUSA] Pausa di 2 secondi per sincronizzazione syncrepl"
+      ansible.builtin.pause:
+        seconds: 2
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 3. VERIFICA BIND SUGLI ALTRI NODI DEL CLUSTER
+    # --------------------------------------------------------------------------
+    - name: "[STEP 3] Tenta l'autenticazione (BIND) con la nuova password sugli altri nodi"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ item }}/
+        -D "{{ test_user_dn }}"
+        -w "NuovaPasswordSegreta456!"
+        -b "{{ suffix }}"
+        "(cn=testuser)" dn
+      loop: "{{ other_nodes }}"
+      register: bind_test
+      ignore_errors: true
+      run_once: true
+
+    - name: "[VERIFICA] Valida il successo dell'autenticazione su tutti i nodi secondari"
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+        fail_msg: "ERRORE: BIND fallito sul nodo {{ item.item }}. La password non e' sincronizzata!"
+        success_msg: "OK: BIND riuscito con successo sul nodo {{ item.item }}."
+      loop: "{{ bind_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 4. CLEANUP FINALE (NODO 1)
+    # --------------------------------------------------------------------------
+    - name: "[STEP 4] Cleanup utente di test a fine esecuzione"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
