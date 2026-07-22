@@ -1,0 +1,85 @@
+# ==============================================================================
+# SCOPO: Diagnostica approfondita dello stato dell'utente e dell'hash password
+#        su tutti e 3 i nodi del cluster OpenLDAP.
+# ==============================================================================
+
+---
+- name: Diagnostica Replicazione Password OpenLDAP
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+    test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
+    node1: "{{ groups['cluster'][0] }}"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # 1. CLEANUP PREVENTIVO E RIGENERAZIONE UTENTE
+    # --------------------------------------------------------------------------
+    - name: "[SETUP] Rimuovi l'utente residuo da node1 per resettare lo stato"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Crea l'utente di test da zero con password iniziale"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        objectClass: [top, person, organizationalPerson, inetOrgPerson]
+        attributes:
+          cn: testuser
+          sn: Test
+          userPassword: "PasswordTemp123!"
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Esegui ldappasswd su node1 (cambio a 'NuovaPasswordSegreta456!')"
+      ansible.builtin.command: >
+        ldappasswd -H ldapi:///
+        -D "{{ test_user_dn }}"
+        -w "PasswordTemp123!"
+        -s "NuovaPasswordSegreta456!"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[PAUSA] Attendi 3 secondi per consentire la sincronizzazione syncrepl"
+      ansible.builtin.pause:
+        seconds: 3
+      run_once: true
+
+    # --------------------------------------------------------------------------
+    # 2. ISPEZIONE STATO REALE SU TUTTI E 3 I NODI (In parallelo)
+    # --------------------------------------------------------------------------
+    - name: "[INSPECTION] Leggi l'entry dell'utente direttamente su OGNI NODO via ldapi"
+      community.general.ldap_search:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "{{ test_user_dn }}"
+        scope: "base"
+        attrs:
+          - userPassword
+          - entryCSN
+          - modifyTimestamp
+          - pwdChangedTime
+      register: node_inspection
+
+    - name: "[REPORT] Stampa i dati dell'utente rilevati su questo nodo"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================="
+          - "NODO: {{ inventory_hostname }}"
+          - "Presenza Utente: {{ 'TROVATO' if node_inspection.results | length > 0 else 'NON PRESENTE (Replica assente!)' }}"
+          - "Hash userPassword: {{ node_inspection.results[0].userPassword | default('N/A') }}"
+          - "Timestamp entryCSN: {{ node_inspection.results[0].entryCSN | default('N/A') }}"
+          - "pwdChangedTime: {{ node_inspection.results[0].pwdChangedTime | default('N/A') }}"
+          - "=================================================="
