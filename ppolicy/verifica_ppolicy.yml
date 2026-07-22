@@ -1,7 +1,7 @@
 # ==============================================================================
 # TITOLO:       Verifica Password Policy e Replicazione OpenLDAP Multi-Master
-# SCOPO:        Verificare che la PPolicy e l'overlay siano presenti su tutti i nodi
-#               e che la replica tra i nodi del cluster stia funzionando.
+# SCOPO:        Verificare che la PPolicy e l'overlay (con relative direttive)
+#               siano presenti su tutti i nodi e che pwdCheckQuality sia attivo.
 # ==============================================================================
 
 ---
@@ -21,10 +21,10 @@
 
   tasks:
     # ==========================================================================
-    # 1. VERIFICA LOCALE SU CN=CONFIG (L'overlay ppolicy è attivo sul nodo?)
+    # 1. VERIFICA LOCALE SU CN=CONFIG (Overlay e Parametri di Cifratura/Forward)
     # ==========================================================================
     
-    - name: "[LOCAL] Verifica presenza overlay ppolicy su cn=config"
+    - name: "[LOCAL] Verifica presenza e attributi overlay ppolicy su cn=config"
       community.general.ldap_search:
         server_uri: "ldapi:///"
         sasl_class: "external"
@@ -33,17 +33,17 @@
       register: local_overlay_check
       failed_when: false
 
-    - name: "[LOCAL] Stampa stato overlay locale"
+    - name: "[LOCAL] Mostra i parametri dell'overlay ppolicy trovati in cn=config"
       ansible.builtin.debug:
-        msg: >-
-          {{
-            'OK: Overlay ppolicy configurato su cn=config' 
-            if local_overlay_check.results | length > 0 
-            else 'ERRORE: Overlay ppolicy MANCANTE su cn=config!'
-          }}
+        msg:
+          - "Stato Overlay: {{ 'Trovato' if local_overlay_check.results | length > 0 else 'NON Trovato' }}"
+          - "olcPPolicyDefault: {{ local_overlay_check.results[0].olcPPolicyDefault | default('N/A') }}"
+          - "olcPPolicyForwardUpdates: {{ local_overlay_check.results[0].olcPPolicyForwardUpdates | default('N/A') }}"
+          - "olcPPolicyHashCleartext: {{ local_overlay_check.results[0].olcPPolicyHashCleartext | default('N/A') }}"
+      when: local_overlay_check.results | length > 0
 
     # ==========================================================================
-    # 2. VERIFICA LOCALE SU DIT (La policy default esiste sul DB locale?)
+    # 2. VERIFICA LOCALE SU DIT (Policy default e pwdCheckQuality)
     # ==========================================================================
 
     - name: "[LOCAL] Leggi l'entry della Password Policy locale"
@@ -61,6 +61,7 @@
         msg:
           - "Stato Policy: {{ 'Trovata' if local_policy_search.results | length > 0 else 'NON Trovata' }}"
           - "pwdMinLength: {{ local_policy_search.results[0].pwdMinLength | default('N/A') }}"
+          - "pwdCheckQuality: {{ local_policy_search.results[0].pwdCheckQuality | default('N/A') }}"
           - "pwdMaxFailure: {{ local_policy_search.results[0].pwdMaxFailure | default('N/A') }}"
           - "pwdLockout: {{ local_policy_search.results[0].pwdLockout | default('N/A') }}"
           - "pwdInHistory: {{ local_policy_search.results[0].pwdInHistory | default('N/A') }}"
@@ -99,5 +100,7 @@
         that:
           - local_overlay_check.results | length > 0
           - local_policy_search.results | length > 0
-        fail_msg: "CRITICO: Il nodo {{ inventory_hostname }} non ha la password policy configurata o replicata correttamente!"
+          - local_policy_search.results[0].pwdCheckQuality is defined
+          - local_policy_search.results[0].pwdCheckQuality | int == 1
+        fail_msg: "CRITICO: Il nodo {{ inventory_hostname }} non ha la Password Policy (o pwdCheckQuality) configurata correttamente!"
         success_msg: "OK: Password policy e overlay verificati con successo sul nodo {{ inventory_hostname }}."
