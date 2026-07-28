@@ -431,7 +431,7 @@
           objectClass: olcOverlayConfig
           objectClass: olcSyncProvConfig
           olcOverlay: syncprov
-          olcSpSessionlog: 5000
+          olcSpSessionlog: 10000
           olcSpCheckpoint: 1000 10
 
     - name: "9. Applicazione overlay syncprov e parametri di session log"
