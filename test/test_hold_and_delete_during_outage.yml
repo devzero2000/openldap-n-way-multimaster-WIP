@@ -1,0 +1,184 @@
+# ==============================================================================
+# TITOLO:       test_hold_and_delete_during_outage.yml
+# SCOPO:        Inserimento 1000 utenti -> Pausa 30s (Crash Manuale) -> 
+#               Cancellazione sotto Disastro -> Recovery -> Verifiche DIT
+# ==============================================================================
+
+---
+- name: "TEST: Inserimento, Pausa (Crash Manuale) e Cancellazione sotto Outage"
+  hosts: localhost
+  connection: local
+  vars:
+    node1: "ubuntu24lts1.example.com"
+    node2: "ubuntu24lts2.example.com"
+    node3: "ubuntu24lts3.example.com"
+    ldap_basedn: "dc=example,dc=com"
+    ldap_admin_dn: "cn=admin,dc=example,dc=com"
+    ldap_admin_pass: "openldap"
+    target_users: 1000
+
+  tasks:
+    # ==========================================================================
+    # FASE 1: INSERIMENTO DEI 1000 UTENTI SU NODO 1
+    # ==========================================================================
+
+    - name: "[PHASE 1] Inserimento massivo di {{ target_users }} utenti su {{ node1 }}"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap, ldap.modlist, time
+
+        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+        l.set_option(ldap.OPT_NETWORK_TIMEOUT, 3.0)
+        l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
+
+        for i in range(1, {{ target_users }} + 1):
+            dn = f'uid=outage.user.{i},ou=People,{{ ldap_basedn }}'
+            attrs = {
+                'objectClass': [b'top', b'inetOrgPerson'],
+                'uid': [f'outage.user.{i}'.encode()],
+                'cn': [f'Outage User {i}'.encode()],
+                'sn': [b'OutageTest'],
+                'userPassword': [b'{SSHA}demoPass123!']
+            }
+            try:
+                msgid = l.add(dn, ldap.modlist.addModlist(attrs))
+                l.result(msgid, all=1, timeout=2.0)
+            except ldap.ALREADY_EXISTS:
+                pass
+            except Exception:
+                pass
+        "
+      register: insert_phase
+
+    - name: "[CHECK] Verifica inserimento locale dei 1000 utenti su {{ node1 }}"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap, sys
+        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+        l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
+        res = l.search_s('ou=People,{{ ldap_basedn }}', ldap.SCOPE_SUBTREE, '(uid=outage.user.*)', ['dn'])
+        print(f'INSERTED_COUNT: {len(res)}')
+        if len(res) != {{ target_users }}:
+            sys.exit(1)
+        "
+      register: check_insert
+
+    - name: "[REPORT] Stato inserimento"
+      ansible.builtin.debug:
+        msg: "{{ check_insert.stdout }} - Inserimento completato con successo su {{ node1 }}."
+
+    # ==========================================================================
+    # FASE 2: PAUSA DI 30 SECONDI (FINISTRA PER LO STOP MANUALE DI N2 E N3)
+    # ==========================================================================
+
+    - name: "[PAUSE] PAUSA DI 30 SECONDI: Stoppa ora node2 e node3 via SSH/console!"
+      ansible.builtin.pause:
+        seconds: 30
+
+    # ==========================================================================
+    # FASE 3: CANCELLAZIONE SOTTO OUTAGE SU NODO 1
+    # ==========================================================================
+
+    - name: "[PHASE 3] Cancellazione massiva dei {{ target_users }} utenti su {{ node1 }} (Peer degradati)"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap, time
+
+        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+        l.set_option(ldap.OPT_NETWORK_TIMEOUT, 3.0)
+        l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
+
+        for i in range(1, {{ target_users }} + 1):
+            dn = f'uid=outage.user.{i},ou=People,{{ ldap_basedn }}'
+            try:
+                msgid = l.delete(dn)
+                l.result(msgid, all=1, timeout=2.0)
+            except Exception:
+                pass
+        "
+      register: delete_phase
+
+    - name: "[CHECK] Verifica svuotamento locale su {{ node1 }}"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap
+        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+        l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
+        res = l.search_s('ou=People,{{ ldap_basedn }}', ldap.SCOPE_SUBTREE, '(uid=outage.user.*)', ['dn'])
+        print(f'REMAINING_ON_N1: {len(res)}')
+        "
+      register: check_delete_n1
+
+    - name: "[REPORT] Stato cancellazione su Nodo 1"
+      ansible.builtin.debug:
+        msg: "{{ check_delete_n1.stdout }} (Record rimasti su {{ node1 }} dopo la pulizia sotto outage)"
+
+    # ==========================================================================
+    # FASE 4: RIPRISTINO NODI E VERIFICA ALLINEAMENTO FINALE (TOTALE = 0)
+    # ==========================================================================
+
+    - name: "[RECOVERY] Riavvio forzato dei nodi {{ node2 }} e {{ node3 }}"
+      delegate_to: "{{ item }}"
+      become: true
+      ansible.builtin.command: "systemctl start slapd"
+      loop:
+        - "{{ node2 }}"
+        - "{{ node3 }}"
+      ignore_errors: true
+
+    - name: "[METRICA] Verifica convergenza della cancellazione (Atteso: 0 utenti su tutti e 3 i nodi)"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap, time, sys
+
+        nodes = ['{{ node1 }}', '{{ node2 }}', '{{ node3 }}']
+        admin_dn = '{{ ldap_admin_dn }}'
+        admin_pass = '{{ ldap_admin_pass }}'
+        base_dn = 'ou=People,{{ ldap_basedn }}'
+        search_filter = '(uid=outage.user.*)'
+
+        start_time = time.time()
+        timeout_limit = 60
+
+        def get_count(node_host):
+            try:
+                l = ldap.initialize(f'ldaps://{node_host}:636', trace_level=0)
+                l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+                l.set_option(ldap.OPT_NETWORK_TIMEOUT, 3.0)
+                l.simple_bind_s(admin_dn, admin_pass)
+                res = l.search_s(base_dn, ldap.SCOPE_SUBTREE, search_filter, ['dn'])
+                return len(res)
+            except Exception:
+                return -1
+
+        while (time.time() - start_time) < timeout_limit:
+            c1 = get_count('{{ node1 }}')
+            c2 = get_count('{{ node2 }}')
+            c3 = get_count('{{ node3 }}')
+            
+            if c1 == 0 and c2 == 0 and c3 == 0:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                print(f'DELETE_CONVERGENCE_OK: {elapsed_ms}ms (Tutti i 1000 record eliminati ovunque. N1: 0, N2: 0, N3: 0)')
+                sys.exit(0)
+            time.sleep(0.5)
+
+        c1 = get_count('{{ node1 }}')
+        c2 = get_count('{{ node2 }}')
+        c3 = get_count('{{ node3 }}')
+        print(f'DELETE_CONVERGENCE_FAIL: N1: {c1}, N2: {c2}, N3: {c3} (Atteso 0 su tutti)')
+        sys.exit(1)
+        "
+      register: final_convergence
+
+    - name: "[REPORT] Risultato del Test di Outage e Sincronizzazione Cancellazioni"
+      ansible.builtin.debug:
+        msg:
+          - "========================================================================"
+          - "REPORT CANCELLAZIONE SOTTO DISASTRO"
+          - "========================================================================"
+          - "{{ final_convergence.stdout }}"
+          - "========================================================================"
