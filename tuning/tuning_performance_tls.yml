@@ -31,7 +31,7 @@
         sasl_class: "{{ ldap_auth.sasl_class }}"
         dn: "cn=config"
         attributes:
-          olcThreads: 16
+          olcThreads: 32
           olcConnMaxPending: 100
           olcConnMaxPendingAuth: 50
         state: exact
