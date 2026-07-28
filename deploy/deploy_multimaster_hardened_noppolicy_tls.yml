@@ -184,6 +184,27 @@
       register: log_init_result
       failed_when: log_init_result.rc != 0
 
+
+    - name: "2d. Tuning dei thread e limiti connessioni in cn=config"
+      copy:
+        dest: /tmp/01_threads_tuning.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcThreads
+          olcThreads: 16
+          -
+          replace: olcConnMaxPending
+          olcConnMaxPending: 100
+          -
+          replace: olcConnMaxPendingAuth
+          olcConnMaxPendingAuth: 50
+
+    - name: "2e. Applicazione tuning thread"
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_threads_tuning.ldif
+      register: threads_result
+      failed_when: threads_result.rc != 0
+
     - name: 3. Configurazione della password di Root in formato SSHA
       shell: slappasswd -s {{ ldap_rootpw }}
       register: ldap_hashed_pw
@@ -452,14 +473,27 @@
     # =========================================================================
     # PARAMETRI DI TUNING: ATTIVAZIONE DB SYNC
     # =========================================================================
-    - name: G. Generazione LDIF per parametri di Tuning Database MDB e cn=config (DB SYNC ATTIVO)
+
+    - name: G. Generazione LDIF per Indici, MaxSize e Tuning MDB (DB SYNC ATTIVO)
       copy:
         dest: /tmp/06_db_tuning.ldif
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
+          replace: olcDbMaxSize
+          olcDbMaxSize: 4294967296
+          -
           replace: olcDbNoSync
           olcDbNoSync: TRUE
+          -
+          replace: olcDbIndex
+          olcDbIndex: objectClass eq
+          olcDbIndex: uid eq
+          olcDbIndex: cn eq,sub
+          olcDbIndex: member eq
+          olcDbIndex: memberUid eq
+          olcDbIndex: entryUUID eq
+          olcDbIndex: entryCSN eq
 
           dn: cn=config
           changetype: modify
