@@ -1,12 +1,13 @@
 # ==============================================================================
 # TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 via (N-Way)
-# AUTORE:       Elia Pinto[cite: 4]
-# DATA:         Luglio 2026[cite: 4]
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
 # SCOPO:        Deploy corazzato con LDAPS basato sulla logica nativa a 3 CSN[cite: 4]
 #               VERSIONE: 1.10 (Risolto errore utente replica, limiti e db sync)
 #               VERSIONE 1.11: aggiunto exattrs="memberOf" a
 #               olcSyncrepl se si utilizza l'overlay slapo-memberof 
 #               https://kb.symas.com/upgrade/migration-strategy-from-slapodynlist
+#               In task G no index on memberOf se si usa l'overlay memberOf
 # ==============================================================================
 
 ---
