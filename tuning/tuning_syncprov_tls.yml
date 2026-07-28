@@ -29,7 +29,7 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={2}syncprov,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcSyncProvConfig
           - olcOverlayConfig
@@ -41,7 +41,7 @@
     - name: "[TUNING] Forza l'applicazione dei parametri sul Database MDB via LDIF"
       ansible.builtin.shell: |
         ldapmodify -Y EXTERNAL -H ldapi:/// <<EOF
-        dn: olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config
+        dn: olcOverlay={2}syncprov,olcDatabase={1}mdb,cn=config
         changetype: modify
         replace: olcSpSessionlog
         olcSpSessionlog: 10000
