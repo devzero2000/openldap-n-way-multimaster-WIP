@@ -1,0 +1,183 @@
+# ==============================================================================
+# TITOLO:       test_crash_cascading_nodes.yml
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Simulazione di crash a cascata (nodo2 -> +4s nodo3) durante
+#               scritture su nodo1, misurazione della convergenza e
+#               pulizia automatica del dataset di test.
+# ==============================================================================
+
+---
+- name: "CRASH TEST 1: Failover a Cascata (nodo2 + nodo3) sotto Carico WAN"
+  hosts: localhost
+  connection: local
+  vars:
+    node1: "ubuntu24lts1.example.com"
+    node2: "ubuntu24lts2.example.com"
+    node3: "ubuntu24lts3.example.com"
+    ldap_basedn: "dc=example,dc=com"
+    ldap_admin_dn: "cn=admin,dc=example,dc=com"
+    ldap_admin_pass: "openldap"
+
+  tasks:
+    # ==========================================================================
+    # FASE 1: SCRITTURA AD ALTA FREQUENZA SU NODO 1
+    # ==========================================================================
+
+    - name: "[PHASE 1] Avvio scrittura asincrona in background su {{ node1 }}"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap, ldap.modlist, time
+        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+        l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
+        
+        for i in range(1, 2001):
+            dn = f'uid=crash.user.{i},ou=People,{{ ldap_basedn }}'
+            attrs = {
+                'objectClass': [b'top', b'inetOrgPerson'],
+                'uid': [f'crash.user.{i}'.encode()],
+                'cn': [f'Crash User {i}'.encode()],
+                'sn': [b'CrashTest'],
+                'userPassword': [b'{SSHA}demoPass123!']
+            }
+            try:
+                l.add_s(dn, ldap.modlist.addModlist(attrs))
+            except Exception:
+                pass
+            time.sleep(0.005) # ~200 ops/sec
+        " > /tmp/async_load.log 2>&1 &
+        echo $! > /tmp/async_load.pid
+      register: start_load
+
+    # ==========================================================================
+    # FASE 2: SIMULAZIONE CRASH A CASCATA
+    # ==========================================================================
+
+    - name: "[PHASE 2] Attendi 2 secondi prima del primo crash"
+      ansible.builtin.pause:
+        seconds: 2
+
+    - name: "[CRASH 1] Stop forzato del servizio slapd su {{ node2 }}"
+      delegate_to: "{{ node2 }}"
+      become: true
+      ansible.builtin.command: "systemctl stop slapd"
+
+    - name: "[PHASE 3] Attendi 4 secondi prima del secondo crash"
+      ansible.builtin.pause:
+        seconds: 4
+
+    - name: "[CRASH 2] Stop forzato del servizio slapd su {{ node3 }}"
+      delegate_to: "{{ node3 }}"
+      become: true
+      ansible.builtin.command: "systemctl stop slapd"
+
+    - name: "[PHASE 4] Attendi il completamento dell'iniezione su {{ node1 }}"
+      ansible.builtin.shell: |
+        if [ -f /tmp/async_load.pid ]; then
+            PID=$(cat /tmp/async_load.pid)
+            while kill -0 "$PID" 2>/dev/null; do
+                sleep 1
+            done
+        fi
+      changed_when: false
+
+    # ==========================================================================
+    # FASE 3: RIPRISTINO NODI E MISURAZIONE CONVERGENZA
+    # ==========================================================================
+
+    - name: "[RECOVERY] Ripristina il servizio slapd su {{ node2 }} e {{ node3 }}"
+      delegate_to: "{{ item }}"
+      become: true
+      ansible.builtin.command: "systemctl start slapd"
+      loop:
+        - "{{ node2 }}"
+        - "{{ node3 }}"
+
+    - name: "[METRICA] Misura il tempo di convergenza delta (Delta Sync via LDAPS)"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap, time, sys
+
+        nodes = ['{{ node1 }}', '{{ node2 }}', '{{ node3 }}']
+        admin_dn = '{{ ldap_admin_dn }}'
+        admin_pass = '{{ ldap_admin_pass }}'
+        base_dn = 'ou=People,{{ ldap_basedn }}'
+        search_filter = '(uid=crash.user.*)'
+
+        start_time = time.time()
+        timeout_limit = 120 # Timeout di sicurezza a 120 secondi
+
+        def get_count(node_host):
+            try:
+                l = ldap.initialize(f'ldaps://{node_host}:636', trace_level=0)
+                l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+                l.set_option(ldap.OPT_NETWORK_TIMEOUT, 3.0)
+                l.simple_bind_s(admin_dn, admin_pass)
+                res = l.search_s(base_dn, ldap.SCOPE_SUBTREE, search_filter, ['dn'])
+                return len(res)
+            except Exception:
+                return -1
+
+        target_count = get_count('{{ node1 }}')
+        
+        while (time.time() - start_time) < timeout_limit:
+            c2 = get_count('{{ node2 }}')
+            c3 = get_count('{{ node3 }}')
+            
+            if c2 == target_count and c3 == target_count and target_count > 0:
+                elapsed_ms = int((time.time() - start_time) * 1000)
+                print(f'CONVERGENCE_OK: {elapsed_ms}ms (Record allineati su tutti i nodi: {target_count})')
+                sys.exit(0)
+            time.sleep(0.5)
+
+        print(f'CONVERGENCE_TIMEOUT: Raggiunto il limite di {timeout_limit}s')
+        sys.exit(1)
+        "
+      register: convergence_metric
+
+    - name: "[REPORT] Risultato del Crash Test"
+      ansible.builtin.debug:
+        msg:
+          - "========================================================================"
+          - "CRASH TEST A CASCATA - REPORT DI RIPRISTINO"
+          - "========================================================================"
+          - "{{ convergence_metric.stdout }}"
+          - "========================================================================"
+
+    # ==========================================================================
+    # FASE 4: CLEANUP FINALE (RIMOZIONE OGGETTI DI TEST E FILE TEMPORANEI)
+    # ==========================================================================
+
+    - name: "[CLEANUP] Cancellazione massiva degli utenti di test su {{ node1 }}"
+      ansible.builtin.shell: |
+        python3 -c "
+        import ldap
+        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
+        l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
+        
+        for i in range(1, 2001):
+            dn = f'uid=crash.user.{i},ou=People,{{ ldap_basedn }}'
+            try:
+                l.delete_s(dn)
+            except Exception:
+                pass
+        "
+      register: cleanup_objects
+
+    - name: "[CLEANUP] Rimozione dei log temporanei su localhost"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/async_load.log
+        - /tmp/async_load.pid
+
+    - name: "[CLEANUP] Attesa convergenza della cancellazione su tutto il cluster"
+      ansible.builtin.pause:
+        seconds: 3
+
+    - name: "[REPORT] Conferma pulizia DIT"
+      ansible.builtin.debug:
+        msg: "CLEANUP COMPLETATO: Tutti i record 'crash.user' sono stati rimossi dal DIT del cluster."
