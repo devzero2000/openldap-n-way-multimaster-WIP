@@ -5,6 +5,7 @@
 # SCOPO:        Simulazione di crash a cascata (nodo2 -> +4s nodo3) durante
 #               scritture su nodo1, misurazione della convergenza e
 #               pulizia automatica del dataset di test.
+# VERSIONE:     2.0 (Fixed Async Task Delegation & Localhost Injection)
 # ==============================================================================
 
 ---
@@ -21,14 +22,14 @@
 
   tasks:
     # ==========================================================================
-    # FASE 1: SCRITTURA AD ALTA FREQUENZA SU NODO 1
+    # FASE 1: SCRITTURA AD ALTA FREQUENZA SU NODO 1 (DELEGATA SU NODE1)
     # ==========================================================================
 
     - name: "[PHASE 1] Avvio scrittura asincrona in background su {{ node1 }}"
       ansible.builtin.shell: |
         python3 -c "
         import ldap, ldap.modlist, time
-        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l = ldap.initialize('ldaps://127.0.0.1:636', trace_level=0)
         l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
         l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
         
@@ -48,6 +49,7 @@
             time.sleep(0.005) # ~200 ops/sec
         " > /tmp/async_load.log 2>&1 &
         echo $! > /tmp/async_load.pid
+      delegate_to: "{{ node1 }}"
       register: start_load
 
     # ==========================================================================
@@ -80,6 +82,7 @@
                 sleep 1
             done
         fi
+      delegate_to: "{{ node1 }}"
       changed_when: false
 
     # ==========================================================================
@@ -153,7 +156,7 @@
       ansible.builtin.shell: |
         python3 -c "
         import ldap
-        l = ldap.initialize('ldaps://{{ node1 }}:636', trace_level=0)
+        l = ldap.initialize('ldaps://127.0.0.1:636', trace_level=0)
         l.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_NEVER)
         l.simple_bind_s('{{ ldap_admin_dn }}', '{{ ldap_admin_pass }}')
         
@@ -164,12 +167,14 @@
             except Exception:
                 pass
         "
+      delegate_to: "{{ node1 }}"
       register: cleanup_objects
 
-    - name: "[CLEANUP] Rimozione dei log temporanei su localhost"
+    - name: "[CLEANUP] Rimozione dei log temporanei su {{ node1 }}"
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
+      delegate_to: "{{ node1 }}"
       loop:
         - /tmp/async_load.log
         - /tmp/async_load.pid
