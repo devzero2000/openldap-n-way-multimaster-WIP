@@ -401,7 +401,7 @@
         - "'already exists' not in setup_module_result.stderr"
         - "'Type or value exists' not in setup_module_result.stderr"
 
-    - name: "8. Generazione LDIF per attivazione overlay syncprov"
+    - name: "8. Generazione LDIF per attivazione e tuning avanzato overlay syncprov"
       copy:
         dest: /tmp/03_enable_overlays.ldif
         content: |
@@ -410,9 +410,10 @@
           objectClass: olcOverlayConfig
           objectClass: olcSyncProvConfig
           olcOverlay: syncprov
+          olcSpSessionlog: 5000
           olcSpCheckpoint: 1000 10
 
-    - name: "9. Applicazione overlay syncprov"
+    - name: "9. Applicazione overlay syncprov e parametri di session log"
       shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
       register: overlay_result
       failed_when: 
