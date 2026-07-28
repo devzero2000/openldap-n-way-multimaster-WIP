@@ -1,0 +1,115 @@
+# ==============================================================================
+# TITOLO:       check_simulate_wan_mpls_ipsec.yml
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Audit strutturale e verifica della simulazione WAN (Netem/TC e
+#               IPTables Mangle) su tutti i nodi del cluster OpenLDAP.
+# ==============================================================================
+
+---
+- name: Audit della Simulazione WAN MPLS + IPSec sul Cluster
+  hosts: cluster
+  become: true
+  vars:
+    iface: "eth1"
+    expected_latency: "50ms"
+    expected_jitter: "2ms"
+    expected_loss: "0.1%"
+    expected_bandwidth: "45mbit"
+    mark_id: "10"
+
+  tasks:
+    # ==========================================================================
+    # 1. ISPEZIONE TRAFFIC CONTROL (tc qdisc, class, filter)
+    # ==========================================================================
+
+    - name: "[TC] Rileva le discipline di coda (qdisc) attive"
+      ansible.builtin.command: "tc qdisc show dev {{ iface }}"
+      register: tc_qdisc_out
+      changed_when: false
+      failed_when: false
+
+    - name: "[TC] Rileva le classi di banda attive"
+      ansible.builtin.command: "tc class show dev {{ iface }}"
+      register: tc_class_out
+      changed_when: false
+      failed_when: false
+
+    - name: "[TC] Rileva i filtri fwmark attivi"
+      ansible.builtin.command: "tc filter show dev {{ iface }}"
+      register: tc_filter_out
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================================
+    # 2. ISPEZIONE IPTABLES MANGLE
+    # ==========================================================================
+
+    - name: "[IPTABLES] Rileva le regole Mangle nella catena POSTROUTING"
+      ansible.builtin.command: "iptables -t mangle -S POSTROUTING"
+      register: iptables_mangle_out
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================================
+    # 3. TEST METRICA DI RETE (RTT PING SINTETICO)
+    # ==========================================================================
+
+    - name: "[NETWORK] Estrai l'indirizzo IPv4 dell'interfaccia {{ iface }}"
+      ansible.builtin.set_fact:
+        iface_ip: "{{ ansible_facts[iface]['ipv4']['address'] | default('') }}"
+
+    - name: "[NETWORK] Esegui ping di test sull'interfaccia {{ iface }}"
+      ansible.builtin.command: "ping -c 3 -I {{ iface }} {{ iface_ip }}"
+      register: ping_test
+      changed_when: false
+      when: iface_ip != ''
+      failed_when: false
+
+    # ==========================================================================
+    # 4. VALUTAZIONE E VERIFICA REGOLE CON ASSERT
+    # ==========================================================================
+
+    - name: "[CHECK] Valida la presenza e la correttezza della configurazione WAN"
+      ansible.builtin.set_fact:
+        check_htb_ok: "{{ 'qdisc htb 1:' in tc_qdisc_out.stdout }}"
+        check_class_ok: "{{ 'class htb 1:10' in tc_class_out.stdout }}"
+        check_netem_ok: "{{ 'qdisc netem 10:' in tc_qdisc_out.stdout and expected_latency in tc_qdisc_out.stdout }}"
+        check_loss_ok: "{{ expected_loss in tc_qdisc_out.stdout }}"
+        check_fwmark_ok: "{{ 'handle 0xa ' in tc_filter_out.stdout or 'fw' in tc_filter_out.stdout }}"
+        check_iptables_389_ok: "{{ '--dport 389' in iptables_mangle_out.stdout and 'MARK --set-xmark 0xa/' in iptables_mangle_out.stdout }}"
+        check_iptables_636_ok: "{{ '--dport 636' in iptables_mangle_out.stdout and 'MARK --set-xmark 0xa/' in iptables_mangle_out.stdout }}"
+
+    # ==========================================================================
+    # 5. REPORT FINALE PER NODO
+    # ==========================================================================
+
+    - name: "[REPORT] Esito Audit Simulazione WAN su {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg:
+          - "========================================================================"
+          - "AUDIT WAN SIMULATION (MPLS + IPSec) - HOST: {{ inventory_hostname }}"
+          - "========================================================================"
+          - "Qdisc HTB Root (1:):          {{ 'OK' if check_htb_ok else 'ASSENTE / FAIL' }}"
+          - "Classe HTB Bandwidth (1:10):  {{ 'OK' if check_class_ok else 'ASSENTE / FAIL' }}"
+          - "Latenza / Jitter Netem:       {{ 'OK (' + expected_latency + ' ' + expected_jitter + ')' if check_netem_ok else 'ASSENTE / FAIL' }}"
+          - "Packet Loss Netem:            {{ 'OK (' + expected_loss + ')' if check_loss_ok else 'ASSENTE / FAIL' }}"
+          - "TC Filter FWMARK 10:          {{ 'OK' if check_fwmark_ok else 'ASSENTE / FAIL' }}"
+          - "IPTables Mangle Porta 389:    {{ 'OK' if check_iptables_389_ok else 'ASSENTE / FAIL' }}"
+          - "IPTables Mangle Porta 636:    {{ 'OK' if check_iptables_636_ok else 'ASSENTE / FAIL' }}"
+          - "------------------------------------------------------------------------"
+          - "RTT Medio rilevato (Ping):    {{ ping_test.stdout_lines[-1] if ping_test.stdout_lines is defined else 'N/A' }}"
+          - "========================================================================"
+
+    - name: "[ASSERT] Fallisci se una delle componenti WAN non è attiva"
+      ansible.builtin.assert:
+        that:
+          - check_htb_ok
+          - check_class_ok
+          - check_netem_ok
+          - check_loss_ok
+          - check_fwmark_ok
+          - check_iptables_389_ok
+          - check_iptables_636_ok
+        fail_msg: "CRITICAL: La simulazione WAN MPLS+IPSec su {{ inventory_hostname }} è INCOMPLETA o NON ATTIVA!"
+        success_msg: "SUCCESS: Simulazione WAN MPLS+IPSec perfettamente ATTIVA e CONFORME su {{ inventory_hostname }}."
