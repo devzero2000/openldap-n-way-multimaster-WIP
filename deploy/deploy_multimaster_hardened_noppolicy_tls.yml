@@ -195,7 +195,7 @@
           olcThreads: 32
           -
           replace: olcConnMaxPending
-          olcConnMaxPending: 100
+          olcConnMaxPending: 200
           -
           replace: olcConnMaxPendingAuth
           olcConnMaxPendingAuth: 50
