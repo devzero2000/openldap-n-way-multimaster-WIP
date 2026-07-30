@@ -3,35 +3,26 @@
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
 # SCOPO:        Deploy corazzato mTLS (SASL/EXTERNAL con Certificati X.509)
-#               VERSIONE: 1.31 (Sequenza DIT/ACL corretta, DN Dedicati dei Nodi)
+#               VERSIONE: 1.40 (PKI Idempotente con community.crypto + Full SANs)
 #
-# REGISTRO DELLE MODIFICHE ED ARCHITETTURA (v1.31 vs v1.11):
-# 1. SEQUENZIAMENTO ROBUSTO (Risolto impasse temporale):
-#    - La creazione di `ou=system` e dei DN dei server (`cn=ubuntu24ltsX`) viene 
-#      eseguita PRIMA dell'applicazione delle ACL e dell'abilitazione mTLS.
-#      Questo evita che la replica vada in 'Access Denied' durante la fase di bootstrap.
+# REGISTRO DELLE MODIFICHE ED ARCHITETTURA (v1.40 vs v1.31):
+# 1. PKI IDEMPOTENTE & CORRETTA (community.crypto):
+#    - Sostituite le chiamate CLI OpenSSL rigide (con il bug `creates`) usando
+#      i moduli `community.crypto.openssl_csr_pipe` e `x509_certificate`.
+#    - Risolta l'assenza di `127.0.0.1` e `localhost` nei SAN X.509.
+#    - Ansible verifica in tempo reale la presenza dei SAN nel certificato:
+#      se mancano, rigenera il certificato in modo trasparente; se ci sono, 
+#      la task restituisce `ok` senza distruggere le chiavi.
 #
-# 2. AUTENTICAZIONE REPLICA (mTLS + SASL/EXTERNAL):
-#    - Eliminati l'utente monolitico 'cn=nwayreplicator' e relative credenziali.
+# 2. SEQUENZIAMENTO ROBUSTO DIT/ACL & SYNC REPL (v1.31 retention):
+#    - `ou=system` e i DN dei nodi creati PRIMA dell'applicazione delle ACL.
 #    - SyncRepl opera in `bindmethod=sasl` e `saslmech=EXTERNAL` su LDAPS (636).
 #    - Impostato `olcTLSVerifyClient: try` in cn=config per la mutual TLS.
-#
-# 3. MAPPING IDENTITÀ E DN DEDICATI (olcAuthzRegexp):
-#    - Regola di trasformazione dal CN del certificato X.509 dell'host al suo DN:
-#      "CN=([^,]+),O=Cyber Actors,.*" -> "cn=$1,ou=system,dc=example,dc=com"
-#
-# 4. ACCESS CONTROL LIST (olcAccess):
-#    - Autorizzati in lettura per SyncRepl tutti i nodi autenticati e mappati
-#      sotto la ramo di sistema tramite `by dn.one="ou=system,dc=example,dc=com" read`.
-#
-# 5. PARAMETRI DI TUNING PER LA PRODUZIONE:
-#    - olcThreads: 32, olcConnMaxPending: 200, olcWriteTimeout: 30s.
-#    - SyncRepl: timeout=120, network-timeout=15, keepalive=240:4:15.
-#    - SyncProv: olcSpSessionlog=10000, olcSpCheckpoint="10000 10".
+#    - Configurato l'ascolto globale su `/etc/default/slapd` (`ldap:/// ldapi:/// ldaps:///`).
 # ==============================================================================
 
 ---
-- name: Configurazione Cluster OpenLDAP Multi-Master a 3 vie - SASL/EXTERNAL mTLS (v1.31)
+- name: Configurazione Cluster OpenLDAP Multi-Master a 3 vie - SASL/EXTERNAL mTLS (v1.40)
   hosts: cluster
   become: true
   vars:
@@ -54,12 +45,15 @@
 
   tasks:
     # =========================================================================
-    # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS
+    # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS (IDEMPOTENTE)
     # =========================================================================
 
-    - name: Certificati - Installa openssl sulla CA
+    - name: Certificati - Installa pacchetti Python/OpenSSL per la PKI sulla CA
       apt:
-        name: openssl
+        name:
+          - openssl
+          - python3-cryptography
+          - python3-openssl
         state: present
       when: ansible_facts['fqdn'] == ca_server
 
@@ -72,62 +66,76 @@
         mode: '0700'
       run_once: true
 
-    - name: Certificati - Generazione Autorità di Certificazione (Solo su ubuntu24lts1)
+    - name: Certificati - Generazione Autorità di Certificazione (Solo su CA)
       block:
-        - name: CA - Genera chiave privata
-          command: openssl genrsa -out /tmp/ca.key 4096
-          args:
-            creates: /tmp/ca.key
+        - name: CA - Genera chiave privata CA
+          community.crypto.openssl_privatekey:
+            path: /tmp/ca.key
+            size: 4096
 
-        - name: CA - Genera certificato root
-          command: >
-            openssl req -x509 -new -nodes -key /tmp/ca.key -sha256 -days 3650
-            -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN=Cyber Actors Local CA"
-            -out /tmp/ca.crt
-          args:
-            creates: /tmp/ca.crt
+        - name: CA - Genera Certificate Signing Request (CSR) per la CA
+          community.crypto.openssl_csr_pipe:
+            privatekey_path: /tmp/ca.key
+            common_name: "Cyber Actors Local CA"
+            organization_name: "Cyber Actors"
+            country_name: "IT"
+            state_or_province_name: "Lazio"
+            locality_name: "Rome"
+            basic_constraints:
+              - "CA:TRUE"
+            basic_constraints_critical: true
+            key_usage:
+              - keyCertSign
+              - cRLSign
+            key_usage_critical: true
+          register: ca_csr
+
+        - name: CA - Genera ed emetti certificato root CA
+          community.crypto.x509_certificate:
+            path: /tmp/ca.crt
+            csr_content: "{{ ca_csr.csr }}"
+            privatekey_path: /tmp/ca.key
+            provider: selfsigned
+            selfsigned_not_after: "+3650d"
       when: ansible_facts['fqdn'] == ca_server
 
-    - name: Server Cert - Genera chiave per ciascun nodo del cluster
-      command: "openssl genrsa -out /tmp/{{ item }}.key 2048"
-      args:
-        creates: "/tmp/{{ item }}.key"
+    - name: Server Cert - Genera chiavi private per ciascun nodo del cluster
+      community.crypto.openssl_privatekey:
+        path: "/tmp/{{ item }}.key"
+        size: 2048
       with_items: "{{ cluster_nodes }}"
       when: ansible_facts['fqdn'] == ca_server
 
-    - name: Server Cert - Genera estensioni SAN per ciascun nodo del cluster
-      copy:
-        dest: "/tmp/{{ item }}.ext"
-        content: |
-          authorityKeyIdentifier=keyid,issuer
-          basicConstraints=CA:FALSE
-          keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
-          extendedKeyUsage = serverAuth, clientAuth
-          subjectAltName = @alt_names
-          [alt_names]
-          DNS.1 = {{ item }}
-          DNS.2 = {{ item | split('.') | first }}
-          IP.1 = {{ '192.168.1.16' if item == 'ubuntu24lts1.example.com' else '192.168.1.17' if item == 'ubuntu24lts2.example.com' else '192.168.1.18' }}
+    - name: Server Cert - Genera CSR con SAN completi (FQDN, Shortname, Localhost, IP)
+      community.crypto.openssl_csr_pipe:
+        privatekey_path: "/tmp/{{ item }}.key"
+        common_name: "{{ item }}"
+        organization_name: "Cyber Actors"
+        country_name: "IT"
+        state_or_province_name: "Lazio"
+        locality_name: "Rome"
+        subject_alt_name:
+          - "DNS:{{ item }}"
+          - "DNS:{{ item | split('.') | first }}"
+          - "DNS:localhost"
+          - "IP:127.0.0.1"
+          - "IP:{{ '192.168.1.16' if item == 'ubuntu24lts1.example.com' else '192.168.1.17' if item == 'ubuntu24lts2.example.com' else '192.168.1.18' }}"
+        extended_key_usage:
+          - serverAuth
+          - clientAuth
+      register: node_csrs
       with_items: "{{ cluster_nodes }}"
       when: ansible_facts['fqdn'] == ca_server
 
-    - name: Server Cert - Genera CSR per ciascun nodo del cluster
-      command: >
-        openssl req -new -key /tmp/{{ item }}.key 
-        -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
-        -out /tmp/{{ item }}.csr
-      args:
-        creates: "/tmp/{{ item }}.csr"
-      with_items: "{{ cluster_nodes }}"
-      when: ansible_facts['fqdn'] == ca_server
-
-    - name: Server Cert - Firma certificato per ciascun nodo usando la CA locale
-      command: >
-        openssl x509 -req -in /tmp/{{ item }}.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key
-        -CAcreateserial -out /tmp/{{ item }}.crt -days 1825 -sha256 -extfile /tmp/{{ item }}.ext
-      args:
-        creates: "/tmp/{{ item }}.crt"
-      with_items: "{{ cluster_nodes }}"
+    - name: Server Cert - Firma/Aggiorna certificati dei nodi tramite la CA
+      community.crypto.x509_certificate:
+        path: "/tmp/{{ item.item }}.crt"
+        csr_content: "{{ item.csr }}"
+        ownca_path: /tmp/ca.crt
+        ownca_privatekey_path: /tmp/ca.key
+        provider: ownca
+        ownca_not_after: "+1825d"
+      loop: "{{ node_csrs.results }}"
       when: ansible_facts['fqdn'] == ca_server
 
     - name: Certificati - Fetch verso il Control Node
@@ -156,6 +164,7 @@
         - { src: "ca.crt", dest: "{{ ssl_ca_path }}", mode: "0644" }
         - { src: "{{ ansible_facts['fqdn'] }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
         - { src: "{{ ansible_facts['fqdn'] }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
+      notify: Riavvia Slapd
 
     - name: Certificati - Pulizia locale control node
       delegate_to: localhost
@@ -399,6 +408,7 @@
           -
           replace: olcAuthzRegexp
           olcAuthzRegexp: "^.*[cC][nN]\\s*=\\s*([^,]+).*$" "cn=$1,ou=system,dc=example,dc=com"
+
     - name: "[LDAPS/mTLS] Applicazione chiavi, mTLS e SASL mapping in cn=config"
       shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_tls_config.ldif
       register: tls_apply_result
