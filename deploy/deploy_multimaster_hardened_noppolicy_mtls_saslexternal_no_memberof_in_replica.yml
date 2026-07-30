@@ -1,0 +1,560 @@
+# ==============================================================================
+# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 vie (N-Way)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Deploy corazzato mTLS (SASL/EXTERNAL con Certificati X.509)
+#               VERSIONE: 1.31 (Sequenza DIT/ACL corretta, DN Dedicati dei Nodi)
+#
+# REGISTRO DELLE MODIFICHE ED ARCHITETTURA (v1.31 vs v1.11):
+# 1. SEQUENZIAMENTO ROBUSTO (Risolto impasse temporale):
+#    - La creazione di `ou=system` e dei DN dei server (`cn=ubuntu24ltsX`) viene 
+#      eseguita PRIMA dell'applicazione delle ACL e dell'abilitazione mTLS.
+#      Questo evita che la replica vada in 'Access Denied' durante la fase di bootstrap.
+#
+# 2. AUTENTICAZIONE REPLICA (mTLS + SASL/EXTERNAL):
+#    - Eliminati l'utente monolitico 'cn=nwayreplicator' e relative credenziali.
+#    - SyncRepl opera in `bindmethod=sasl` e `saslmech=EXTERNAL` su LDAPS (636).
+#    - Impostato `olcTLSVerifyClient: try` in cn=config per la mutual TLS.
+#
+# 3. MAPPING IDENTITÀ E DN DEDICATI (olcAuthzRegexp):
+#    - Regola di trasformazione dal CN del certificato X.509 dell'host al suo DN:
+#      "CN=([^,]+),O=Cyber Actors,.*" -> "cn=$1,ou=system,dc=example,dc=com"
+#
+# 4. ACCESS CONTROL LIST (olcAccess):
+#    - Autorizzati in lettura per SyncRepl tutti i nodi autenticati e mappati
+#      sotto la ramo di sistema tramite `by dn.one="ou=system,dc=example,dc=com" read`.
+#
+# 5. PARAMETRI DI TUNING PER LA PRODUZIONE:
+#    - olcThreads: 32, olcConnMaxPending: 200, olcWriteTimeout: 30s.
+#    - SyncRepl: timeout=120, network-timeout=15, keepalive=240:4:15.
+#    - SyncProv: olcSpSessionlog=10000, olcSpCheckpoint="10000 10".
+# ==============================================================================
+
+---
+- name: Configurazione Cluster OpenLDAP Multi-Master a 3 vie - SASL/EXTERNAL mTLS (v1.31)
+  hosts: cluster
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+    
+    ldap_admin_group: "cn=administrators,ou=groups,dc=example,dc=com"
+
+    # Variabili infrastruttura PKI / SSL
+    ca_server: "ubuntu24lts1.example.com"
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+    
+    cluster_nodes:
+      - ubuntu24lts1.example.com
+      - ubuntu24lts2.example.com
+      - ubuntu24lts3.example.com
+
+  tasks:
+    # =========================================================================
+    # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS
+    # =========================================================================
+
+    - name: Certificati - Installa openssl sulla CA
+      apt:
+        name: openssl
+        state: present
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Certificati - Directory temporanea locale sul control node
+      delegate_to: localhost
+      become: false
+      file:
+        path: /tmp/ldap_certs_transit
+        state: directory
+        mode: '0700'
+      run_once: true
+
+    - name: Certificati - Generazione Autorità di Certificazione (Solo su ubuntu24lts1)
+      block:
+        - name: CA - Genera chiave privata
+          command: openssl genrsa -out /tmp/ca.key 4096
+          args:
+            creates: /tmp/ca.key
+
+        - name: CA - Genera certificato root
+          command: >
+            openssl req -x509 -new -nodes -key /tmp/ca.key -sha256 -days 3650
+            -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN=Cyber Actors Local CA"
+            -out /tmp/ca.crt
+          args:
+            creates: /tmp/ca.crt
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Server Cert - Genera chiave per ciascun nodo del cluster
+      command: "openssl genrsa -out /tmp/{{ item }}.key 2048"
+      args:
+        creates: "/tmp/{{ item }}.key"
+      with_items: "{{ cluster_nodes }}"
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Server Cert - Genera estensioni SAN per ciascun nodo del cluster
+      copy:
+        dest: "/tmp/{{ item }}.ext"
+        content: |
+          authorityKeyIdentifier=keyid,issuer
+          basicConstraints=CA:FALSE
+          keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+          extendedKeyUsage = serverAuth, clientAuth
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = {{ item }}
+          DNS.2 = {{ item | split('.') | first }}
+          IP.1 = {{ '192.168.1.16' if item == 'ubuntu24lts1.example.com' else '192.168.1.17' if item == 'ubuntu24lts2.example.com' else '192.168.1.18' }}
+      with_items: "{{ cluster_nodes }}"
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Server Cert - Genera CSR per ciascun nodo del cluster
+      command: >
+        openssl req -new -key /tmp/{{ item }}.key 
+        -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
+        -out /tmp/{{ item }}.csr
+      args:
+        creates: "/tmp/{{ item }}.csr"
+      with_items: "{{ cluster_nodes }}"
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Server Cert - Firma certificato per ciascun nodo usando la CA locale
+      command: >
+        openssl x509 -req -in /tmp/{{ item }}.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key
+        -CAcreateserial -out /tmp/{{ item }}.crt -days 1825 -sha256 -extfile /tmp/{{ item }}.ext
+      args:
+        creates: "/tmp/{{ item }}.crt"
+      with_items: "{{ cluster_nodes }}"
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Certificati - Fetch verso il Control Node
+      fetch:
+        src: "/tmp/{{ item }}"
+        dest: "/tmp/ldap_certs_transit/{{ item }}"
+        flat: yes
+      with_items:
+        - ca.crt
+        - ubuntu24lts1.example.com.key
+        - ubuntu24lts1.example.com.crt
+        - ubuntu24lts2.example.com.key
+        - ubuntu24lts2.example.com.crt
+        - ubuntu24lts3.example.com.key
+        - ubuntu24lts3.example.com.crt
+      when: ansible_facts['fqdn'] == ca_server
+
+    - name: Certificati - Distribuzione e assegnazione permessi restrittivi (Hardened)
+      copy:
+        src: "/tmp/ldap_certs_transit/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: openldap
+        group: openldap
+        mode: "{{ item.mode }}"
+      with_items:
+        - { src: "ca.crt", dest: "{{ ssl_ca_path }}", mode: "0644" }
+        - { src: "{{ ansible_facts['fqdn'] }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
+        - { src: "{{ ansible_facts['fqdn'] }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
+
+    - name: Certificati - Pulizia locale control node
+      delegate_to: localhost
+      become: false
+      file:
+        path: /tmp/ldap_certs_transit
+        state: absent
+      run_once: true
+
+    # =========================================================================
+    # FASE CLUSTER: LOGICA DI CONFIGURAZIONE BASE ENGINE
+    # =========================================================================
+
+    - name: 1. Installazione di OpenLDAP e utility client
+      apt:
+        name:
+          - slapd
+          - ldap-utils
+          - python-is-python3
+        state: present
+        update_cache: yes
+
+    - name: Garantisci che slapd sia attivo per accettare configurazioni
+      service:
+        name: slapd
+        state: started
+
+    - name: 2. Configurazione dei parametri di default in /etc/ldap/ldap.conf
+      blockinfile:
+        path: /etc/ldap/ldap.conf
+        block: |
+          BASE    {{ ldap_basedn }}
+          URI     ldaps://localhost
+          TLS_CACERT {{ ssl_ca_path }}
+          TLS_REQCERT demand
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
+
+    - name: 2b. Generazione LDIF configurazione livello Log avanzato (stats sync)
+      copy:
+        dest: /tmp/01_loglevel.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcLogLevel
+          olcLogLevel: stats sync
+
+    - name: 2c. Applicazione livello di log a cn=config
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
+      register: log_init_result
+      failed_when: log_init_result.rc != 0
+
+    - name: 2d. Tuning dei thread e limiti connessioni in cn=config
+      copy:
+        dest: /tmp/01_threads_tuning.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcThreads
+          olcThreads: 32
+          -
+          replace: olcConnMaxPending
+          olcConnMaxPending: 200
+          -
+          replace: olcConnMaxPendingAuth
+          olcConnMaxPendingAuth: 50
+
+    - name: 2e. Applicazione tuning thread
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_threads_tuning.ldif
+      register: threads_result
+      failed_when: threads_result.rc != 0
+
+    - name: 3. Configurazione della password di Root in formato SSHA
+      shell: slappasswd -s {{ ldap_rootpw }}
+      register: ldap_hashed_pw
+      changed_when: false
+
+    - name: 4. Creazione del file LDIF per la configurazione del Database base
+      copy:
+        dest: /tmp/01_db_init.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSuffix
+          olcSuffix: {{ ldap_basedn }}
+          -
+          replace: olcRootDN
+          olcRootDN: {{ ldap_rootdn }}
+          -
+          replace: olcRootPW
+          olcRootPW: {{ ldap_hashed_pw.stdout }}
+  
+    - name: 5. Applicazione configurazione Database di base
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_db_init.ldif
+      register: db_init_result
+      failed_when: "'ERR' in db_init_result.stderr and 'Duplicate' not in db_init_result.stderr"
+
+    # =========================================================================
+    # STEP CRITICO: BOOTSTRAP STRUTTURA DIT BASE (Garantisce l'esistenza dei DN prima delle ACL)
+    # =========================================================================
+
+    - name: 5b. Generazione LDIF per Entry Base, OUs di Sistema e Nodi Server Cluster
+      copy:
+        dest: /tmp/01e_bootstrap_dit.ldif
+        content: |
+          dn: {{ ldap_basedn }}
+          objectClass: top
+          objectClass: domain
+          dc: {{ ldap_basedn.split(',')[0].split('=')[1] }}
+
+          dn: ou=system,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: system
+
+          dn: ou=groups,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: groups
+
+          dn: {{ ldap_admin_group }}
+          changetype: add
+          objectClass: top
+          objectClass: groupOfNames
+          cn: administrators
+          member: cn=admin,{{ ldap_basedn }}
+
+          # Entry identificative dei nodi del cluster per mTLS SASL Authorization
+          {% for node in cluster_nodes %}
+          dn: cn={{ node }},ou=system,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: applicationProcess
+          cn: {{ node }}
+
+          {% endfor %}
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
+
+    - name: 5c. Applicazione Struttura DIT Iniziale e Nodi Server (Solo sul primo nodo)
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
+      register: dit_result
+      failed_when:
+        - dit_result.rc != 0
+        - "'Already exists' not in dit_result.stderr"
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
+
+    - name: 5d. Eliminazione Utente Replica Obsoleto (Se ancora presente nel DIT da installazioni precedenti)
+      shell: ldapdelete -Y EXTERNAL -H ldapi:/// "cn=nwayreplicator,ou=system,{{ ldap_basedn }}"
+      register: del_repl_user
+      failed_when:
+        - del_repl_user.rc != 0
+        - "'No such object' not in del_repl_user.stderr"
+      run_once: true
+      delegate_to: "{{ groups['cluster'][0] }}"
+
+    # =========================================================================
+    # HARDENING SICUREZZA & ACL GLOBALI (Autorizzano l'OU di sistema)
+    # =========================================================================
+
+    - name: A. Blocco dei Bind Anonimi a livello globale
+      copy:
+        dest: /tmp/01b_disable_anon.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          add: olcRequires
+          olcRequires: authc
+          -
+          add: olcDisallows
+          olcDisallows: bind_anon
+
+    - name: B. Applicazione blocco anonimi
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01b_disable_anon.ldif
+      register: anon_result
+      failed_when: 
+        - anon_result.rc != 0
+        - "'Type or value exists' not in anon_result.stderr"
+
+    - name: C. Generazione LDIF per ACL Globali (Autorizza i nodi in ou=system)
+      copy:
+        dest: /tmp/01c_acl_init.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcAccess
+          olcAccess: {0}to dn.base="" by anonymous read by * read
+          olcAccess: {1}to dn.base="cn=Subschema" by anonymous read by * read
+          olcAccess: {2}to attrs=userPassword,pwdReset
+            by self write
+            by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.one="ou=system,{{ ldap_basedn }}" read
+            by * auth
+          olcAccess: {3}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
+            by self read
+            by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.one="ou=system,{{ ldap_basedn }}" read
+            by * none
+          olcAccess: {4}to dn.subtree="{{ ldap_basedn }}"
+            by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.one="ou=system,{{ ldap_basedn }}" read
+            by self write
+            by users read
+            by * none
+
+    - name: D. Applicazione ACL Globali
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01c_acl_init.ldif
+      register: acl_result
+      failed_when:
+        - acl_result.rc != 0
+
+    # =========================================================================
+    # INIEZIONE PARAMETRI TLS / SASL MAPPING IN cn=config
+    # =========================================================================
+
+    - name: "[LDAPS/mTLS] Generazione LDIF parametri TLS e Mappatura SASL verso DN Nodi"
+      copy:
+        dest: /tmp/01_tls_config.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcTLSVerifyClient
+          olcTLSVerifyClient: try
+          -
+          replace: olcTLSCACertificateFile
+          olcTLSCACertificateFile: {{ ssl_ca_path }}
+          -
+          replace: olcTLSCertificateFile
+          olcTLSCertificateFile: {{ ssl_cert_path }}
+          -
+          replace: olcTLSCertificateKeyFile
+          olcTLSCertificateKeyFile: {{ ssl_key_path }}
+          -
+          replace: olcAuthzRegexp
+          olcAuthzRegexp: "^.*[cC][nN]\\s*=\\s*([^,]+).*$" "cn=$1,ou=system,dc=example,dc=com"
+    - name: "[LDAPS/mTLS] Applicazione chiavi, mTLS e SASL mapping in cn=config"
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_tls_config.ldif
+      register: tls_apply_result
+      failed_when:
+        - tls_apply_result.rc != 0
+
+    - name: "[FORZATURA] Riavvio completo per inizializzare i contesti TLS/SASL interni"
+      service:
+        name: slapd
+        state: restarted
+
+    # =========================================================================
+    # CONFIGURAZIONE REPLICA SASL/EXTERNAL (mTLS)
+    # =========================================================================
+
+    - name: 6. Generazione LDIF per ServerID e caricamento modulo syncprov
+      copy:
+        dest: /tmp/02_replication_setup.ldif
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          olcServerID: 1 ldaps://ubuntu24lts1.example.com
+          olcServerID: 2 ldaps://ubuntu24lts2.example.com
+          olcServerID: 3 ldaps://ubuntu24lts3.example.com
+
+          dn: cn=module{0},cn=config
+          changetype: modify
+          add: olcModuleLoad
+          olcModuleLoad: syncprov
+
+    - name: 7. Applicazione ServerID e caricamento moduli
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_replication_setup.ldif
+      register: setup_module_result
+      failed_when:
+        - setup_module_result.rc != 0
+        - "'already exists' not in setup_module_result.stderr"
+        - "'Type or value exists' not in setup_module_result.stderr"
+
+    - name: 8. Generazione LDIF per attivazione e tuning avanzato overlay syncprov
+      copy:
+        dest: /tmp/03_enable_overlays.ldif
+        content: |
+          dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
+          changetype: add
+          objectClass: olcOverlayConfig
+          objectClass: olcSyncProvConfig
+          olcOverlay: syncprov
+          olcSpSessionlog: 10000
+          olcSpCheckpoint: 10000 10
+
+    - name: 9. Applicazione overlay syncprov e parametri di session log
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
+      register: overlay_result
+      failed_when: 
+        - overlay_result.rc != 0 
+        - "'already in list' not in overlay_result.stderr"
+        - "'Already exists' not in overlay_result.stderr"
+
+    - name: 10. Generazione LDIF per Syncrepl SASL/EXTERNAL mTLS
+      copy:
+        dest: /tmp/04_multimaster.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSyncRepl
+          {% if ansible_facts['fqdn'] == 'ubuntu24lts1.example.com' %}
+          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          {% elif ansible_facts['fqdn'] == 'ubuntu24lts2.example.com' %}
+          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          {% elif ansible_facts['fqdn'] == 'ubuntu24lts3.example.com' %}
+          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          {% endif %}
+          -
+          replace: olcMultiProvider
+          olcMultiProvider: TRUE
+
+    - name: 11. Applicazione configurazione Syncrepl SASL/EXTERNAL
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/04_multimaster.ldif
+      register: multimaster_result
+      failed_when: >
+        multimaster_result.rc != 0 and
+        'Already exists' not in multimaster_result.stderr and
+        'Duplicate' not in multimaster_result.stderr and
+        'typeIsCritical' not in multimaster_result.stderr and
+        'Type or value exists' not in multimaster_result.stderr
+
+    # =========================================================================
+    # PARAMETRI DI TUNING: TUNING DB E MONITOR
+    # =========================================================================
+
+    - name: G. Generazione LDIF per Indici, MaxSize e Tuning MDB
+      copy:
+        dest: /tmp/06_db_tuning.ldif
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcDbMaxSize
+          olcDbMaxSize: 4294967296
+          -
+          replace: olcDbNoSync
+          olcDbNoSync: TRUE
+          -
+          replace: olcDbIndex
+          olcDbIndex: objectClass eq
+          olcDbIndex: uid eq
+          olcDbIndex: cn eq,sub
+          olcDbIndex: member eq
+          olcDbIndex: memberUid eq
+          olcDbIndex: entryUUID eq
+          olcDbIndex: entryCSN eq
+
+          dn: cn=config
+          changetype: modify
+          replace: olcWriteTimeout
+          olcWriteTimeout: 30
+
+    - name: H. Applicazione parametri di Tuning Database
+      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
+      register: tuning_result
+      failed_when:
+        - tuning_result.rc != 0
+        - "'Type or value exists' not in tuning_result.stderr"
+        - "'attribute OR type already exists' not in tuning_result.stderr"
+
+    - name: 12. Generazione LDIF per backend cn=Monitor
+      copy:
+        dest: /tmp/05_monitor.ldif
+        content: |
+          dn: olcDatabase={2}monitor,cn=config
+          changetype: add
+          objectClass: olcDatabaseConfig
+          olcDatabase: {2}monitor
+          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+
+    - name: 13. Applicazione configurazione backend cn=Monitor
+      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
+      register: monitor_result
+      failed_when:
+        - monitor_result.rc != 0
+        - "'Already exists' not in monitor_result.stderr"
+        - "'Type or value exists' not in monitor_result.stderr"
+        - "'only one monitor database allowed' not in monitor_result.stderr"     
+          
+    - name: 14. Configurazione ascolto slapd su tutte le interfacce di rete
+      lineinfile:
+        path: /etc/default/slapd
+        regexp: '^SLAPD_SERVICES='
+        line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
+      notify: Riavvia Slapd
+
+  handlers:
+    - name: Riavvia Slapd
+      service:
+        name: slapd
+        state: restarted
