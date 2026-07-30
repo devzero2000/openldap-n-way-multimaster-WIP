@@ -1,0 +1,151 @@
+# ==============================================================================
+# TITOLO:       Restore Offline Completo Cluster/Nodo OpenLDAP (MDB & Config)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Arresto di slapd, ripristino dei file MDB fisici e di cn=config
+#               da archivio tar.gz, correzione permessi e restart del demone.
+# SINTASSI:
+#   ansible-playbook -i inventory restore_openldap_offline.yml \
+#     --extra-vars "backup_file=/var/backups/openldap/openldap_full_backup_ubuntu24lts1.example.com_20260730T130000.tar.gz"
+#
+#   ansible-playbook -i inventory restore_openldap_offline.yml \
+#  -l ubuntu24lts1.example.com \
+#  --extra-vars "backup_file=/var/backups/openldap/openldap_full_backup_ubuntu24lts1.example.com_20260730T130000.tar.gz"\
+# ==============================================================================
+
+---
+- name: Restore Offline Completo OpenLDAP da Archivio Backup
+  hosts: cluster
+  become: true
+  vars:
+    ldap_data_dir: "/var/lib/ldap"
+    ldap_config_dir: "/etc/ldap/slapd.d"
+    restore_tmp_dir: "/tmp/openldap_restore_workdir"
+
+  pre_tasks:
+    - name: 0. Verifica la presenza della variabile obbligatoria 'backup_file'
+      fail:
+        msg: >
+          [ERRORE] Devi specificare il percorso del file di backup!
+          Esempio: ansible-playbook restore_openldap_offline.yml -e "backup_file=/var/backups/openldap/openldap_full_backup_...tar.gz"
+      when: backup_file is not defined or backup_file == ""
+
+    - name: 0b. Verifica che il file di backup esista sul nodo target
+      stat:
+        path: "{{ backup_file }}"
+      register: backup_stat
+
+    - name: 0c. Interrompi se il file di backup non esiste
+      fail:
+        msg: "[ERRORE] Il file di backup specificato non esiste: {{ backup_file }}"
+      when: not backup_stat.stat.exists
+
+  tasks:
+    # =========================================================================
+    # FASE 1: PREPARAZIONE E ARRESTO DEL SERVIZIO
+    # =========================================================================
+
+    - name: 1. Arresto del servizio slapd
+      service:
+        name: slapd
+        state: stopped
+
+    - name: 2. Creazione della directory temporanea di estrazione
+      file:
+        path: "{{ restore_tmp_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    # =========================================================================
+    # FASE 2: ESTRAZIONE E UNPACKING DELL'ARCHIVIO
+    # =========================================================================
+
+    - name: 3. Decompressione del pacchetto principale di backup
+      unarchive:
+        src: "{{ backup_file }}"
+        dest: "{{ restore_tmp_dir }}"
+        remote_src: true
+
+    - name: 4. Identificazione della sotto-cartella estratta
+      find:
+        paths: "{{ restore_tmp_dir }}"
+        file_type: directory
+        patterns: "backup_*"
+      register: extracted_folder
+
+    - name: 4b. Impostazione della variabile per la directory del backup decompresso
+      set_fact:
+        target_backup_dir: "{{ extracted_folder.files[0].path }}"
+
+    # =========================================================================
+    # FASE 3: RIPRISTINO DEI DATI (MDB) E CONFIGURAZIONE (slapd.d)
+    # =========================================================================
+
+    - name: 5. Pulizia preventiva delle directory correnti di OpenLDAP
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+        - "{{ ldap_data_dir }}"
+        - "{{ ldap_config_dir }}"
+
+    - name: 6. Ricreazione delle directory di destinazione vuote
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: '0700'
+      with_items:
+        - "{{ ldap_data_dir }}"
+        - "{{ ldap_config_dir }}"
+
+    - name: 7. Ripristino dei file MDB binari in /var/lib/ldap/
+      unarchive:
+        src: "{{ target_backup_dir }}/mdb_raw_files.tar.gz"
+        dest: "{{ ldap_data_dir }}"
+        remote_src: true
+
+    - name: 8. Ripristino della configurazione OLC binaria in /etc/ldap/slapd.d/
+      unarchive:
+        src: "{{ target_backup_dir }}/slapd_d_raw.tar.gz"
+        dest: "{{ ldap_config_dir }}"
+        remote_src: true
+
+    # =========================================================================
+    # FASE 4: RIPRISTINO PERMESSI (HARDENED) E RIAVVIO
+    # =========================================================================
+
+    - name: 9. Ripristino ricorsivo dei permessi restrittivi (openldap:openldap)
+      file:
+        path: "{{ item.path }}"
+        owner: openldap
+        group: openldap
+        mode: "{{ item.mode }}"
+        recurse: true
+      with_items:
+        - { path: "{{ ldap_data_dir }}", mode: '0700' }
+        - { path: "{{ ldap_config_dir }}", mode: '0700' }
+
+    - name: 10. Pulizia della directory temporanea di lavorazione
+      file:
+        path: "{{ restore_tmp_dir }}"
+        state: absent
+
+    - name: 11. Avvio del servizio slapd con la configurazione/dati ripristinati
+      service:
+        name: slapd
+        state: started
+
+    - name: 12. Verifica funzionale dello stato del demone e del DIT
+      command: ldapsearch -Y EXTERNAL -H ldapi:/// -b "" -s base "(objectClass=*)"
+      register: check_slapd
+      retries: 5
+      delay: 2
+      until: check_slapd.rc == 0
+
+    - name: 13. Conferma di ripristino completato
+      debug:
+        msg: "Restore completato con successo su {{ ansible_facts['fqdn'] }}. Il servizio slapd è attivo e rispondente."
