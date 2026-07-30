@@ -1,0 +1,95 @@
+# ==============================================================================
+# TITOLO:       Backup Offline Completo Cluster OpenLDAP (MDB & OLC Config)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Arresto controllato di slapd, dump LDIF, backup dei binary MDB 
+#               e ripristino istantaneo del servizio.
+# ==============================================================================
+
+---
+- name: Backup Offline Completo OpenLDAP (cn=config + MDB Binary & LDIF)
+  hosts: cluster
+  become: true
+  vars:
+    backup_base_dir: "/var/backups/openldap"
+    backup_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    current_backup_dir: "{{ backup_base_dir }}/backup_{{ backup_timestamp }}"
+    
+    ldap_config_dir: "/etc/ldap/slapd.d"
+    ldap_data_dir: "/var/lib/ldap"
+
+  tasks:
+    # =========================================================================
+    # FASE 1: PREPARAZIONE DIRECTORY E ARRESTO CONTROLLATO
+    # =========================================================================
+
+    - name: 1. Creazione directory principale dei backup
+      file:
+        path: "{{ current_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: 2. Arresto del servizio slapd su tutti i nodi (Stato Consistente)
+      service:
+        name: slapd
+        state: stopped
+
+    # =========================================================================
+    # FASE 2: DUMP LDIF OFFLINE (slapcat) & BACKUP BINARIO MDB
+    # =========================================================================
+
+    - name: 3. Dump LDIF della configurazione (cn=config) via slapcat
+      command: >
+        slapcat -b "cn=config" -l "{{ current_backup_dir }}/config_{{ backup_timestamp }}.ldif"
+      register: dump_config_result
+      failed_when: dump_config_result.rc != 0
+
+    - name: 4. Dump LDIF dei dati reali del DIT via slapcat
+      command: >
+        slapcat -b "dc=example,dc=com" -l "{{ current_backup_dir }}/data_{{ backup_timestamp }}.ldif"
+      register: dump_data_result
+      failed_when: dump_data_result.rc != 0
+
+    - name: 5. Backup binario snapshot di /var/lib/ldap (data.mdb + lock.mdb)
+      command: >
+        tar -czf "{{ current_backup_dir }}/mdb_raw_files.tar.gz" -C "{{ ldap_data_dir }}" .
+      register: tar_mdb_result
+      failed_when: tar_mdb_result.rc != 0
+
+    - name: 6. Backup binario della directory di configurazione /etc/ldap/slapd.d
+      command: >
+        tar -czf "{{ current_backup_dir }}/slapd_d_raw.tar.gz" -C "{{ ldap_config_dir }}" .
+      register: tar_config_result
+      failed_when: tar_config_result.rc != 0
+
+    # =========================================================================
+    # FASE 3: RIPRISTINO SERVIZIO & COMPRESSIONE FINALE
+    # =========================================================================
+
+    - name: 7. Riavvio immediato del servizio slapd
+      service:
+        name: slapd
+        state: started
+
+    - name: 8. Verifica che slapd sia tornato operativo
+      command: ldapsearch -Y EXTERNAL -H ldapi:/// -b "" -s base "(objectClass=*)"
+      register: check_slapd
+      retries: 3
+      delay: 2
+      until: check_slapd.rc == 0
+
+    - name: 9. Creazione tarball finale compresso contenente l'intero snapshot
+      command: >
+        tar -czf "{{ backup_base_dir }}/openldap_full_backup_{{ ansible_facts['fqdn'] }}_{{ backup_timestamp }}.tar.gz"
+        -C "{{ backup_base_dir }}" "backup_{{ backup_timestamp }}"
+
+    - name: 10. Rimozione directory temporanea uncompressed
+      file:
+        path: "{{ current_backup_dir }}"
+        state: absent
+
+    - name: 11. Report di conferma backup
+      debug:
+        msg: "Backup completato con successo su {{ ansible_facts['fqdn'] }}. File salvato in: {{ backup_base_dir }}/openldap_full_backup_{{ ansible_facts['fqdn'] }}_{{ backup_timestamp }}.tar.gz"
