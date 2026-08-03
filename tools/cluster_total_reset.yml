@@ -1,0 +1,100 @@
+# ==============================================================================
+# TITOLO:       cluster_total_reset.yml
+# AUTORE:       Elia Pinto
+# DATA:         Agosto 2026
+# SCOPO:        Total Offline Reset del cluster N-Way Multi-Master OpenLDAP.
+#               Spegnimento simultaneo di slapd, pulizia MDB, re-importazione LDIF
+#               di bootstrap con slapadd -w e riavvio controllato.
+# VERSIONE:     1.0 (Full Offline Cluster Re-bootstrap)
+# ==============================================================================
+
+---
+- name: "TOTAL RESET: Azzeramento Offline e Re-bootstrap del Cluster Multi-Master"
+  hosts: cluster
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_data_dir: "/var/lib/ldap"
+
+  tasks:
+    # ==========================================================================
+    # FASE 1: STOP SIMULTANEO DEL SERVIZIO SU TUTTI I NODI
+    # ==========================================================================
+    - name: "[STEP 1] Arresto simultaneo del servizio slapd su tutto il cluster"
+      ansible.builtin.service:
+        name: slapd
+        state: stopped
+
+    # ==========================================================================
+    # FASE 2: SVUOTAMENTO DEL DATABASE MDB E PREPARAZIONE LDIF BOOTSTRAP
+    # ==========================================================================
+    - name: "[STEP 2] Svuotamento fisico del database MDB (/var/lib/ldap/*)"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ ldap_data_dir }}/data.mdb"
+        - "{{ ldap_data_dir }}/lock.mdb"
+
+    - name: "[STEP 3] Generazione del file LDIF di bootstrap con le sole OU di base"
+      ansible.builtin.copy:
+        dest: /tmp/bootstrap_clean.ldif
+        content: |
+          dn: {{ ldap_basedn }}
+          objectClass: top
+          objectClass: domain
+          dc: {{ ldap_basedn.split(',')[0].split('=')[1] }}
+
+          dn: ou=People,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: People
+
+          dn: ou=groups,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: groups
+
+          dn: ou=system,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: system
+
+          dn: cn=administrators,ou=groups,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: groupOfNames
+          cn: administrators
+          member: cn=admin,{{ ldap_basedn }}
+
+    # ==========================================================================
+    # FASE 3: IMPORTAZIONE OFFLINE CON SLAPADD -W E RIPRISTINO PERMESSI
+    # ==========================================================================
+    - name: "[STEP 4] Esecuzione di slapadd -w per inizializzare il DB ed i CSN locali"
+      ansible.builtin.command: >
+        slapadd -c -w -b "{{ ldap_basedn }}" -l /tmp/bootstrap_clean.ldif
+      register: slapadd_out
+
+    - name: "[STEP 5] Ripristino dei permessi di proprietà (openldap:openldap) su MDB"
+      ansible.builtin.file:
+        path: "{{ ldap_data_dir }}"
+        owner: openldap
+        group: openldap
+        mode: '0700'
+        recurse: true
+
+    - name: "[STEP 6] Pulizia del file LDIF temporaneo"
+      ansible.builtin.file:
+        path: /tmp/bootstrap_clean.ldif
+        state: absent
+
+    # ==========================================================================
+    # FASE 4: RIAVVIO COORDINATO DEL CLUSTER
+    # ==========================================================================
+    - name: "[STEP 7] Riavvio del servizio slapd su tutti i nodi del cluster"
+      ansible.builtin.service:
+        name: slapd
+        state: started
+
+    - name: "[REPORT] Conferma Total Reset"
+      ansible.builtin.debug:
+        msg: "RESET COMPLETATO: Il cluster Multi-Master è stato totalmente pulito offline e ripartito con la sola struttura DIT di base."
