@@ -1,0 +1,50 @@
+# ==============================================================================
+# TITOLO:       Configurazione Infrastruttura slapo-memberof (Risolto per Replica)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026 (Aggiornato Agosto 2026)
+# SCOPO:        Caricamento modulo e configurazione corretta di memberof statico.
+#               Uso della classe groupOfEntries (RFC 4519)
+# ==============================================================================
+
+---
+- name: "Attivazione slapo-memberof sul Cluster"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    target_db: "olcDatabase={1}mdb,cn=config"
+
+  tasks:
+
+    - name: "[MEMBEROF] Carica il modulo globale memberof"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof"
+        state: present
+
+    - name: "[MEMBEROF] Inizializza e configura l'overlay per groupOfEntries"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}memberof,{{ target_db }}"
+        objectClass:
+          - olcOverlayConfig
+          - olcMemberOf
+        attributes:
+          olcOverlay: "{0}memberof"
+          olcMemberOfGroupOC: "groupOfEntries"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
+          olcMemberOfDN: "cn=admin,{{ suffix }}"
+          # Configurazione necessaria per ambienti replicati
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
+        state: present
+
+    - name: "[RESTART] Riavvia slapd per applicare l'overlay"
+      ansible.builtin.systemd:
+        name: slapd
+        state: restarted
