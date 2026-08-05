@@ -360,20 +360,20 @@
             by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
             by dn.exact="{{ ldap_rootdn }}" write
             by group.exact="{{ ldap_admin_group }}" write
-            by dn.one="ou=system,{{ ldap_basedn }}" read
+            by dn.subtree="ou=system,{{ ldap_basedn }}" read
             by * auth
           olcAccess: {3}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
             by self read
             by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
             by dn.exact="{{ ldap_rootdn }}" write
             by group.exact="{{ ldap_admin_group }}" write
-            by dn.one="ou=system,{{ ldap_basedn }}" read
+            by dn.subtree="ou=system,{{ ldap_basedn }}" read
             by * none
           olcAccess: {4}to dn.subtree="{{ ldap_basedn }}"
             by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" write
             by dn.exact="{{ ldap_rootdn }}" write
             by group.exact="{{ ldap_admin_group }}" write
-            by dn.one="ou=system,{{ ldap_basedn }}" read
+            by dn.subtree="ou=system,{{ ldap_basedn }}" read
             by self write
             by users read
             by * none
