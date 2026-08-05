@@ -3,6 +3,7 @@
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
 # SCOPO:        Caricamento modulo e configurazione corretta di memberof statico.
+#               uso la class groupOfNames
 # ==============================================================================
 
 ---
