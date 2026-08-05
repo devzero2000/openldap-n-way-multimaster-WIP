@@ -1,0 +1,62 @@
+# ==============================================================================
+# TITOLO:       Rimozione Fisica Schema Custom groupOfEntries da OLC
+# AUTORE:       Elia Pinto
+# DATA:         Agosto 2026
+# SCOPO:        Arresto di slapd, eliminazione del file LDIF dello schema da
+#               /etc/ldap/slapd.d/cn=config/cn=schema/ e riavvio garantito.
+# ==============================================================================
+
+---
+- name: "Rimozione Fisica Schema groupOfEntries dal File System OLC"
+  hosts: cluster
+  become: true
+
+  tasks:
+
+    - name: "[FIND] Individua il file LDIF dello schema groupofentries"
+      ansible.builtin.find:
+        paths: /etc/ldap/slapd.d/cn=config/cn=schema/
+        patterns: "*groupofentries*.ldif"
+      register: found_schema_files
+
+    - name: "[STOP] Arresta slapd per manutenzione OLC"
+      ansible.builtin.systemd:
+        name: slapd
+        state: stopped
+      when: found_schema_files.matched > 0
+
+    - name: "[DELETE] Rimuovi il file LDIF dello schema dal file system"
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ found_schema_files.files }}"
+      when: found_schema_files.matched > 0
+
+    - name: "[START] Forza l'avvio del servizio slapd su tutti i nodi"
+      ansible.builtin.systemd:
+        name: slapd
+        state: started
+
+    - name: "[WAIT] Attendi che il servizio stia rispondendo sulla socket ldapi"
+      ansible.builtin.wait_for:
+        path: /var/run/slapd/ldapi
+        state: present
+        timeout: 15
+
+    - name: "[VERIFICA] Controlla l'effettiva scomparsa dello schema da LDAP"
+      ansible.builtin.command: >
+        ldapsearch -Q -LLL -Y EXTERNAL -H ldapi:///
+        -b "cn=schema,cn=config"
+        "(olcObjectClasses=*groupOfEntries*)" olcObjectClasses
+      register: schema_check_after
+      changed_when: false
+
+    - name: "[REPORT] Esito operazione"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " RIMOZIONE FISICA GROUPOFENTRIES COMPLETATA"
+          - "=================================================================="
+          - "File LDIF Rimosse: {{ found_schema_files.files | map(attribute='path') | list }}"
+          - "Stato in cn=config: {{ 'OK (Schema rimosso)' if schema_check_after.stdout == '' else 'ATTENZIONE: Definizione ancora presente' }}"
+          - "=================================================================="
