@@ -1,0 +1,57 @@
+# ==============================================================================
+# TITOLO:       Deployment Schema Custom groupOfEntries (IETF Draft)
+# AUTORE:       Elia Pinto
+# DATA:         Agosto 2026
+# SCOPO:        Estensione dinamica di cn=schema,cn=config per abilitare la
+#               classe groupOfEntries ed il supporto ai gruppi vuoti.
+# ==============================================================================
+
+---
+- name: "Importazione Schema groupOfEntries nel Cluster OpenLDAP"
+  hosts: cluster
+  become: true
+  vars:
+    server_uri: "ldapi:///"
+    sasl_class: "external"
+
+  tasks:
+
+    - name: "[SCHEMA] Inietta la definizione di groupOfEntries in cn=config"
+      community.general.ldap_entry:
+        server_uri: "{{ server_uri }}"
+        sasl_class: "{{ sasl_class }}"
+        dn: "cn=groupofentries,cn=schema,cn=config"
+        objectClass:
+          - olcSchemaConfig
+        attributes:
+          cn: "groupofentries"
+          olcObjectClasses: >-
+            ( 1.3.6.1.4.1.7922.2.1.1 
+            NAME 'groupOfEntries' 
+            DESC 'Group of entries with optional member attribute (IETF Draft)' 
+            SUP top 
+            STRUCTURAL 
+            MUST cn 
+            MAY ( member $ businessCategory $ seeAlso $ owner $ ou $ o $ description ) )
+        state: present
+      register: schema_reg
+      failed_when:
+        - schema_reg.failed
+        - "'Already exists' not in schema_reg.msg"
+
+    - name: "[VERIFICA] Controlla la presenza della classe nel dizionario dati"
+      ansible.builtin.command: >
+        ldapsearch -Q -LLL -Y EXTERNAL -H ldapi:///
+        -b "cn=schema,cn=config"
+        "(olcObjectClasses=*groupOfEntries*)" olcObjectClasses
+      register: schema_check
+      changed_when: false
+
+    - name: "[REPORT] Esito estensione schema"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " ESTENSIONE SCHEMA GROUPOFENTRIES COMPLETATA CON SUCCESSO"
+          - "=================================================================="
+          - "{{ schema_check.stdout_lines }}"
+          - "=================================================================="
