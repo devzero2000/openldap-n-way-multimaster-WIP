@@ -129,6 +129,13 @@ audit_overlays() {
     done
 }
 
+audit_mdb_full_dump() {
+    log_section "6. DUMP COMPLETO CONFIGURAZIONE olcDatabase={1}mdb,cn=config"
+
+    exec_ldapsearch_full "olcDatabase={1}mdb,cn=config" base "(objectClass=*)" | \
+        grep -v -E "^(SASL|search:|result:|#|numResponses:|numEntries:)" || true
+}
+
 main() {
     clear
     printf "${BOLD}${BLUE}"
@@ -145,6 +152,7 @@ main() {
     audit_context_csn
     audit_loaded_modules
     audit_overlays
+    audit_mdb_full_dump
 
     printf "\n${GREEN}[INFO] Audit completato con successo.${NC}\n\n"
 }
