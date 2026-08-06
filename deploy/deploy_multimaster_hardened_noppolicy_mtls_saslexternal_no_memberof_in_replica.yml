@@ -314,14 +314,6 @@
       run_once: true
       delegate_to: "{{ groups['cluster'][0] }}"
 
-    - name: 5d. Eliminazione Utente Replica Obsoleto (Se ancora presente nel DIT da installazioni precedenti)
-      shell: ldapdelete -Y EXTERNAL -H ldapi:/// "cn=nwayreplicator,ou=system,{{ ldap_basedn }}"
-      register: del_repl_user
-      failed_when:
-        - del_repl_user.rc != 0
-        - "'No such object' not in del_repl_user.stderr"
-      run_once: true
-      delegate_to: "{{ groups['cluster'][0] }}"
 
     # =========================================================================
     # HARDENING SICUREZZA & ACL GLOBALI (Autorizzano l'OU di sistema)
