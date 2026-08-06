@@ -3,7 +3,7 @@
 # AUTORE:       Elia Pinto[cite: 4]
 # DATA:         Luglio 2026[cite: 4]
 # SCOPO:        Deploy corazzato con LDAPS basato sulla logica nativa a 3 CSN[cite: 4]
-#               VERSIONE: 1.10 (Risolto errore utente replica, limiti e db sync)
+#               VERSIONE: 1.12 (Incluso modulo ppolicy prima delle ACL e indentazione corretta)
 # ==============================================================================
 
 ---
@@ -184,7 +184,6 @@
       register: log_init_result
       failed_when: log_init_result.rc != 0
 
-
     - name: "2d. Tuning dei thread e limiti connessioni in cn=config"
       copy:
         dest: /tmp/01_threads_tuning.ldif
@@ -249,7 +248,14 @@
         - anon_result.rc != 0
         - "'Type or value exists' not in anon_result.stderr"
 
-   - name: C. Generazione LDIF per ACL Globali Corrette (olcAccess)
+    - name: Enable ppolicy module
+      community.general.ldap_attrs:
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "ppolicy.la"
+        state: present
+
+    - name: C. Generazione LDIF per ACL Globali Corrette (olcAccess)
       copy:
         dest: /tmp/01c_acl_init.ldif
         content: |
@@ -291,17 +297,10 @@
     # INIZIALIZZAZIONE STRUTTURA DEL DIT: SOLO SUL PRIMO NODO (Garantisce UUID identici)
     # =========================================================================
 
-    - name: E. Generazione LDIF per Entry Base, OUs di Sistema, Gruppo e Utente Replicator
+    - name: E. Generazione LDIF per OUs di Sistema, Gruppo e Utente Replicator
       copy:
         dest: /tmp/01e_bootstrap_dit.ldif
         content: |
-          # 1. Radice Dinamica Universale per lo Schema Core
-          dn: {{ ldap_basedn }}
-          objectClass: top
-          objectClass: domain
-          dc: {{ ldap_basedn.split(',')[0].split('=')[1] }}
-
-          # 2. Struttura e Utenze di Sistema
           dn: ou=system,{{ ldap_basedn }}
           changetype: add
           objectClass: top
@@ -313,6 +312,12 @@
           objectClass: top
           objectClass: organizationalUnit
           ou: groups
+
+          dn: ou=people,{{ ldap_basedn }}
+          changetype: add
+          objectClass: top
+          objectClass: organizationalUnit
+          ou: people
 
           dn: {{ ldap_repl_user }}
           changetype: add
@@ -334,7 +339,7 @@
       delegate_to: "{{ groups['cluster'][0] }}"
 
     - name: F. Applicazione Struttura DIT Iniziale (Solo sul primo nodo)
-      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
+      shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01e_bootstrap_dit.ldif
       register: dit_result
       failed_when:
         - dit_result.rc != 0
@@ -497,7 +502,7 @@
 
           dn: cn=config
           changetype: modify
-          add: olcWriteTimeout
+          replace: olcWriteTimeout
           olcWriteTimeout: 30
 
     - name: H. Applicazione parametri di Tuning Database
