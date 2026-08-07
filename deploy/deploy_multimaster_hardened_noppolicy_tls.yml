@@ -84,7 +84,9 @@
           [alt_names]
           DNS.1 = {{ item }}
           DNS.2 = {{ item | split('.') | first }}
+          DNS.3 = localhost
           IP.1 = {{ '192.168.1.16' if item == 'ubuntu24lts1.example.com' else '192.168.1.17' if item == 'ubuntu24lts2.example.com' else '192.168.1.18' }}
+          IP.2 = 127.0.0.1
       with_items: "{{ cluster_nodes }}"
       when: ansible_facts['fqdn'] == ca_server
 
