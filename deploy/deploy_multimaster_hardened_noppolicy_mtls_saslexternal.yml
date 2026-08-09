@@ -1,12 +1,12 @@
 # ==============================================================================
-# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 via (N-Way)
+# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# SCOPO:        Deploy con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
+# SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
 # ==============================================================================
 
 ---
-- name: Configurazione Cluster OpenLDAP Multi-Master a 3 vie (Modern N-Way) - HARDENED SASL EXTERNAL mTLS
+- name: Configurazione Cluster OpenLDAP Multi-Master dinamico (N-Way) - HARDENED SASL EXTERNAL mTLS
   hosts: cluster
   become: true
   vars:
@@ -16,16 +16,14 @@
 
     ldap_admin_group: "cn=administrators,ou=groups,dc=example,dc=com"
 
+    # Dinamico: la CA e il nodo coordinatore coincidono sempre con il primo host dell'inventory del gruppo cluster
+    ca_server: "{{ groups['cluster'][0] }}"
+    cluster_nodes: "{{ groups['cluster'] }}"
+
     # Variabili infrastruttura PKI / SSL
-    ca_server: "ubuntu24lts1.example.com"
     ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
     ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
     ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
-
-    cluster_nodes:
-      - ubuntu24lts1.example.com
-      - ubuntu24lts2.example.com
-      - ubuntu24lts3.example.com
 
   tasks:
     # =========================================================================
@@ -36,7 +34,7 @@
       ansible.builtin.apt:
         name: openssl
         state: present
-      when: ansible_facts['fqdn'] == ca_server
+      when: inventory_hostname == ca_server
 
     - name: Certificati - Directory temporanea locale sul control node
       delegate_to: localhost
@@ -47,9 +45,8 @@
         mode: "0700"
       run_once: true
 
-    - name: Certificati - Generazione Autorità di Certificazione (Solo su ubuntu24lts1)
-      when: ansible_facts['fqdn'] == ca_server
-
+    - name: Certificati - Generazione Autorità di Certificazione (Solo sul primo nodo)
+      when: inventory_hostname == ca_server
       block:
         - name: CA - Genera chiave privata
           ansible.builtin.command: openssl genrsa -out /tmp/ca.key 4096
@@ -71,10 +68,10 @@
       args:
         creates: "/tmp/{{ item }}.key"
       with_items: "{{ cluster_nodes }}"
-      when: ansible_facts['fqdn'] == ca_server
+      when: inventory_hostname == ca_server
       changed_when: true
 
-    - name: Server Cert - Genera estensioni SAN per ciascun nodo del cluster
+    - name: Server Cert - Genera estensioni SAN dinamiche per ciascun nodo
       ansible.builtin.copy:
         dest: "/tmp/{{ item }}.ext"
         mode: "0600"
@@ -87,10 +84,10 @@
           DNS.1 = {{ item }}
           DNS.2 = {{ item | split('.') | first }}
           DNS.3 = localhost
-          IP.1 = {{ '192.168.1.16' if item == 'ubuntu24lts1.example.com' else '192.168.1.17' if item == 'ubuntu24lts2.example.com' else '192.168.1.18' }}
+          IP.1 = {{ hostvars[item]['ansible_default_ipv4']['address'] | default('127.0.0.1') }}
           IP.2 = 127.0.0.1
       with_items: "{{ cluster_nodes }}"
-      when: ansible_facts['fqdn'] == ca_server
+      when: inventory_hostname == ca_server
 
     - name: Server Cert - Genera CSR per ciascun nodo del cluster
       ansible.builtin.command: >
@@ -99,7 +96,7 @@
       args:
         creates: "/tmp/{{ item }}.csr"
       with_items: "{{ cluster_nodes }}"
-      when: ansible_facts['fqdn'] == ca_server
+      when: inventory_hostname == ca_server
       changed_when: true
 
     - name: Server Cert - Firma certificato per ciascun nodo usando la CA locale
@@ -109,23 +106,21 @@
       args:
         creates: "/tmp/{{ item }}.crt"
       with_items: "{{ cluster_nodes }}"
-      when: ansible_facts['fqdn'] == ca_server
+      when: inventory_hostname == ca_server
       changed_when: true
 
-    - name: Certificati - Fetch verso il Control Node
+    - name: Certificati - Fetch dinamico verso il Control Node di tutti i certificati
       ansible.builtin.fetch:
         src: "/tmp/{{ item }}"
         dest: "/tmp/ldap_certs_transit/{{ item }}"
         flat: true
       with_items:
-        - ca.crt
-        - ubuntu24lts1.example.com.key
-        - ubuntu24lts1.example.com.crt
-        - ubuntu24lts2.example.com.key
-        - ubuntu24lts2.example.com.crt
-        - ubuntu24lts3.example.com.key
-        - ubuntu24lts3.example.com.crt
-      when: ansible_facts['fqdn'] == ca_server
+        - "ca.crt"
+        - "{{ cluster_nodes | map('regex_replace', '$', '.key') | list }}"
+        - "{{ cluster_nodes | map('regex_replace', '$', '.crt') | list }}"
+      loop_control:
+        extended: true
+      when: inventory_hostname == ca_server
 
     - name: Certificati - Distribuzione e assegnazione permessi restrittivi (Hardened)
       ansible.builtin.copy:
@@ -136,8 +131,8 @@
         mode: "{{ item.mode }}"
       with_items:
         - { src: "ca.crt", dest: "{{ ssl_ca_path }}", mode: "0644" }
-        - { src: "{{ ansible_facts['fqdn'] }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
-        - { src: "{{ ansible_facts['fqdn'] }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
+        - { src: "{{ inventory_hostname }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
 
     - name: Certificati - Pulizia locale control node
       delegate_to: localhost
@@ -323,7 +318,7 @@
           o: example.com
           dc: example
       run_once: true
-      delegate_to: "{{ groups['cluster'][0] }}"
+      delegate_to: "{{ ca_server }}"
 
     - name: F. Applicazione Radice DIT con Bind Amministrativo (Solo sul primo nodo)
       ansible.builtin.command: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01_root_dit.ldif
@@ -332,10 +327,10 @@
         - root_dit_result.rc != 0
         - "'Already exists' not in root_dit_result.stderr"
       run_once: true
-      delegate_to: "{{ groups['cluster'][0] }}"
+      delegate_to: "{{ ca_server }}"
       changed_when: true
 
-    - name: E2. Generazione LDIF per OUs, Gruppo e Nodi Server mTLS
+    - name: E2. Generazione LDIF dinamica per OUs, Gruppo e Nodi Server mTLS
       ansible.builtin.copy:
         dest: /tmp/02_sub_dit.ldif
         mode: "0600"
@@ -374,7 +369,7 @@
 
           {% endfor %}
       run_once: true
-      delegate_to: "{{ groups['cluster'][0] }}"
+      delegate_to: "{{ ca_server }}"
 
     - name: F2. Applicazione sottostruttura DIT con Bind Amministrativo (Solo sul primo nodo)
       ansible.builtin.command: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/02_sub_dit.ldif
@@ -384,7 +379,7 @@
         - "'Already exists' not in sub_dit_result.stderr"
         - "'Constraint violation' not in sub_dit_result.stderr"
       run_once: true
-      delegate_to: "{{ groups['cluster'][0] }}"
+      delegate_to: "{{ ca_server }}"
       changed_when: true
 
     - name: F3. Generazione e applicazione Limiti Illimitati per i nodi in ou=system
@@ -465,10 +460,10 @@
         state: restarted
 
     # =========================================================================
-    # CONFIGURAZIONE REPLICA INTELLIGENTE VIA LDAPS (SASL / EXTERNAL)
+    # CONFIGURAZIONE REPLICA INTELLIGENTE VIA LDAPS (SASL / EXTERNAL) - DINAMICA
     # =========================================================================
 
-    - name: "6. Generazione LDIF per ServerID globali in cn=config"
+    - name: "6. Generazione LDIF dinamico per ServerID globali in cn=config"
       ansible.builtin.copy:
         dest: /tmp/02_serverid.ldif
         mode: "0600"
@@ -476,9 +471,9 @@
           dn: cn=config
           changetype: modify
           replace: olcServerID
-          olcServerID: 1 ldaps://ubuntu24lts1.example.com
-          olcServerID: 2 ldaps://ubuntu24lts2.example.com
-          olcServerID: 3 ldaps://ubuntu24lts3.example.com
+          {% for node in cluster_nodes %}
+          olcServerID: {{ loop.index }} ldaps://{{ node }}
+          {% endfor %}
 
     - name: "6b. Applicazione ServerID"
       ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_serverid.ldif
@@ -518,7 +513,7 @@
         - "'Already exists' not in overlay_result.stderr"
       changed_when: true
 
-    - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (SASL EXTERNAL)
+    - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (SASL EXTERNAL) - Completamente Dinamico
       ansible.builtin.copy:
         dest: /tmp/04_multimaster.ldif
         mode: "0600"
@@ -526,16 +521,11 @@
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
           replace: olcSyncRepl
-          {% if ansible_facts['fqdn'] == 'ubuntu24lts1.example.com' %}
-          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          {% elif ansible_facts['fqdn'] == 'ubuntu24lts2.example.com' %}
-          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          olcSyncRepl: rid=003 provider=ldaps://ubuntu24lts3.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          {% elif ansible_facts['fqdn'] == 'ubuntu24lts3.example.com' %}
-          olcSyncRepl: rid=001 provider=ldaps://ubuntu24lts1.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
-          olcSyncRepl: rid=002 provider=ldaps://ubuntu24lts2.example.com:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          {% for node in cluster_nodes %}
+          {% if node != inventory_hostname %}
+          olcSyncRepl: rid={{ "%03d" | format(loop.index) }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
           {% endif %}
+          {% endfor %}
           -
           replace: olcMultiProvider
           olcMultiProvider: TRUE
