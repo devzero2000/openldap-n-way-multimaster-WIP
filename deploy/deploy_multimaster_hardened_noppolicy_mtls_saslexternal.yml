@@ -2,7 +2,7 @@
 # TITOLO:       Configurazione Cluster OpenLDAP Multi-Master a 3 via (N-Way)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
+# SCOPO:        Deploy con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
 # ==============================================================================
 
 ---
@@ -13,7 +13,7 @@
     ldap_basedn: "dc=example,dc=com"
     ldap_rootdn: "cn=admin,dc=example,dc=com"
     ldap_rootpw: "openldap"
-    
+
     ldap_admin_group: "cn=administrators,ou=groups,dc=example,dc=com"
 
     # Variabili infrastruttura PKI / SSL
@@ -21,7 +21,7 @@
     ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
     ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
     ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
-    
+
     cluster_nodes:
       - ubuntu24lts1.example.com
       - ubuntu24lts2.example.com
@@ -33,7 +33,7 @@
     # =========================================================================
 
     - name: Certificati - Installa openssl sulla CA
-      apt:
+      ansible.builtin.apt:
         name: openssl
         state: present
       when: ansible_facts['fqdn'] == ca_server
@@ -41,38 +41,43 @@
     - name: Certificati - Directory temporanea locale sul control node
       delegate_to: localhost
       become: false
-      file:
+      ansible.builtin.file:
         path: /tmp/ldap_certs_transit
         state: directory
-        mode: '0700'
+        mode: "0700"
       run_once: true
 
     - name: Certificati - Generazione Autorità di Certificazione (Solo su ubuntu24lts1)
+      when: ansible_facts['fqdn'] == ca_server
+
       block:
         - name: CA - Genera chiave privata
-          command: openssl genrsa -out /tmp/ca.key 4096
+          ansible.builtin.command: openssl genrsa -out /tmp/ca.key 4096
           args:
             creates: /tmp/ca.key
+          changed_when: true
 
         - name: CA - Genera certificato root
-          command: >
+          ansible.builtin.command: >
             openssl req -x509 -new -nodes -key /tmp/ca.key -sha256 -days 3650
             -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN=Cyber Actors Local CA"
             -out /tmp/ca.crt
           args:
             creates: /tmp/ca.crt
-      when: ansible_facts['fqdn'] == ca_server
+          changed_when: true
 
     - name: Server Cert - Genera chiave per ciascun nodo del cluster
-      command: "openssl genrsa -out /tmp/{{ item }}.key 2048"
+      ansible.builtin.command: "openssl genrsa -out /tmp/{{ item }}.key 2048"
       args:
         creates: "/tmp/{{ item }}.key"
       with_items: "{{ cluster_nodes }}"
       when: ansible_facts['fqdn'] == ca_server
+      changed_when: true
 
     - name: Server Cert - Genera estensioni SAN per ciascun nodo del cluster
-      copy:
+      ansible.builtin.copy:
         dest: "/tmp/{{ item }}.ext"
+        mode: "0600"
         content: |
           authorityKeyIdentifier=keyid,issuer
           basicConstraints=CA:FALSE
@@ -88,29 +93,30 @@
       when: ansible_facts['fqdn'] == ca_server
 
     - name: Server Cert - Genera CSR per ciascun nodo del cluster
-      command: >
-        openssl req -new -key /tmp/{{ item }}.key 
-        -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
+      ansible.builtin.command: >
+        openssl req -new -key /tmp/{{ item }}.key  -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
         -out /tmp/{{ item }}.csr
       args:
         creates: "/tmp/{{ item }}.csr"
       with_items: "{{ cluster_nodes }}"
       when: ansible_facts['fqdn'] == ca_server
+      changed_when: true
 
     - name: Server Cert - Firma certificato per ciascun nodo usando la CA locale
-      command: >
+      ansible.builtin.command: >
         openssl x509 -req -in /tmp/{{ item }}.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key
         -CAcreateserial -out /tmp/{{ item }}.crt -days 1825 -sha256 -extfile /tmp/{{ item }}.ext
       args:
         creates: "/tmp/{{ item }}.crt"
       with_items: "{{ cluster_nodes }}"
       when: ansible_facts['fqdn'] == ca_server
+      changed_when: true
 
     - name: Certificati - Fetch verso il Control Node
-      fetch:
+      ansible.builtin.fetch:
         src: "/tmp/{{ item }}"
         dest: "/tmp/ldap_certs_transit/{{ item }}"
-        flat: yes
+        flat: true
       with_items:
         - ca.crt
         - ubuntu24lts1.example.com.key
@@ -122,7 +128,7 @@
       when: ansible_facts['fqdn'] == ca_server
 
     - name: Certificati - Distribuzione e assegnazione permessi restrittivi (Hardened)
-      copy:
+      ansible.builtin.copy:
         src: "/tmp/ldap_certs_transit/{{ item.src }}"
         dest: "{{ item.dest }}"
         owner: openldap
@@ -136,7 +142,7 @@
     - name: Certificati - Pulizia locale control node
       delegate_to: localhost
       become: false
-      file:
+      ansible.builtin.file:
         path: /tmp/ldap_certs_transit
         state: absent
       run_once: true
@@ -146,21 +152,21 @@
     # =========================================================================
 
     - name: 1. Installazione di OpenLDAP e utility client
-      apt:
+      ansible.builtin.apt:
         name:
           - slapd
           - ldap-utils
           - python-is-python3
         state: present
-        update_cache: yes
+        update_cache: true
 
     - name: "Garantisci che slapd sia attivo per accettare configurazioni"
-      service:
+      ansible.builtin.service:
         name: slapd
         state: started
 
     - name: 2. Configurazione dei parametri di default in /etc/ldap/ldap.conf
-      blockinfile:
+      ansible.builtin.blockinfile:
         path: /etc/ldap/ldap.conf
         block: |
           BASE    {{ ldap_basedn }}
@@ -170,8 +176,9 @@
         marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
 
     - name: 2b. Generazione LDIF configurazione livello Log avanzato (stats sync)
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01_loglevel.ldif
+        mode: "0600"
         content: |
           dn: cn=config
           changetype: modify
@@ -179,13 +186,15 @@
           olcLogLevel: stats sync
 
     - name: 2c. Applicazione livello di log a cn=config
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
       register: log_init_result
       failed_when: log_init_result.rc != 0
+      changed_when: true
 
     - name: "2d. Tuning dei thread e limiti connessioni in cn=config"
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01_threads_tuning.ldif
+        mode: "0600"
         content: |
           dn: cn=config
           changetype: modify
@@ -199,18 +208,20 @@
           olcConnMaxPendingAuth: 50
 
     - name: "2e. Applicazione tuning thread"
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_threads_tuning.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_threads_tuning.ldif
       register: threads_result
       failed_when: threads_result.rc != 0
+      changed_when: true
 
     - name: 3. Configurazione della password di Root in formato SSHA
-      shell: slappasswd -s {{ ldap_rootpw }}
+      ansible.builtin.command: slappasswd -s {{ ldap_rootpw }}
       register: ldap_hashed_pw
       changed_when: false
 
     - name: 4. Creazione del file LDIF per la configurazione del Database base
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01_db_init.ldif
+        mode: "0600"
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
@@ -222,15 +233,17 @@
           -
           replace: olcRootPW
           olcRootPW: {{ ldap_hashed_pw.stdout }}
-  
+
     - name: 5. Applicazione configurazione Database di base
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_db_init.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_db_init.ldif
       register: db_init_result
       failed_when: "'ERR' in db_init_result.stderr and 'Duplicate' not in db_init_result.stderr"
+      changed_when: true
 
     - name: A. Blocco dei Bind Anonimi a livello globale
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01b_disable_anon.ldif
+        mode: "0600"
         content: |
           dn: cn=config
           changetype: modify
@@ -241,11 +254,12 @@
           olcDisallows: bind_anon
 
     - name: B. Applicazione blocco anonimi
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01b_disable_anon.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01b_disable_anon.ldif
       register: anon_result
-      failed_when: 
+      failed_when:
         - anon_result.rc != 0
         - "'Type or value exists' not in anon_result.stderr"
+      changed_when: true
 
     - name: Enable ppolicy module
       community.general.ldap_attrs:
@@ -255,8 +269,9 @@
         state: present
 
     - name: C. Generazione LDIF per ACL Globali Corrette con livello zero SASL External e PPolicy
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01c_acl_init.ldif
+        mode: "0600"
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
@@ -285,18 +300,20 @@
             by * none
 
     - name: D. Applicazione ACL Globali
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01c_acl_init.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01c_acl_init.ldif
       register: acl_result
       failed_when:
         - acl_result.rc != 0
+      changed_when: true
 
     # =========================================================================
     # INIZIALIZZAZIONE ATOMICA DEL DIT (Radice + Sottostruttura)
     # =========================================================================
 
     - name: E. Generazione LDIF per la Radice del DIT
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01_root_dit.ldif
+        mode: "0600"
         content: |
           dn: {{ ldap_basedn }}
           changetype: add
@@ -309,17 +326,19 @@
       delegate_to: "{{ groups['cluster'][0] }}"
 
     - name: F. Applicazione Radice DIT con Bind Amministrativo (Solo sul primo nodo)
-      shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01_root_dit.ldif
+      ansible.builtin.command: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/01_root_dit.ldif
       register: root_dit_result
       failed_when:
         - root_dit_result.rc != 0
         - "'Already exists' not in root_dit_result.stderr"
       run_once: true
       delegate_to: "{{ groups['cluster'][0] }}"
+      changed_when: true
 
     - name: E2. Generazione LDIF per OUs, Gruppo e Nodi Server mTLS
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/02_sub_dit.ldif
+        mode: "0600"
         content: |
           dn: ou=system,{{ ldap_basedn }}
           changetype: add
@@ -358,7 +377,7 @@
       delegate_to: "{{ groups['cluster'][0] }}"
 
     - name: F2. Applicazione sottostruttura DIT con Bind Amministrativo (Solo sul primo nodo)
-      shell: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/02_sub_dit.ldif
+      ansible.builtin.command: ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/02_sub_dit.ldif
       register: sub_dit_result
       failed_when:
         - sub_dit_result.rc != 0
@@ -366,10 +385,12 @@
         - "'Constraint violation' not in sub_dit_result.stderr"
       run_once: true
       delegate_to: "{{ groups['cluster'][0] }}"
+      changed_when: true
 
     - name: F3. Generazione e applicazione Limiti Illimitati per i nodi in ou=system
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01f_limits_repl.ldif
+        mode: "0600"
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
@@ -377,18 +398,20 @@
           olcLimits: dn.subtree="ou=system,{{ ldap_basedn }}" size.soft=unlimited size.hard=unlimited time.soft=unlimited time.hard=unlimited
 
     - name: F4. Applicazione Limiti Replica
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01f_limits_repl.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01f_limits_repl.ldif
       register: limits_result
       failed_when:
         - limits_result.rc != 0
         - "'Type or value exists' not in limits_result.stderr"
+      changed_when: true
 
     # =========================================================================
     # INIEZIONE PARAMETRI TLS, AUTHZREGEXP E RIAVVIO STRUTTURALE CLIENT
     # =========================================================================
     - name: "[LDAPS] Aggiunta della regola AuthzRegexp per i certificati mTLS"
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01_authz_config.ldif
+        mode: "0600"
         content: |
           dn: cn=config
           changetype: modify
@@ -396,17 +419,18 @@
           olcAuthzRegexp: "^cn=([^,]+),.*" "cn=$1,ou=system,{{ ldap_basedn }}"
 
     - name: "[LDAPS] Applicazione AuthzRegexp in cn=config (ignora se già esistente)"
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_authz_config.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_authz_config.ldif
       register: authz_add_result
       failed_when:
         - authz_add_result.rc != 0
         - "'Type or value exists' not in authz_add_result.stderr"
         - "'Attribute or value exists' not in authz_add_result.stderr"
-
+      changed_when: true
 
     - name: "[LDAPS] 2. Generazione e aggiunta della nuova regola AuthzRegexp e parametri TLS"
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/01_tls_config.ldif
+        mode: "0600"
         content: |
           dn: cn=config
           changetype: modify
@@ -423,19 +447,20 @@
           olcTLSCertificateKeyFile: {{ ssl_key_path }}
 
     - name: "[LDAPS] Applicazione configurazione TLS e AuthzRegexp in cn=config"
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_tls_config.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_tls_config.ldif
       register: tls_apply_result
       failed_when:
         - tls_apply_result.rc != 0
+      changed_when: true
 
     - name: 14. Configurazione ascolto slapd su tutte le interfacce di rete (PRIMA del riavvio)
-      lineinfile:
+      ansible.builtin.lineinfile:
         path: /etc/default/slapd
-        regexp: '^SLAPD_SERVICES='
+        regexp: "^SLAPD_SERVICES="
         line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
 
     - name: "[FORZATURA] Riavvio completo per inizializzare i contesti Client TLS interni"
-      service:
+      ansible.builtin.service:
         name: slapd
         state: restarted
 
@@ -444,8 +469,9 @@
     # =========================================================================
 
     - name: "6. Generazione LDIF per ServerID globali in cn=config"
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/02_serverid.ldif
+        mode: "0600"
         content: |
           dn: cn=config
           changetype: modify
@@ -455,12 +481,13 @@
           olcServerID: 3 ldaps://ubuntu24lts3.example.com
 
     - name: "6b. Applicazione ServerID"
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_serverid.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_serverid.ldif
       register: serverid_result
       failed_when:
         - serverid_result.rc != 0
         - "'Type or value exists' not in serverid_result.stderr"
         - "'Already exists' not in serverid_result.stderr"
+      changed_when: true
 
     - name: "7. Caricamento modulo syncprov"
       community.general.ldap_attrs:
@@ -470,8 +497,9 @@
         state: present
 
     - name: "8. Generazione LDIF per attivazione e tuning avanzato overlay syncprov"
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/03_enable_overlays.ldif
+        mode: "0600"
         content: |
           dn: olcOverlay=syncprov,olcDatabase={1}mdb,cn=config
           changetype: add
@@ -482,16 +510,18 @@
           olcSpCheckpoint: 1000 10
 
     - name: "9. Applicazione overlay syncprov e parametri di session log"
-      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
+      ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/03_enable_overlays.ldif
       register: overlay_result
-      failed_when: 
-        - overlay_result.rc != 0 
+      failed_when:
+        - overlay_result.rc != 0
         - "'already in list' not in overlay_result.stderr"
         - "'Already exists' not in overlay_result.stderr"
+      changed_when: true
 
     - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (SASL EXTERNAL)
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/04_multimaster.ldif
+        mode: "0600"
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
@@ -511,7 +541,7 @@
           olcMultiProvider: TRUE
 
     - name: 11. Applicazione configurazione Syncrepl e MultiProvider
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/04_multimaster.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/04_multimaster.ldif
       register: multimaster_result
       failed_when: >
         multimaster_result.rc != 0 and
@@ -519,14 +549,16 @@
         'Duplicate' not in multimaster_result.stderr and
         'typeIsCritical' not in multimaster_result.stderr and
         'Type or value exists' not in multimaster_result.stderr
+      changed_when: true
 
     # =========================================================================
     # PARAMETRI DI TUNING: ATTIVAZIONE DB SYNC
     # =========================================================================
 
     - name: G. Generazione LDIF per Indici, MaxSize e Tuning MDB (DB SYNC ATTIVO)
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/06_db_tuning.ldif
+        mode: "0600"
         content: |
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
@@ -551,16 +583,18 @@
           olcWriteTimeout: 30
 
     - name: H. Applicazione parametri di Tuning Database
-      shell: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
       register: tuning_result
       failed_when:
         - tuning_result.rc != 0
         - "'Type or value exists' not in tuning_result.stderr"
         - "'attribute OR type already exists' not in tuning_result.stderr"
+      changed_when: true
 
     - name: 12. Generazione LDIF per inizializzazione/aggiornamento del backend cn=Monitor
-      copy:
+      ansible.builtin.copy:
         dest: /tmp/05_monitor.ldif
+        mode: "0600"
         content: |
           dn: olcDatabase={2}monitor,cn=config
           changetype: add
@@ -569,16 +603,17 @@
           olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
 
     - name: 13. Applicazione configurazione backend cn=Monitor
-      shell: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
+      ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
       register: monitor_result
       failed_when:
         - monitor_result.rc != 0
         - "'Already exists' not in monitor_result.stderr"
         - "'Type or value exists' not in monitor_result.stderr"
-        - "'only one monitor database allowed' not in monitor_result.stderr"     
+        - "'only one monitor database allowed' not in monitor_result.stderr"
+      changed_when: true
 
   handlers:
     - name: Riavvia Slapd
-      service:
+      ansible.builtin.service:
         name: slapd
         state: restarted

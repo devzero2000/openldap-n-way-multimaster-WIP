@@ -1,0 +1,5 @@
+# This file contains ignores rule violations for ansible-lint
+deploy_multimaster_hardened_noppolicy_mtls_saslexternal.yml run-once[task]
+deploy_multimaster_hardened_noppolicy_mtls_saslexternal.yml yaml[line-length]
+deploy_multimaster_hardened_noppolicy_mtls_saslexternal.yml yaml[trailing-spaces]
+deploy_multimaster_hardened_noppolicy_mtls_saslexternal.yml yaml[truthy]
