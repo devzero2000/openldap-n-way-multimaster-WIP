@@ -1,0 +1,86 @@
+# ==============================================================================
+# TITOLO:       Generatore di Carico per slapo-nestgroup + slapo-dynlist
+# SCOPO:        Iniezione massiva di 30k utenti, gruppi flat e alberi nidificati
+#               per stress-test delle performance in RAM su cluster Multi-Master.
+# ==============================================================================
+
+---
+- name: "Generazione Dataset Massivo per Stress Test Nested + Dynlist"
+  hosts: ubuntu24lts1.example.com
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_path: "/tmp/stress_nested_data.ldif"
+    ldap_pw: "openldap"
+
+  tasks:
+    - name: "[TEMPLATING] Genera lo script Python per il dataset con nesting"
+      ansible.builtin.copy:
+        dest: /tmp/generate_nested_ldif.py
+        mode: "0755"
+        content: |
+          #!/usr/bin/env python3
+          import hashlib
+          import base64
+          import os
+
+          suffix = "{{ suffix }}"
+
+          def make_ssha_password(password_plain):
+              salt = os.urandom(4)
+              ctx = hashlib.sha1(password_plain.encode('utf-8'))
+              ctx.update(salt)
+              ssha_hash = base64.b64encode(ctx.digest() + salt).decode('utf-8')
+              return "{SSHA}" + ssha_hash
+
+          with open("{{ ldif_path }}", "w") as f:
+              f.write(f"dn: ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: People\n\n")
+              f.write(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n\n")
+
+              # 1. 30.000 Utenti
+              for i in range(1, 30001):
+                  username = f"user.{i}"
+                  ssha_password = make_ssha_password(f"{username}.1")
+                  f.write(f"dn: uid={username},ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Test User{i}\nsn: User{i}\nuserPassword: {ssha_password}\n\n")
+
+              # 2. 30.000 Gruppi Periferici (con mix di utenti e nesting tra gruppi)
+              for i in range(1, 30001):
+                  f.write(f"dn: cn=group.{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: group.{i}\ndescription: Gruppo {i}\n")
+
+                  # Assegna 5 utenti diretti
+                  start_user = ((i * 5) % 30000) + 1
+                  for u in range(start_user, start_user + 5):
+                      f.write(f"member: uid=user.{u if u <= 30000 else u - 30000},ou=People,{suffix}\n")
+
+                  # Introduce nesting: i gruppi dispari contengono il gruppo precedente (se i > 1)
+                  if i > 1 and i % 2 != 0:
+                      f.write(f"member: cn=group.{i-1},ou=groups,{suffix}\n")
+
+                  f.write("\n")
+
+              # 3. Ruoli Globali di Vertice con nesting profondo
+              for i in range(1, 11):
+                  f.write(f"dn: cn=root.architect.{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: root.architect.{i}\ndescription: Ruolo Globale Nidificato {i}\n")
+                  # Inserisce sottogruppi ricorsivi nell'albero
+                  f.write(f"member: cn=group.{i*100},ou=groups,{suffix}\n")
+                  f.write(f"member: cn=group.{i*200},ou=groups,{suffix}\n")
+                  f.write("\n")
+
+    - name: "[EXECUTE] Esegui lo script Python per generare l'LDIF nidificato"
+      ansible.builtin.command: python3 /tmp/generate_nested_ldif.py
+      changed_when: true
+
+    - name: "[IMPORT] Inietta il dataset massivo nidificato nel cluster"
+      ansible.builtin.command: >
+        ldapmodify -a -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
+      register: ldapadd_res
+      changed_when: true
+      failed_when: "ldapadd_res.rc != 0 and 'Already exists' not in ldapadd_res.stderr"
+
+    - name: "[CLEANUP] Rimuovi file temporanei di generazione"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_nested_ldif.py"
+        - "{{ ldif_path }}"

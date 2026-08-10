@@ -1,0 +1,105 @@
+# ==============================================================================
+# TITOLO:       Verifica Performance Completa slapo-dynlist (Esteso)
+# SCOPO:        Misurare i tempi di calcolo in RAM dell'attributo memberOf virtuale,
+#               query dirette, inverse puntuali, ricorsione e impatto su LMDB.
+# ==============================================================================
+
+---
+- name: "Validazione Performance Estesa Dynlist"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    test_user_1: "uid=user.500,ou=People,dc=example,dc=com"
+    test_user_1_pw: "user.500.1"
+    test_user_2: "uid=user.15000,ou=People,dc=example,dc=com"
+    test_user_2_pw: "user.15000.1"
+    target_nested_group: "cn=root.architect.1,ou=groups,{{ suffix }}"
+    target_small_group: "cn=group.500,ou=groups,{{ suffix }}"
+    target_check_group: "cn=group.100,ou=groups,{{ suffix }}"
+
+  tasks:
+    - name: "[METRICA 1] Estrazione dinamica in RAM dell'attributo memberOf su un utente"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "{{ test_user_1 }}" -s base "(objectClass=*)" memberOf
+      register: query_1_time
+      changed_when: false
+
+    - name: "[METRICA 2] Verifica puntuale appartenenza utente a gruppo specifico (Filtro combinato)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(uid=user.500)(memberOf={{ target_check_group }}))" dn
+      register: query_2_time
+      changed_when: false
+
+    - name: "[METRICA 3] Query inversa con ricorsione complessa (Filtro su Root Group nidificato)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_2 }}" -w "{{ test_user_2_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ target_nested_group }}))" dn
+      register: query_3_time
+      changed_when: false
+
+    - name: "[METRICA 4] Ispezione dei membri strutturali diretti del gruppo radice (member)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "{{ target_nested_group }}" -s base "(objectClass=*)" member
+      register: query_4_time
+      changed_when: false
+
+    - name: "[METRICA 5] Ispezione dei membri strutturali diretti di un gruppo periferico"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "{{ target_small_group }}" -s base "(objectClass=*)" member
+      register: query_5_time
+      changed_when: false
+
+    - name: "[METRICA 6] Query inversa su un gruppo periferico (memberOf su gruppo piccolo)"
+      ansible.builtin.command: >
+        time ldapsearch -H ldap://localhost -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ target_small_group }}))" dn
+      register: query_6_time
+      changed_when: false
+
+    - name: "[STABILITÀ] Controllo sincronizzazione Multi-Master (contextCSN)"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://localhost -D "cn=admin,{{ suffix }}" -w "openldap"
+        -b "{{ suffix }}" -s base "(objectClass=*)" contextCSN
+      register: context_csn_res
+      changed_when: false
+
+    - name: "[DIAGNOSTICA] Monitoraggio dell'ingombro fisico su disco di LMDB (Vantaggio RAM-only)"
+      ansible.builtin.command: "ls -lh /var/lib/ldap/data.mdb"
+      register: mdb_disk_size
+      changed_when: false
+
+    - name: "[REPORT] Generazione del report prestazionale esteso con Dynlist"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " REPORT PERFORMANCE ESTESO: SLAPO-DYNLIST (RAM-ONLY)             "
+          - "=================================================================="
+          - "1. Dimensione fisica del database LMDB su disco (assenza di bloat):"
+          - "{{ mdb_disk_size.stdout }}"
+          - "------------------------------------------------------------------"
+          - "2. Latenza estrazione dinamica memberOf (Query Base Utente):"
+          - "{{ query_1_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "3. Latenza verifica puntuale utente-gruppo (Filtro combinato):"
+          - "{{ query_2_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "4. Latenza risoluzione ricorsiva complessa (Query Inversa Root Group):"
+          - "{{ query_3_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "5. Latenza lettura membri strutturali diretti del gruppo radice:"
+          - "{{ query_4_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "6. Latenza lettura membri strutturali di un gruppo periferico:"
+          - "{{ query_5_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "7. Latenza query inversa su gruppo periferico:"
+          - "{{ query_6_time.stderr_lines }}"
+          - "------------------------------------------------------------------"
+          - "8. Stato dei contatori di replica (contextCSN) sul nodo {{ inventory_hostname }}:"
+          - "{{ context_csn_res.stdout_lines | select('match', '^contextCSN:') | list }}"
+          - "=================================================================="
