@@ -1,0 +1,70 @@
+# ==============================================================================
+# TITOLO:       Configurazione Cluster OpenLDAP: slapo-nestgroup + slapo-dynlist
+# SCOPO:        1. Caricamento dei moduli globali nestgroup.la e dynlist.la.
+#               2. Configurazione dell'overlay nestgroup per la gerarchia dei gruppi.
+#               3. Configurazione dell'overlay dynlist per il calcolo dinamico di memberOf.
+# ==============================================================================
+
+---
+- name: Configurazione Avanzata Overlay Nestgroup e Dynlist su Cluster Multi-Master
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    target_db: "olcDatabase={1}mdb,cn=config"
+
+  tasks:
+    # --------------------------------------------------------------------------
+    # 1. CARICAMENTO MODULI GLOBALI
+    # --------------------------------------------------------------------------
+    - name: "[SETUP] Carica i moduli globali nestgroup e dynlist in cn=config"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad:
+            - "nestgroup.la"
+            - "dynlist.la"
+        state: present
+
+    # --------------------------------------------------------------------------
+    # 2. CONFIGURAZIONE OVERLAY NESTGROUP
+    # --------------------------------------------------------------------------
+    - name: "[CONFIG] Attiva e configura l'overlay nestgroup sul database principale"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}nestgroup,{{ target_db }}"
+        objectClass:
+          - olcOverlayConfig
+          - olcNestGroupConfig
+        attributes:
+          olcOverlay: "{0}nestgroup"
+          olcNestgroupMember: "member"
+          olcNestgroupMemberOf: "memberOf"
+          olcNestgroupBase: "ou=groups,{{ suffix }}"
+          olcNestgroupFlags:
+            - "member-filter"
+            - "memberof-filter"
+            - "member-values"
+            - "memberof-values"
+        state: present
+
+    # --------------------------------------------------------------------------
+    # 3. CONFIGURAZIONE OVERLAY DYNLIST (MEMBEROF DINAMICO)
+    # --------------------------------------------------------------------------
+    - name: "[CONFIG] Attiva e configura l'overlay dynlist per generare memberOf in RAM"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={1}dynlist,{{ target_db }}"
+        objectClass:
+          - olcOverlayConfig
+          - olcDynListConfig
+        attributes:
+          olcOverlay: "{1}dynlist"
+          # Sintassi corretta: <objectClass> <URL-ad> <mapping>
+          # Utilizziamo groupOfNames e mappiamo member su memberOf
+          olcDynListAttrSet: "groupOfNames labeledURI memberOf"
+        state: present
