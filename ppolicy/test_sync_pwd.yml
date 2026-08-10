@@ -69,11 +69,12 @@
       run_once: true
 
     - name: "[STEP 2c] L'utente si cambia la password rispettando PPolicy su node1"
-      ansible.builtin.command: >
-        ldappasswd -H ldap://127.0.0.1/
-        -D "{{ test_user_dn }}"
-        -w "PasswordTemp123!"
-        -s "NuovaPasswordSegreta456!"
+      community.general.ldap_passwd:
+        server_uri: "ldap://127.0.0.1/"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "PasswordTemp123!"
+        dn: "{{ test_user_dn }}"
+        passwd: "NuovaPasswordSegreta456!"
       delegate_to: "{{ node1 }}"
       run_once: true
 
