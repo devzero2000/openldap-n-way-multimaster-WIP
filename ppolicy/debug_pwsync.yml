@@ -43,12 +43,13 @@
       delegate_to: "{{ node1 }}"
       run_once: true
 
-    - name: "[SETUP] Esegui ldappasswd su node1 (cambio a 'NuovaPasswordSegreta456!')"
-      ansible.builtin.command: >
-        ldappasswd -H ldapi:///
-        -D "{{ test_user_dn }}"
-        -w "PasswordTemp123!"
-        -s "NuovaPasswordSegreta456!"
+    - name: "[SETUP] Esegui il cambio password tramite ldap_passwd su node1 (cambio a 'NuovaPasswordSegreta456!')"
+      community.general.ldap_passwd:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "PasswordTemp123!"
+        dn: "{{ test_user_dn }}"
+        passwd: "NuovaPasswordSegreta456!"
       delegate_to: "{{ node1 }}"
       run_once: true
 
