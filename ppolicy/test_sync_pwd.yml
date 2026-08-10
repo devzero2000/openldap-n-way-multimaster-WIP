@@ -11,9 +11,9 @@
     suffix: "dc=example,dc=com"
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
-    
+
     test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
-    
+
     node1: "{{ groups['cluster'][0] }}"
     other_nodes: "{{ groups['cluster'][1:] }}"
 
@@ -51,6 +51,7 @@
       register: initial_pw_hash
       delegate_to: "{{ node1 }}"
       run_once: true
+      changed_when: false
 
     - name: "[STEP 2b] Crea l'utente con password temporanea hashata su node1"
       community.general.ldap_entry:
@@ -75,6 +76,7 @@
         -s "NuovaPasswordSegreta456!"
       delegate_to: "{{ node1 }}"
       run_once: true
+      changed_when: false
 
     # --------------------------------------------------------------------------
     # 3. PAUSA E VERIFICA SINCRONIZZAZIONE SUGLI ALTRI NODI
@@ -95,6 +97,7 @@
       register: sync_results
       ignore_errors: true
       run_once: true
+      changed_when: false
 
     - name: "[VERIFICA] Esito della sincronizzazione"
       ansible.builtin.assert:

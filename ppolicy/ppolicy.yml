@@ -14,7 +14,7 @@
   vars:
     stato: "enable"
     suffix: "dc=example,dc=com"
-    
+
     # Credenziali per modificare la configurazione dell'infrastruttura (cn=config)
     ldap_auth_config:
       server_uri: "ldapi:///"
@@ -30,17 +30,17 @@
     # ==========================================================================
     # PRE-REQUISITI: VERIFICA DIPENDENZE
     # ==========================================================================
-    
+
     - name: "[SETUP] Installa la libreria python3-ldap se non presente"
       ansible.builtin.apt:
         name: python3-ldap
         state: present
-        update_cache: yes
+        update_cache: true
 
     # ==========================================================================
     # CASO: ABILITAZIONE (stato == "enable")
     # ==========================================================================
-    
+
     - name: "[ENABLE] Carica il modulo globale ppolicy.la"
       community.general.ldap_attrs:
         server_uri: "{{ ldap_auth_config.server_uri }}"

@@ -14,9 +14,9 @@
     suffix: "dc=example,dc=com"
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
-    
+
     test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
-    
+
     node1: "{{ groups['cluster'][0] }}"
     other_nodes: "{{ groups['cluster'][1:] }}"
 
@@ -60,11 +60,13 @@
         -s "NuovaPasswordSegreta456!"
       delegate_to: "{{ node1 }}"
       run_once: true
+      changed_when: false
 
     - name: "[PAUSA] Pausa di 2 secondi per sincronizzazione syncrepl"
       ansible.builtin.pause:
         seconds: 2
       run_once: true
+      changed_when: false
 
     # --------------------------------------------------------------------------
     # 3. VERIFICA BIND SUGLI ALTRI NODI DEL CLUSTER
@@ -80,6 +82,7 @@
       register: bind_test
       ignore_errors: true
       run_once: true
+      changed_when: false
 
     - name: "[VERIFICA] Valida il successo dell'autenticazione su tutti i nodi secondari"
       ansible.builtin.assert:
