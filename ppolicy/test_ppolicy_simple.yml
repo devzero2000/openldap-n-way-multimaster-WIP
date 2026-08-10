@@ -60,7 +60,6 @@
         -s "NuovaPasswordSegreta456!"
       delegate_to: "{{ node1 }}"
       run_once: true
-      changed_when: false
 
     - name: "[PAUSA] Pausa di 2 secondi per sincronizzazione syncrepl"
       ansible.builtin.pause:

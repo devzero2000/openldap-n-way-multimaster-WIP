@@ -76,7 +76,6 @@
         -s "NuovaPasswordSegreta456!"
       delegate_to: "{{ node1 }}"
       run_once: true
-      changed_when: false
 
     # --------------------------------------------------------------------------
     # 3. PAUSA E VERIFICA SINCRONIZZAZIONE SUGLI ALTRI NODI
