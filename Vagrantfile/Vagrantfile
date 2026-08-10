@@ -27,7 +27,7 @@ Vagrant.configure("2") do |config|
       # Provisioning unico per privilegi, rete, Ansible e SSH mesh
       node.vm.provision "shell", inline: <<-SHELL
         export DEBIAN_FRONTEND=noninteractive
-        # Impostazione Timezone su Europa/Rom
+        # Impostazione Timezone su Europa/Roma
         timedatectl set-timezone Europe/Rome
 
         # Configurazione e attivazione di systemd-timesyncd per l'NTP
