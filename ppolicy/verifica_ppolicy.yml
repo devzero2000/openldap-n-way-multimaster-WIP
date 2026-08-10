@@ -12,10 +12,8 @@
     suffix: "dc=example,dc=com"
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
-    
     # Policy DN che dobbiamo verificare
     policy_dn: "cn=default,ou=policies,{{ suffix }}"
-    
     # Overlay DN su cn=config
     overlay_dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
 
@@ -23,7 +21,7 @@
     # ==========================================================================
     # 1. VERIFICA LOCALE SU CN=CONFIG (Overlay e Parametri di Cifratura/Forward)
     # ==========================================================================
-    
+
     - name: "[LOCAL] Verifica presenza e attributi overlay ppolicy su cn=config"
       community.general.ldap_search:
         server_uri: "ldapi:///"
@@ -85,8 +83,7 @@
     - name: "[CROSS-CHECK] Esito interrogazione incrociata tra nodi"
       ansible.builtin.debug:
         msg: >-
-          Interrogando {{ item.item }}: 
-          {{ 'REPLICA OK (Policy trovata)' if item.results | length > 0 else 'FALLITO (Impossibile raggiungere o policy assente)' }}
+          Interrogando {{ item.item }}:  {{ 'REPLICA OK (Policy trovata)' if item.results | length > 0 else 'FALLITO (Impossibile raggiungere o policy assente)' }}
       loop: "{{ cross_node_check.results }}"
       loop_control:
         label: "{{ item.item }}"
