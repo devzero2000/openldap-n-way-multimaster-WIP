@@ -4,11 +4,12 @@
 Vagrant.configure("2") do |config|
   config.vm.box = "bento/ubuntu-24.04"
 
-  # Mappatura dei nodi con i rispettivi IP
+  # Mappatura dei nodi con i rispettivi IP (incluso ubuntu24lts4)
   nodes = {
     "ubuntu24lts1" => "192.168.1.16",
     "ubuntu24lts2" => "192.168.1.17",
-    "ubuntu24lts3" => "192.168.1.18"
+    "ubuntu24lts3" => "192.168.1.18",
+    "ubuntu24lts4" => "192.168.1.19"
   }
 
   nodes.each_with_index do |(hostname, ip), index|
@@ -17,14 +18,14 @@ Vagrant.configure("2") do |config|
       node.vm.hostname = "#{hostname}.example.com"
       node.vm.provider "vmware_desktop" do |v|
         v.gui = false
-        v.vmx["memsize"] = "4096"
+        v.vmx["memsize"] = "2028"
         v.vmx["numvcpus"] = "1"
       end
 
       # Rete Bridged
       node.vm.network "public_network", ip: ip, bridge: "eth0"
 
-      # Provisioning unico per privilegi, rete, Ansible e SSH mesh
+      # Provisioning iniziale (eseguito solo alla prima creazione)
       node.vm.provision "shell", inline: <<-SHELL
         export DEBIAN_FRONTEND=noninteractive
         # Impostazione Timezone su Europa/Roma
@@ -34,18 +35,11 @@ Vagrant.configure("2") do |config|
         timedatectl set-ntp true
         systemctl restart systemd-timesyncd
         
-        # 1. Privilegi Sudo passwordless
+        # Privilegi Sudo passwordless
         echo "vagrant ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-vagrant
         chmod 440 /etc/sudoers.d/90-vagrant
 
-        # 2. Configurazione locale di /etc/hosts per la risoluzione dei nomi
-        # Inserisce gli IP e gli hostname di tutto il cluster eliminando eventuali duplicati vecchi
-        echo -e "\n# Configurazione Cluster Ansible" >> /etc/hosts
-        echo "192.168.1.16 ubuntu24lts1.example.com ubuntu24lts1" >> /etc/hosts
-        echo "192.168.1.17 ubuntu24lts2.example.com ubuntu24lts2" >> /etc/hosts
-        echo "192.168.1.18 ubuntu24lts3.example.com ubuntu24lts3" >> /etc/hosts
-
-        # 3. Configurazione SSH chiavi incrociate
+        # Configurazione SSH chiavi incrociate
         if [ ! -f /home/vagrant/.ssh/id_rsa ]; then
           sudo -u vagrant ssh-keygen -t rsa -N "" -f /home/vagrant/.ssh/id_rsa
         fi
@@ -55,32 +49,84 @@ Vagrant.configure("2") do |config|
         cp /home/vagrant/.ssh/id_rsa.pub /vagrant/.cluster_keys/#{hostname}.pub
         chown vagrant:vagrant /vagrant/.cluster_keys/#{hostname}.pub
 
-        # 4. Installazione Ansible da PPA
+        # Installazione Ansible da PPA
         apt-get update -y
         apt-get install -y software-properties-common
         apt-add-repository --yes --update ppa:ansible/ansible
         apt-get install -y ansible
-
-        # 5. Configurazione dell'inventario Ansible locale
-        echo -e "[cluster]\nubuntu24lts1.example.com\nubuntu24lts2.example.com\nubuntu24lts3.example.com" > /etc/ansible/hosts
       SHELL
     end
   end
 
-  # Secondo stage di provisioning: viene eseguito SOLO quando tutte le chiavi pubbliche sono pronte
+  # Secondo stage / Boot provisioning: eseguito SEMPRE ad ogni avvio (run: "always") 
+  # per applicare in modo idempotente i punti 1, 2, 3 e 4 richiesti.
   nodes.each do |hostname, ip|
     config.vm.define hostname do |node|
       node.vm.provision "shell", run: "always", inline: <<-SHELL
-        # Popola l'authorized_keys con le chiavi di tutte e 3 le macchine
-        cat /vagrant/.cluster_keys/*.pub >> /home/vagrant/.ssh/authorized_keys
-        
-        # Rimuove i duplicati e sistema i permessi
-        sort -u /home/vagrant/.ssh/authorized_keys -o /home/vagrant/.ssh/authorized_keys
-        chown vagrant:vagrant /home/vagrant/.ssh/authorized_keys
-        chmod 600 /home/vagrant/.ssh/authorized_keys
+        export DEBIAN_FRONTEND=noninteractive
 
-        # Disabilita il StrictHostKeyChecking per evitare il prompt "yes/no"
-        echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/vagrant/.ssh/config
+        # -------------------------------------------------------------
+        # 1) Aggiunta host (inclusi gli IP di tutti e 4 i nodi) in modo idempotente
+        # -------------------------------------------------------------
+        sed -i '/# Configurazione Cluster Ansible/,$d' /etc/hosts
+        echo -e "\n# Configurazione Cluster Ansible" >> /etc/hosts
+        echo "192.168.1.16 ubuntu24lts1.example.com ubuntu24lts1" >> /etc/hosts
+        echo "192.168.1.17 ubuntu24lts2.example.com ubuntu24lts2" >> /etc/hosts
+        echo "192.168.1.18 ubuntu24lts3.example.com ubuntu24lts3" >> /etc/hosts
+        echo "192.168.1.19 ubuntu24lts4.example.com ubuntu24lts4" >> /etc/hosts
+
+        # -------------------------------------------------------------
+        # 2) Aggiunta all'inventory Ansible del gruppo 'readonlyreplica' con ubuntu24lts4
+        # -------------------------------------------------------------
+        mkdir -p /etc/ansible
+        cat << 'EOF' > /etc/ansible/hosts
+[cluster]
+ubuntu24lts1.example.com
+ubuntu24lts2.example.com
+ubuntu24lts3.example.com
+
+[readonlyreplica]
+ubuntu24lts4.example.com
+EOF
+
+        # -------------------------------------------------------------
+        # 3) Configurazione autoupdate dei package (sicurezza e ordinari)
+        # -------------------------------------------------------------
+        apt-get update -y
+        apt-get install -y unattended-upgrades apt-listchanges
+
+        cat << 'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+        cat << 'EOF' > /etc/apt/apt.conf.d/50unattended-upgrades-local
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}";
+    "${distro_id}ESM:${distro_codename}";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+EOF
+
+        # -------------------------------------------------------------
+        # 4) Forzare un aggiornamento al boot (idempotente)
+        # -------------------------------------------------------------
+        apt-get update -y
+        apt-get upgrade -y
+
+        # Gestione autorizzazioni e mesh SSH (mantenuta coerente per il cluster)
+        if [ -d /vagrant/.cluster_keys ]; then
+          cat /vagrant/.cluster_keys/*.pub > /home/vagrant/.ssh/authorized_keys
+          sort -u /home/vagrant/.ssh/authorized_keys -o /home/vagrant/.ssh/authorized_keys
+          chown vagrant:vagrant /home/vagrant/.ssh/authorized_keys
+          chmod 600 /home/vagrant/.ssh/authorized_keys
+        fi
+
+        echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" > /home/vagrant/.ssh/config
         echo -e "Host *.example.com\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/vagrant/.ssh/config
         chown vagrant:vagrant /home/vagrant/.ssh/config
         chmod 600 /home/vagrant/.ssh/config
