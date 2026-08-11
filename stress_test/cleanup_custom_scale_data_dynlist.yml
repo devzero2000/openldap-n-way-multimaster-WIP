@@ -1,0 +1,59 @@
+# ==============================================================================
+# TITOLO:       Pulizia e Rimozione Dataset Custom (Scale 8k/30k)
+# ==============================================================================
+---
+- name: "Pulizia Totale Dataset Custom"
+  hosts: ubuntu24lts1.example.com
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_path: "/tmp/custom_scale_delete.ldif"
+    ldap_pw: "openldap"
+
+  tasks:
+    - name: "[TEMPLATING] Genera script Python per la rimozione selettiva"
+      ansible.builtin.copy:
+        dest: /tmp/generate_custom_scale_delete.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          suffix = "{{ suffix }}"
+          total_users = 8000
+          total_groups = 30000
+          depth_levels = 15
+
+          with open("{{ ldif_path }}", "w") as f:
+              # 1. Rimuovi i gruppi radice complessi
+              for i in range(1, 4):
+                  f.write(f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: delete\n\n")
+
+              # 2. Rimuovi i 30.000 gruppi custom
+              for i in range(1, total_groups + 1):
+                  f.write(f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: delete\n\n")
+
+              # 3. Rimuovi i livelli della catena di deep nesting
+              for d in range(1, depth_levels + 1):
+                  f.write(f"dn: cn=custom-scale-deep-tier-{d},ou=groups,{suffix}\nchangetype: delete\n\n")
+
+              # 4. Rimuovi gli 8.000 utenti custom
+              for i in range(1, total_users + 1):
+                  f.write(f"dn: uid=custom-scale-user-{i},ou=People,{suffix}\nchangetype: delete\n\n")
+
+    - name: "[EXECUTE] Genera file LDIF di cancellazione"
+      ansible.builtin.command: python3 /tmp/generate_custom_scale_delete.py
+      changed_when: true
+
+    - name: "[APPLY] Esegui la rimozione massiva dal cluster"
+      ansible.builtin.command: >
+        ldapmodify -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
+      register: ldapdel_res
+      changed_when: true
+      failed_when: "ldapdel_res.rc != 0 and 'No such object' not in ldapdel_res.stderr"
+
+    - name: "[CLEANUP] Rimuovi file temporanei"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_custom_scale_delete.py"
+        - "{{ ldif_path }}"
