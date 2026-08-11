@@ -27,6 +27,27 @@
 
   tasks:
     # =========================================================================
+    # FASE PRELIMINARE: INSTALLAZIONE SLAPD E PREPARAZIONE DIRECTORY SASL2
+    # =========================================================================
+
+    - name: 1. Installazione di OpenLDAP e utility client (anticipata per creare utente openldap)
+      ansible.builtin.apt:
+        name:
+          - slapd
+          - ldap-utils
+          - python-is-python3
+        state: present
+        update_cache: true
+
+    - name: Certificati - Assicura che la directory sasl2 esista sui nodi del cluster
+      ansible.builtin.file:
+        path: /etc/ldap/sasl2
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: '0755'
+
+    # =========================================================================
     # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS
     # =========================================================================
 
@@ -145,15 +166,6 @@
     # =========================================================================
     # FASE CLUSTER: LOGICA DI CONFIGURAZIONE BASE
     # =========================================================================
-
-    - name: 1. Installazione di OpenLDAP e utility client
-      ansible.builtin.apt:
-        name:
-          - slapd
-          - ldap-utils
-          - python-is-python3
-        state: present
-        update_cache: true
 
     - name: "Garantisci che slapd sia attivo per accettare configurazioni"
       ansible.builtin.service:
