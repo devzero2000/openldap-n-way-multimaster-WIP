@@ -1,0 +1,98 @@
+# ==============================================================================
+# TITOLO:       Creazione Dataset Scalato (8k/30k + Deep Nesting)
+# ==============================================================================
+---
+- name: "Generazione e Iniezione Dataset Custom (Scale 8k/30k)"
+  hosts: ubuntu24lts1.example.com
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_path: "/tmp/custom_scale_data.ldif"
+    ldap_pw: "openldap"
+
+  tasks:
+    - name: "[TEMPLATING] Genera lo script Python per il dataset isolato"
+      ansible.builtin.copy:
+        dest: /tmp/generate_custom_scale_ldif.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import hashlib
+          import base64
+          import os
+
+          suffix = "{{ suffix }}"
+          total_users = 8000
+          total_groups = 30000
+
+          def make_ssha_password(password_plain):
+              salt = os.urandom(4)
+              ctx = hashlib.sha1(password_plain.encode('utf-8'))
+              ctx.update(salt)
+              ssha_hash = base64.b64encode(ctx.digest() + salt).decode('utf-8')
+              return "{SSHA}" + ssha_hash
+
+          with open("{{ ldif_path }}", "w") as f:
+              f.write(f"dn: ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: People\n\n")
+              f.write(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n\n")
+
+              # 1. 8.000 Utenze con prefisso specifico
+              for i in range(1, total_users + 1):
+                  username = f"custom-scale-user-{i}"
+                  ssha_password = make_ssha_password(f"{username}.1")
+                  f.write(f"dn: uid={username},ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Custom User {i}\nsn: ScaleUser{i}\nuserPassword: {ssha_password}\n\n")
+              
+              # 2. Catena di Deep Nesting dedicata
+              depth_levels = 15
+              for d in range(depth_levels, 0, -1):
+                  group_name = f"cn=custom-scale-deep-tier-{d},ou=groups,{suffix}"
+                  f.write(f"dn: {group_name}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-deep-tier-{d}\ndescription: Livello profondo {d}\n")
+                  if d == depth_levels:
+                      f.write(f"member: uid=custom-scale-user-5000,ou=People,{suffix}\n")
+                  else:
+                      f.write(f"member: cn=custom-scale-deep-tier-{d+1},ou=groups,{suffix}\n")
+                  f.write("\n")
+
+              # 3. 30.000 Gruppi con prefisso specifico e alta densità per l'utente 1 (Architect)
+              for i in range(1, total_groups + 1):
+                  f.write(f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-group-{i}\ndescription: Gruppo custom {i}\n")
+                  
+                  start_user = ((i * 15) % total_users) + 1
+                  for u in range(start_user, start_user + 4):
+                      actual_u = u if u <= total_users else (u % total_users) + 1
+                      f.write(f"member: uid=custom-scale-user-{actual_u},ou=People,{suffix}\n")
+                  
+                  # Alta varianza Cloud Architect (~300 gruppi)
+                  if i <= 300:
+                      f.write(f"member: uid=custom-scale-user-1,ou=People,{suffix}\n")
+
+                  if i > 1 and i % 2 != 0:
+                      f.write(f"member: cn=custom-scale-group-{i-1},ou=groups,{suffix}\n")
+                      
+                  f.write("\n")
+              
+              # 4. Gruppi Radice con Deep Nesting
+              for i in range(1, 4):
+                  f.write(f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-root-deep-{i}\ndescription: Radice profonda {i}\n")
+                  f.write(f"member: cn=custom-scale-deep-tier-1,ou=groups,{suffix}\n")
+                  f.write(f"member: cn=custom-scale-group-{i*500},ou=groups,{suffix}\n")
+                  f.write("\n")
+
+    - name: "[EXECUTE] Esegui script di generazione LDIF"
+      ansible.builtin.command: python3 /tmp/generate_custom_scale_ldif.py
+      changed_when: true
+
+    - name: "[IMPORT] Inietta il dataset nel cluster"
+      ansible.builtin.command: >
+        ldapmodify -a -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
+      register: ldapadd_res
+      changed_when: true
+      failed_when: "ldapadd_res.rc != 0 and 'Already exists' not in ldapadd_res.stderr"
+
+    - name: "[CLEANUP] Rimuovi script temporaneo"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_custom_scale_ldif.py"
+        - "{{ ldif_path }}"
