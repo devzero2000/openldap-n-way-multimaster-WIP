@@ -1,0 +1,105 @@
+# ==============================================================================
+# TITOLO:       Configurazione Infrastruttura slapo-memberof + slapo-nestgroup
+#               (Risolto per Replica MMR)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Caricamento moduli e configurazione corretta di:
+#               - memberof (statico, diretto, locale al nodo, escluso da replica)
+#               - nestgroup (espansione a query-time dei gruppi annidati,
+#                 nessuna scrittura, quindi nativamente safe in MMR)
+#               uso la class groupOfNames
+#
+# NOTA IMPORTANTE (da fare a parte, non gestito da questo playbook):
+#   memberOf va escluso dalla replica sulle stanze syncrepl di OGNI nodo
+#   del mesh MMR, es.:
+#       olcSyncrepl: ... exattrs="memberOf"
+#   Senza questa esclusione le scritture locali di memberof entrano in
+#   conflitto con i valori replicati dagli altri master.
+# ==============================================================================
+
+---
+- name: "Attivazione slapo-memberof + slapo-nestgroup sul Cluster"
+  hosts: cluster
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    groups_base: "ou=groups,{{ suffix }}"
+    target_db: "olcDatabase={1}mdb,cn=config"
+
+  tasks:
+
+    # --------------------------------------------------------------------
+    # MEMBEROF (livello diretto, write-time, locale al nodo)
+    # --------------------------------------------------------------------
+
+    - name: "[MEMBEROF] Carica il modulo globale memberof"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof"
+        state: present
+
+    - name: "[MEMBEROF] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}memberof,{{ target_db }}"
+        objectClass:
+          - olcOverlayConfig
+          - olcMemberOf
+        attributes:
+          olcOverlay: "{0}memberof"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
+          olcMemberOfDN: "cn=admin,{{ suffix }}"
+          # Configurazione necessaria per ambienti replicati
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
+        state: present
+
+    # --------------------------------------------------------------------
+    # NESTGROUP (espansione annidamento a search-time, nessuna scrittura,
+    # richiede OpenLDAP >= 2.6.8, consigliata >= 2.6.9/2.6.10)
+    # --------------------------------------------------------------------
+
+    - name: "[NESTGROUP] Carica il modulo globale nestgroup"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "nestgroup"
+        state: present
+
+    - name: "[NESTGROUP] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={1}nestgroup,{{ target_db }}"
+        objectClass:
+          - olcOverlayConfig
+          - olcNestGroupConfig
+        attributes:
+          olcOverlay: "{1}nestgroup"
+          # Sottoalbero che contiene le entry di tipo gruppo
+          olcNestGroupBase: "{{ groups_base }}"
+          # Attributi coerenti con quelli usati da memberof sopra
+          olcNestGroupMember: "member"
+          olcNestGroupMemberOf: "memberOf"
+          # Abilita tutte e quattro le funzionalità di espansione/filtro
+          olcNestGroupFlags:
+            - "member-values"
+            - "member-filter"
+            - "memberOf-values"
+            - "memberOf-filter"
+        state: present
+
+    # --------------------------------------------------------------------
+
+    - name: "[RESTART] Riavvia slapd per applicare gli overlay"
+      ansible.builtin.systemd:
+        name: slapd
+        state: restarted
