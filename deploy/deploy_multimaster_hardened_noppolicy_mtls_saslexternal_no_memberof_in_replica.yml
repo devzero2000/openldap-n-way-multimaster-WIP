@@ -45,7 +45,7 @@
         state: directory
         owner: openldap
         group: openldap
-        mode: '0755'
+        mode: "0755"
 
     # =========================================================================
     # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS
@@ -272,7 +272,7 @@
       community.general.ldap_attrs:
         dn: "cn=module{0},cn=config"
         attributes:
-          olcModuleLoad: "ppolicy.la"
+          olcModuleLoad: "ppolicy"
         state: present
 
     - name: C. Generazione LDIF per ACL Globali Corrette con livello zero SASL External e PPolicy
@@ -471,6 +471,161 @@
         name: slapd
         state: restarted
 
+    ###########################################################################
+    # CONFIGURAZIONE MEMBEROF NESTED GROUP REFINT
+    # #########################################################################
+    # SCOPO:        Caricamento moduli e configurazione corretta di:
+    #               - memberof   {0}  (statico, diretto, locale al nodo, escluso
+    #                                   da replica; olcMemberOfRefInt: FALSE
+    #                                   perche' la referential integrity sui
+    #                                   valori "member"/"uniqueMember" e' delegata
+    #                                   all'overlay refint standalone qui sotto,
+    #                                   per evitare doppia gestione)
+    #               - refint     {1}  (referential integrity su member/
+    #                                   uniqueMember/manager/owner; NON su
+    #                                   memberOf, che resta di competenza
+    #                                   esclusiva di memberof)
+    #               - nestgroup  {2}  (espansione a query-time dei gruppi
+    #                                   annidati, nessuna scrittura, quindi
+    #                                   nativamente safe in MMR)
+    #               uso la class groupOfNames
+    #
+    # NOTA IMPORTANTE 1 (da fare a parte, non gestito da questo playbook):
+    #   memberOf va escluso dalla replica sulle stanze syncrepl di OGNI nodo
+    #   del mesh MMR, su TUTTI i collegamenti verso TUTTI i peer, es.:
+    #       olcSyncrepl: ... exattrs="memberOf"
+    #   Senza questa esclusione, su ogni singolo link, le scritture locali di
+    #   memberof entrano in conflitto con i valori replicati dagli altri master.
+    #
+    # NOTA IMPORTANTE 2:
+    #   syncprov va aggiunto per ultimo (istanza {3}) nel playbook successivo,
+    #   cosi' da catturare correttamente anche le modifiche derivate generate
+    #   internamente da memberof/refint.
+    #
+    # NOTA IMPORTANTE 3 (deprecazione):
+    #   La man page ufficiale di slapo-memberof(5) dichiara l'overlay deprecato
+    #   (sostituto raccomandato: dynlist) e ne sconsiglia esplicitamente l'uso
+    #   in ambienti replicati. La configurazione qui sotto (calcolo locale non
+    #   replicato) e' l'assetto che la documentazione stessa raccomanda quando
+    #   memberof deve comunque essere usato in MMR, ma va tenuto presente in
+    #   ottica di eventuale migrazione futura a dynlist/nestgroup.
+    # ==============================================================================
+
+    # --------------------------------------------------------------------
+    # MEMBEROF (livello diretto, write-time, locale al nodo) - istanza {0}
+    # --------------------------------------------------------------------
+
+    - name: "[MEMBEROF] Carica il modulo globale memberof"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof"
+        state: present
+
+    - name: "[MEMBEROF] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcMemberOf
+        attributes:
+          olcOverlay: "{0}memberof"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
+          olcMemberOfDN: "cn=admin,{{ ldap_basedn }}"
+          # olcMemberOfRefInt FALSE: la pulizia di member/uniqueMember alla
+          # cancellazione di un'entry e' delegata all'overlay refint {1}
+          # sottostante, per evitare che due meccanismi scrivano sullo
+          # stesso attributo con logiche diverse.
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
+          olcMemberOfDangling: "ignore"
+        state: present
+
+    # --------------------------------------------------------------------
+    # REFINT (referential integrity su member/uniqueMember/manager/owner,
+    # NON su memberOf) - istanza {1}
+    # --------------------------------------------------------------------
+
+    - name: "[REFINT] Carica il modulo globale refint"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "refint"
+        state: present
+
+    - name: "[REFINT] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={1}refint,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcRefintConfig
+        attributes:
+          olcOverlay: "{1}refint"
+          # Volutamente NON includere memberOf qui: e' gestito solo da
+          # memberof (overlay {0} sopra).
+          olcRefintAttribute:
+            - "member"
+            - "uniqueMember"
+            - "manager"
+            - "owner"
+          olcRefintModifiersName: "{{ ldap_rootdn }}"
+        state: present
+
+    # --------------------------------------------------------------------
+    # NESTGROUP (espansione annidamento a search-time, nessuna scrittura,
+    # richiede OpenLDAP >= 2.6.8, consigliata >= 2.6.9/2.6.10) - istanza {2}
+    # --------------------------------------------------------------------
+
+    - name: "[NESTGROUP] Carica il modulo globale nestgroup"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "nestgroup"
+        state: present
+
+    - name: "[NESTGROUP] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={2}nestgroup,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcNestGroupConfig
+        attributes:
+          olcOverlay: "{2}nestgroup"
+          # Sottoalbero che contiene le entry di tipo gruppo
+          olcNestGroupBase: "ou=groups,{{ ldap_basedn }}"
+          # Attributi coerenti con quelli usati da memberof sopra
+          olcNestGroupMember: "member"
+          olcNestGroupMemberOf: "memberOf"
+          # Valori come da man page slapo-nestgroup(5): tutto minuscolo
+          # ("memberof-...", non "memberOf-..."). Verificare con slaptest -u
+          # prima del deploy in produzione.
+          olcNestGroupFlags:
+            - "member-values"
+            - "member-filter"
+            - "memberof-values"
+            - "memberof-filter"
+        state: present
+
+    # --------------------------------------------------------------------
+
+    - name: "[RESTART] Riavvia slapd per applicare gli overlay"
+      ansible.builtin.systemd:
+        name: slapd
+        state: restarted
     # =========================================================================
     # CONFIGURAZIONE REPLICA INTELLIGENTE VIA LDAPS (SASL / EXTERNAL) - DINAMICA
     # =========================================================================
