@@ -8,7 +8,7 @@
 
 ---
 - name: "Reset Totale: Epurazione Nodi Cluster OpenLDAP"
-  hosts: cluster
+  hosts: all
   become: true
   gather_facts: false
 
