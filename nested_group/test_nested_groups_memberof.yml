@@ -1,0 +1,131 @@
+---
+- name: Test Completo Directory LDAP - MemberOf e Nested Groups
+  hosts: cluster[0]
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+
+  tasks:
+    - name: 1. Iniezione DIT di Test (Utenti, Gruppi, Sottogruppi e Nested)
+      ansible.builtin.copy:
+        dest: /tmp/test_nested_seed.ldif
+        mode: '0600'
+        content: |
+          # --- UTENTI ---
+          dn: uid=mrossi,ou=people,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: person
+          objectClass: organizationalPerson
+          objectClass: inetOrgPerson
+          uid: mrossi
+          cn: Mario Rossi
+          sn: Rossi
+          userPassword: password123
+
+          dn: uid=gbianchi,ou=people,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: person
+          objectClass: organizationalPerson
+          objectClass: inetOrgPerson
+          uid: gbianchi
+          cn: Giuseppe Bianchi
+          sn: Bianchi
+          userPassword: password123
+
+          dn: uid=averdi,ou=people,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: person
+          objectClass: organizationalPerson
+          objectClass: inetOrgPerson
+          uid: averdi
+          cn: Anna Verdi
+          sn: Verdi
+          userPassword: password123
+
+          # --- GRUPPI LIVELLO 1 (Flat) ---
+          dn: cn=developers,ou=groups,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: groupOfNames
+          cn: developers
+          member: uid=mrossi,ou=people,{{ ldap_basedn }}
+          member: uid=gbianchi,ou=people,{{ ldap_basedn }}
+
+          # --- GRUPPI LIVELLO 2 (Nested / Sottogruppi) ---
+          dn: cn=it_staff,ou=groups,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: groupOfNames
+          cn: it_staff
+          member: uid=averdi,ou=people,{{ ldap_basedn }}
+          member: cn=developers,ou=groups,{{ ldap_basedn }}
+
+          # --- GRUPPO LIVELLO 3 (Nested profondo) ---
+          dn: cn=corporate_all,ou=groups,{{ ldap_basedn }}
+          objectClass: top
+          objectClass: groupOfNames
+          cn: corporate_all
+          member: cn=it_staff,ou=groups,{{ ldap_basedn }}
+
+    - name: 2. Applicazione dei dati di test su LDAP
+      ansible.builtin.command: >
+        ldapadd -x -D "{{ ldap_rootdn }}" -w "{{ ldap_rootpw }}" -H ldapi:/// -f /tmp/test_nested_seed.ldif
+      register: ldap_seed_result
+      failed_when:
+        - ldap_seed_result.rc != 0
+        - "'Already exists' not in ldap_seed_result.stderr"
+      changed_when: true
+
+    # =========================================================================
+    # TEST DI VERIFICA E QUERY (Autenticazione via EXTERNAL su socket ldapi:///)
+    # =========================================================================
+
+    - name: "TEST A: Elenca tutti i gruppi a cui appartiene direttamente/indirettamente Mario Rossi (con memberOf)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=people,{{ ldap_basedn }}" "(uid=mrossi)" memberOf
+      register: test_a
+      changed_when: false
+
+    - name: "Stampa Risultato Test A (MemberOf di Mario Rossi)"
+      ansible.builtin.debug:
+        msg: "{{ test_a.stdout_lines }}"
+
+    - name: "TEST B: Elenca i membri diretti del gruppo corporate_all (verifica struttura base)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=groups,{{ ldap_basedn }}" "(cn=corporate_all)" member
+      register: test_b
+      changed_when: false
+
+    - name: "Stampa Risultato Test B (Membri di corporate_all)"
+      ansible.builtin.debug:
+        msg: "{{ test_b.stdout_lines }}"
+
+    - name: "TEST C: Query ricorsiva dei sottogruppi (Nested Group Lookup via controllo attributi espansi)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=groups,{{ ldap_basedn }}" "(objectClass=groupOfNames)" cn member
+      register: test_c
+      changed_when: false
+
+    - name: "Stampa Risultato Test C (Mappatura globale gruppi)"
+      ansible.builtin.debug:
+        msg: "{{ test_c.stdout_lines }}"
+
+    - name: "TEST D: Trova tutti gli utenti che appartengono al gruppo PADRE 'corporate_all'"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=people,{{ ldap_basedn }}" "(memberOf=cn=corporate_all,ou=groups,{{ ldap_basedn }})" dn cn
+      register: test_d
+      changed_when: false
+
+    - name: "Stampa Risultato Test D (Utenti ereditati nel gruppo padre corporate_all)"
+      ansible.builtin.debug:
+        msg: "{{ test_d.stdout_lines }}"
+
+    - name: "TEST E: Trova tutti i gruppi (compresi i padri) di cui 'mrossi' fa parte"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=groups,{{ ldap_basedn }}" "(member=uid=mrossi,ou=people,{{ ldap_basedn }})" cn
+      register: test_e
+      changed_when: false
+
+    - name: "Stampa Risultato Test E (Ereditarietà verso l'alto per mrossi)"
+      ansible.builtin.debug:
+        msg: "{{ test_e.stdout_lines }}"
