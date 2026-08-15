@@ -11,6 +11,7 @@
   hosts: readonlyreplica
   become: true
   vars:
+    ansible_python_interpreter: /usr/bin/python3
     ldap_basedn: "dc=example,dc=com"
     ldap_rootdn: "cn=admin,dc=example,dc=com"
     ldap_rootpw: "openldap"
@@ -61,7 +62,7 @@
           DNS.1 = {{ item }}
           DNS.2 = {{ item | split('.') | first }}
           DNS.3 = localhost
-          IP.1 = {{ hostvars[item]['ansible_default_ipv4']['address'] | default('127.0.0.1') }}
+          IP.1 = {{ hostvars[item]['ansible_facts']['default_ipv4']['address'] | default('127.0.0.1') }}
           IP.2 = 127.0.0.1
       with_items: "{{ groups['readonlyreplica'] }}"
 
