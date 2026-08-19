@@ -427,6 +427,7 @@
           olcDbIndex: memberUid eq
           olcDbIndex: entryUUID eq
           olcDbIndex: entryCSN eq
+          olcDbIndex: memberOf eq  
 
     - name: Applicazione parametri di Tuning Database
       ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
