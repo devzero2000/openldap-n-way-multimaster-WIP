@@ -734,6 +734,7 @@
           olcDbIndex: memberUid eq
           olcDbIndex: entryUUID eq
           olcDbIndex: entryCSN eq
+          olcDbIndex: memberOf eq
 
           dn: cn=config
           changetype: modify
