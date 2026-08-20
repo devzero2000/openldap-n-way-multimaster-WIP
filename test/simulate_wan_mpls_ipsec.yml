@@ -13,7 +13,7 @@
 
 ---
 - name: "Configurazione WAN Emulation sul Cluster OpenLDAP"
-  hosts: cluster
+  hosts: ldap_all
   become: true
   vars:
     # Stato di default: ora impostato su "enabled" come richiesto
