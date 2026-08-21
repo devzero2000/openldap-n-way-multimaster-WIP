@@ -395,7 +395,7 @@
       delegate_to: "{{ ca_server }}"
       changed_when: true
 
-    - name: F3. Generazione e applicazione Limiti Illimitati per i nodi in ou=system
+    - name: F3. Generazione e applicazione Limiti Illimitati per i nodi del cluster
       ansible.builtin.copy:
         dest: /tmp/01f_limits_repl.ldif
         mode: "0600"
@@ -403,7 +403,9 @@
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
           add: olcLimits
-          olcLimits: dn.subtree="ou=system,{{ ldap_basedn }}" size.soft=unlimited size.hard=unlimited time.soft=unlimited time.hard=unlimited
+          {% for node in cluster_nodes %}
+          olcLimits: dn.exact="cn={{ node }},ou=system,{{ ldap_basedn }}" time.soft=unlimited time.hard=unlimited size.soft=unlimited size.hard=unlimited size.pr=unlimited size.prtotal=unlimited
+          {% endfor %}
 
     - name: F4. Applicazione Limiti Replica
       ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01f_limits_repl.ldif
