@@ -178,7 +178,7 @@
           dn: cn=config
           changetype: modify
           replace: olcThreads
-          olcThreads: 32
+          olcThreads: 128
           -
           replace: olcConnMaxPending
           olcConnMaxPending: 200
@@ -389,7 +389,7 @@
           changetype: modify
           replace: olcSyncRepl
           {% for node in cluster_nodes %}
-          olcSyncRepl: rid={{ 100 + loop.index }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand
+          olcSyncRepl: rid={{ 100 + loop.index }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=120 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
           {% endfor %}
 
     - name: Applicazione configurazione Syncrepl HA Read-Only
@@ -414,7 +414,7 @@
           dn: olcDatabase={1}mdb,cn=config
           changetype: modify
           replace: olcDbMaxSize
-          olcDbMaxSize: 4294967296
+          olcDbMaxSize: 32212254720
           -
           replace: olcDbNoSync
           olcDbNoSync: TRUE
