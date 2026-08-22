@@ -227,7 +227,7 @@
           dn: cn=config
           changetype: modify
           replace: olcThreads
-          olcThreads: 128
+          olcThreads: 32
           -
           replace: olcConnMaxPending
           olcConnMaxPending: 200
