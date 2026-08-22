@@ -111,6 +111,25 @@
         state: present
         update_cache: true
 
+    - name: OS Tuning - Assicura che la directory di override systemd per slapd esista
+      ansible.builtin.file:
+        path: /etc/systemd/system/slapd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: OS Tuning - Configura il limite dei file aperti (nofile) per slapd in systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slapd.service.d/limits.conf
+        mode: "0644"
+        content: |
+          [Service]
+          LimitNOFILE=65536
+          LimitNPROC=65536
+      notify: Ricarica systemd e riavvia slapd
+
+
     - name: Certificati - Assicura che la directory sasl2 esista sulla replica (post-installazione slapd)
       ansible.builtin.file:
         path: /etc/ldap/sasl2
@@ -486,3 +505,12 @@
       ansible.builtin.service:
         name: slapd
         state: restarted
+
+  handlers:
+
+    - name: Ricarica systemd e riavvia slapd
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: slapd
+        state: restarted
+
