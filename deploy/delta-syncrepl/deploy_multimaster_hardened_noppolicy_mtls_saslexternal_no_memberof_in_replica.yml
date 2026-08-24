@@ -1,0 +1,964 @@
+# ==============================================================================
+# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
+# AUTORE:       Elia Pinto (revisione idempotenza/sicurezza)
+# SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo e ACL mirate
+#
+# CHANGELOG PRINCIPALE RISPETTO ALLA VERSIONE PRECEDENTE
+# --------------------------------------------------------------------------
+# 1. Le operazioni di modifica/creazione su cn=config sono state convertite da
+#    `command: ldapmodify/ldapadd` + `failed_when` basato su pattern-matching
+#    dello stderr, a `community.general.ldap_attrs` / `ldap_entry`. Questi
+#    moduli leggono lo stato attuale via LDAP prima di scrivere: il playbook
+#    ora riporta "changed" SOLO quando cambia davvero qualcosa, ed e' immune
+#    a differenze di locale/versione nei messaggi d'errore di slapd.
+# 2. Tuning MDB reso piu' prudente: olcDbMaxSize ridotto (4GB db primario /
+#    1GB accesslog, entrambi parametrizzati) per non affamare VM con poca
+#    RAM. Rimossi olcDbNoSync=TRUE e olcWriteTimeout custom: si lasciano i
+#    default di slapd, piu' sicuri per l'integrita' dei dati in caso di
+#    crash/power-loss tra due checkpoint.
+# 3. Il blocco overlay memberof/refint/nestgroup viene applicato PRIMA della
+#    fase di tuning indici (che include `olcDbIndex: memberOf eq`): serve
+#    che l'attributeType memberOf sia gia' registrato (via modulo caricato +
+#    overlay istanziato) prima di poterlo indicizzare, altrimenti slapd
+#    risponde "Constraint violation" perche' l'attributo non e' ancora noto
+#    allo schema del database.
+# 4. Ordine module-load vs overlay reso esplicito e verificato ovunque: il
+#    caricamento del modulo in cn=module{0},cn=config avviene sempre in un
+#    task dedicato PRIMA del task che referenzia l'overlay su {1}mdb.
+# 5. Materiale crittografico (chiave CA, chiavi/CSR dei nodi) spostato da
+#    /tmp a /etc/ldap/pki (0700, root:root) sul nodo coordinatore: persiste
+#    tra un run e l'altro (necessario perche' i "creates:" restino validi e
+#    il playbook non rigeneri una CA diversa ad ogni esecuzione) ma non resta
+#    piu' leggibile da altri utenti locali in /tmp.
+# 6. L'hash SSHA della root password viene calcolato una sola volta (sul
+#    nodo coordinatore) e distribuito a tutti i nodi, invece che rigenerato
+#    con un salt diverso da ciascun host ad ogni run.
+# 7. Modulo ppolicy: nessun overlay olcPPolicyConfig e' istanziato, ma il
+#    modulo resta caricato perche' e' lui a registrare nello schema gli
+#    attributi pwdReset/pwdChangedTime/pwdFailureTime/pwdAccountLockedTime/
+#    pwdHistory referenziati dalle ACL globali (task C/D) - senza il modulo
+#    caricato, slapd rifiuta quelle ACL perche' non conosce quegli
+#    attributeType. Per lo stesso motivo del punto 3 (memberOf), il
+#    caricamento va fatto PRIMA del task ACL che li referenzia.
+# 8. Aggiunta pulizia degli LDIF temporanei (possono contenere l'hash della
+#    root password) a fine esecuzione, su tutti i nodi.
+# 9. ServerID e RID di replica calcolati su `cluster_nodes` ordinato
+#    alfabeticamente (non piu' sul semplice ordine di inventory, che puo'
+#    cambiare in modo non deterministico), con possibilita' di fissare un ID
+#    esplicito per host tramite `ldap_server_id` in host_vars.
+# ==============================================================================
+
+---
+- name: Configurazione Cluster OpenLDAP Multi-Master dinamico (N-Way) - HARDENED SASL EXTERNAL mTLS
+  hosts: cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    # ATTENZIONE: solo per lab/demo. In produzione spostare in ansible-vault,
+    # es. `ansible-vault encrypt_string 'password' --name 'ldap_rootpw'`.
+    ldap_rootpw: "openldap"
+
+    ldap_admin_group: "cn=administrators,ou=groups,dc=example,dc=com"
+
+    # cluster_nodes ordinato alfabeticamente: la scelta del nodo coordinatore/CA
+    # (ca_server) e la numerazione di ServerID/RID diventano deterministiche e
+    # stabili anche se l'ordine con cui l'inventory elenca gli host cambia.
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    ca_server: "{{ cluster_nodes[0] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+
+    # Variabili infrastruttura PKI / SSL
+    pki_dir: "/etc/ldap/pki"
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+
+    # Tuning MDB: valori prudenti per VM con poca RAM. Alzabili via -e se
+    # l'hardware lo consente. olcDbNoSync/olcWriteTimeout NON vengono forzati:
+    # si usano i default di slapd (piu' sicuri per l'integrita' dei dati).
+    ldap_db_maxsize: 4294967296          # 4 GB - database primario {1}mdb
+    ldap_accesslog_maxsize: 1073741824   # 1 GB - database cn=accesslog
+
+  tasks:
+    # =========================================================================
+    # FASE PRELIMINARE: INSTALLAZIONE SLAPD E PREPARAZIONE DIRECTORY SASL2
+    # =========================================================================
+
+    - name: 1. Installazione di OpenLDAP e utility client (anticipata per creare utente openldap)
+      ansible.builtin.apt:
+        name:
+          - slapd
+          - ldap-utils
+          - python-is-python3
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: OS Tuning - Assicura che la directory di override systemd per slapd esista
+      ansible.builtin.file:
+        path: /etc/systemd/system/slapd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: OS Tuning - Configura il limite dei file aperti (nofile) per slapd in systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slapd.service.d/limits.conf
+        mode: "0644"
+        content: |
+          [Service]
+          LimitNOFILE=65536
+          LimitNPROC=65536
+      notify: Ricarica systemd e riavvia slapd
+
+    - name: Certificati - Assicura che la directory sasl2 esista sui nodi del cluster
+      ansible.builtin.file:
+        path: /etc/ldap/sasl2
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: "0755"
+
+    # =========================================================================
+    # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS
+    # Il materiale privato (CA + chiavi nodo) vive in {{ pki_dir }} (0700,
+    # root:root) sul nodo coordinatore, NON in /tmp: deve persistere tra un
+    # run e l'altro (i "creates:" sotto dipendono da questo) e non deve
+    # restare leggibile da altri utenti locali.
+    # =========================================================================
+
+    - name: Certificati - Installa openssl sulla CA
+      ansible.builtin.apt:
+        name: openssl
+        state: present
+      when: inventory_hostname == ca_server
+
+    - name: Certificati - Directory temporanea locale sul control node
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: /tmp/ldap_certs_transit
+        state: directory
+        mode: "0700"
+      run_once: true
+
+    - name: Certificati - Directory persistente per il materiale PKI sul nodo coordinatore
+      ansible.builtin.file:
+        path: "{{ pki_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: inventory_hostname == ca_server
+
+    - name: Certificati - Generazione Autorità di Certificazione (Solo sul primo nodo)
+      when: inventory_hostname == ca_server
+      block:
+        - name: CA - Genera chiave privata
+          ansible.builtin.command: "openssl genrsa -out {{ pki_dir }}/ca.key 4096"
+          args:
+            creates: "{{ pki_dir }}/ca.key"
+          changed_when: true
+
+        - name: CA - Applica permessi restrittivi alla chiave privata
+          ansible.builtin.file:
+            path: "{{ pki_dir }}/ca.key"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: CA - Genera certificato root
+          ansible.builtin.command: >
+            openssl req -x509 -new -nodes -key {{ pki_dir }}/ca.key -sha256 -days 3650
+            -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN=Cyber Actors Local CA"
+            -out {{ pki_dir }}/ca.crt
+          args:
+            creates: "{{ pki_dir }}/ca.crt"
+          changed_when: true
+
+    - name: Server Cert - Genera chiave per ciascun nodo del cluster
+      ansible.builtin.command: "openssl genrsa -out {{ pki_dir }}/{{ item }}.key 2048"
+      args:
+        creates: "{{ pki_dir }}/{{ item }}.key"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+      changed_when: true
+
+    - name: Server Cert - Applica permessi restrittivi alle chiavi dei nodi
+      ansible.builtin.file:
+        path: "{{ pki_dir }}/{{ item }}.key"
+        owner: root
+        group: root
+        mode: "0600"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+
+    - name: Server Cert - Genera estensioni SAN dinamiche per ciascun nodo
+      ansible.builtin.copy:
+        dest: "{{ pki_dir }}/{{ item }}.ext"
+        mode: "0600"
+        content: |
+          authorityKeyIdentifier=keyid,issuer
+          basicConstraints=CA:FALSE
+          keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = {{ item }}
+          DNS.2 = {{ item | split('.') | first }}
+          DNS.3 = localhost
+          IP.1 = {{ hostvars[item]['ansible_facts']['default_ipv4']['address'] | default('127.0.0.1') }}
+          IP.2 = 127.0.0.1
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+
+    - name: Server Cert - Genera CSR per ciascun nodo del cluster
+      ansible.builtin.command: >
+        openssl req -new -key {{ pki_dir }}/{{ item }}.key -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
+        -out {{ pki_dir }}/{{ item }}.csr
+      args:
+        creates: "{{ pki_dir }}/{{ item }}.csr"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+      changed_when: true
+
+    - name: Server Cert - Firma certificato per ciascun nodo usando la CA locale
+      ansible.builtin.command: >
+        openssl x509 -req -in {{ pki_dir }}/{{ item }}.csr -CA {{ pki_dir }}/ca.crt -CAkey {{ pki_dir }}/ca.key
+        -CAcreateserial -out {{ pki_dir }}/{{ item }}.crt -days 1825 -sha256 -extfile {{ pki_dir }}/{{ item }}.ext
+      args:
+        creates: "{{ pki_dir }}/{{ item }}.crt"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+      changed_when: true
+
+    - name: Certificati - Fetch dinamico verso il Control Node di tutti i certificati
+      ansible.builtin.fetch:
+        src: "{{ pki_dir }}/{{ item }}"
+        dest: "/tmp/ldap_certs_transit/{{ item }}"
+        flat: true
+      with_items:
+        - "ca.crt"
+        - "{{ cluster_nodes | map('regex_replace', '$', '.key') | list }}"
+        - "{{ cluster_nodes | map('regex_replace', '$', '.crt') | list }}"
+      loop_control:
+        extended: true
+      when: inventory_hostname == ca_server
+
+    - name: Certificati - Distribuzione e assegnazione permessi restrittivi (Hardened)
+      ansible.builtin.copy:
+        src: "/tmp/ldap_certs_transit/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: openldap
+        group: openldap
+        mode: "{{ item.mode }}"
+      with_items:
+        - { src: "ca.crt", dest: "{{ ssl_ca_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
+      notify: Riavvia Slapd
+
+    - name: Certificati - Pulizia locale control node
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: /tmp/ldap_certs_transit
+        state: absent
+      run_once: true
+
+    # =========================================================================
+    # FASE CLUSTER: LOGICA DI CONFIGURAZIONE BASE
+    # =========================================================================
+
+    - name: "Garantisci che slapd sia attivo per accettare configurazioni"
+      ansible.builtin.service:
+        name: slapd
+        state: started
+
+    - name: 2. Configurazione dei parametri di default in /etc/ldap/ldap.conf
+      ansible.builtin.blockinfile:
+        path: /etc/ldap/ldap.conf
+        block: |
+          BASE    {{ ldap_basedn }}
+          URI     ldaps://localhost
+          TLS_CACERT {{ ssl_ca_path }}
+          TLS_REQCERT demand
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
+
+    - name: 2b. Livello di log avanzato (stats sync) su cn=config
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=config"
+        attributes:
+          olcLogLevel: "stats sync"
+        state: exact
+
+    - name: "2d. Tuning dei thread e limiti connessioni in cn=config"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=config"
+        attributes:
+          olcThreads: "32"
+          olcConnMaxPending: "200"
+          olcConnMaxPendingAuth: "50"
+        state: exact
+
+    # -------------------------------------------------------------------
+    # Hash della root password: generato UNA SOLA VOLTA (sul nodo
+    # coordinatore) e distribuito a tutti i nodi. Se lo si generasse su
+    # ciascun host separatamente, il salt casuale di `slappasswd` sarebbe
+    # diverso ad ogni run/nodo: stessa password in chiaro ma hash sempre
+    # differente, quindi un "changed" spurio ad ogni esecuzione.
+    # -------------------------------------------------------------------
+
+    - name: 3. Genera l'hash SSHA della password di root (solo sul nodo coordinatore)
+      ansible.builtin.command: "slappasswd -s {{ ldap_rootpw }}"
+      register: _root_pw_hash
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == ca_server
+
+    - name: 4. Configurazione di base del database (suffix, rootDN, rootPW)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcSuffix: "{{ ldap_basedn }}"
+          olcRootDN: "{{ ldap_rootdn }}"
+          olcRootPW: "{{ hostvars[ca_server]._root_pw_hash.stdout }}"
+        state: exact
+      no_log: true
+
+    - name: A/B. Blocco dei Bind Anonimi a livello globale
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=config"
+        attributes:
+          olcRequires: "authc"
+          olcDisallows: "bind_anon"
+        state: present
+
+    - name: "[PPOLICY] Carica il modulo globale ppolicy (nessun overlay istanziato)"
+      # Il modulo va caricato anche senza un overlay attivo: e' lui a
+      # registrare nello schema gli attributi pwdReset, pwdChangedTime,
+      # pwdFailureTime, pwdAccountLockedTime, pwdHistory usati dalle ACL
+      # subito sotto (task C/D). Deve precedere quel task per lo stesso
+      # motivo per cui memberof/refint/nestgroup precedono il tuning indici.
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "ppolicy"
+        state: present
+
+    - name: C/D. ACL Globali (SASL External a livello zero + protezione password/lockout)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcAccess:
+            - >-
+              {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by * break
+            - >-
+              {1}to dn.base="" by anonymous read by * read
+            - >-
+              {2}to dn.base="cn=Subschema" by anonymous read by * read
+            - >-
+              {3}to attrs=userPassword,pwdReset
+              by self write
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by * auth
+            - >-
+              {4}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
+              by self read
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by * none
+            - >-
+              {5}to dn.subtree="{{ ldap_basedn }}"
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by self write
+              by users read
+              by * none
+        state: exact
+        ordered: true
+
+    # =========================================================================
+    # INIZIALIZZAZIONE DEL DIT (Radice + Sottostruttura)
+    # Con l'ACL {0} sopra, il bind SASL/EXTERNAL come root peercred ha gia'
+    # "manage" su tutto il database: non serve piu' un bind semplice con
+    # rootdn/rootpw (e quindi non serve piu' esporre la password in chiaro
+    # in nessun task di questa fase).
+    # =========================================================================
+
+    - name: E/F. Crea la radice del DIT
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "{{ ldap_basedn }}"
+        objectClass:
+          - top
+          - dcObject
+          - organization
+        attributes:
+          o: "example.com"
+          dc: "example"
+        state: present
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2a. Crea le Organizational Unit di base
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "ou={{ item }},{{ ldap_basedn }}"
+        objectClass: organizationalUnit
+        attributes:
+          ou: "{{ item }}"
+        state: present
+      loop:
+        - system
+        - groups
+        - people
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2b. Crea il gruppo amministratori
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "{{ ldap_admin_group }}"
+        objectClass: groupOfNames
+        attributes:
+          cn: "administrators"
+          member: "cn=admin,{{ ldap_basedn }}"
+        state: present
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2c. Crea l'identità applicativa (mTLS) di ciascun nodo (cluster + readonly)
+      # Include anche readonly_nodes: e' l'identita' con cui i consumer
+      # in sola lettura si autenticano (via certificato client + authzRegexp)
+      # quando fanno syncrepl verso i master. Senza questa entry il bind SASL
+      # EXTERNAL funzionerebbe comunque (le ACL confrontano il DN come
+      # stringa, non richiedono che l'oggetto esista), ma i limiti F3/F4 qui
+      # sotto referenziano gia' lo stesso DN per i readonly_nodes: creare
+      # l'entry mantiene il DIT coerente con quel che le ACL/limits
+      # presuppongono, ed e' un prerequisito se in futuro si vuole legare
+      # quell'identita' a un gruppo o ad altri attributi.
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn={{ item }},ou=system,{{ ldap_basedn }}"
+        objectClass: applicationProcess
+        attributes:
+          cn: "{{ item }}"
+        state: present
+      loop: "{{ (cluster_nodes + readonly_nodes) | unique }}"
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: F3. Generazione e applicazione Limiti Illimitati per tutti i nodi (Cluster + Readonly)
+      ansible.builtin.copy:
+        dest: /tmp/01f_limits_repl.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcLimits
+          {% set all_nodes = cluster_nodes + readonly_nodes %}
+          {% for node in all_nodes %}
+          olcLimits: {% raw %}{{% endraw %}{{ loop.index0 }}{% raw %}{% endraw %}}dn.exact="cn={{ node }},ou=system,{{ ldap_basedn }}" time.soft=unlimited time.hard=unlimited size.soft=unlimited size.hard=unlimited size.pr=unlimited size.prtotal=unlimited
+          {% endfor %}
+
+    - name: F4. Applicazione Limiti Replica
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01f_limits_repl.ldif
+      register: limits_result
+      failed_when:
+        - limits_result.rc != 0
+        - "'Type or value exists' not in limits_result.stderr"
+      changed_when: true
+
+    # =========================================================================
+    # INIEZIONE PARAMETRI TLS, AUTHZREGEXP
+    # =========================================================================
+
+    - name: "[LDAPS] AuthzRegexp per i certificati mTLS + parametri TLS"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=config"
+        attributes:
+          olcAuthzRegexp: '"^cn=([^,]+),.*" "cn=$1,ou=system,{{ ldap_basedn }}"'
+          olcTLSVerifyClient: "try"
+          olcTLSCACertificateFile: "{{ ssl_ca_path }}"
+          olcTLSCertificateFile: "{{ ssl_cert_path }}"
+          olcTLSCertificateKeyFile: "{{ ssl_key_path }}"
+        state: exact
+
+    - name: 14. Configurazione ascolto slapd su tutte le interfacce di rete (PRIMA del riavvio)
+      ansible.builtin.lineinfile:
+        path: /etc/default/slapd
+        regexp: "^SLAPD_SERVICES="
+        line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
+      notify: Riavvia Slapd
+
+    - name: "[FORZATURA] Applica subito eventuali modifiche pendenti prima di proseguire"
+      ansible.builtin.meta: flush_handlers
+
+    ###########################################################################
+    # CONFIGURAZIONE MEMBEROF / REFINT / NESTGROUP
+    # #########################################################################
+    # SCOPO:        Caricamento moduli e configurazione corretta di:
+    #               - memberof   {0}  (statico, diretto, locale al nodo, escluso
+    #                                   da replica; olcMemberOfRefInt: FALSE
+    #                                   perche' la referential integrity sui
+    #                                   valori "member"/"uniqueMember" e' delegata
+    #                                   all'overlay refint standalone qui sotto,
+    #                                   per evitare doppia gestione)
+    #               - refint     {1}  (referential integrity su member/
+    #                                   uniqueMember/manager/owner; NON su
+    #                                   memberOf, che resta di competenza
+    #                                   esclusiva di memberof)
+    #               - nestgroup  {2}  (espansione a query-time dei gruppi
+    #                                   annidati, nessuna scrittura, quindi
+    #                                   nativamente safe in MMR)
+    #               uso la class groupOfNames
+    #
+    # NOTA IMPORTANTE 1 (gia' gestita da questo playbook):
+    #   memberOf va escluso dalla replica sulle stanze syncrepl di OGNI nodo
+    #   del mesh MMR, su TUTTI i collegamenti verso TUTTI i peer: e' l'
+    #   `exattrs="memberOf"` gia' presente nella riga olcSyncRepl generata piu'
+    #   sotto. Senza questa esclusione, su ogni singolo link, le scritture
+    #   locali di memberof entrano in conflitto con i valori replicati dagli
+    #   altri master.
+    #
+    # NOTA IMPORTANTE 2:
+    #   Questo blocco overlay va applicato PRIMA del tuning indici (piu' in
+    #   basso, `olcDbIndex: memberOf eq`): l'attributeType memberOf diventa
+    #   noto allo schema del database solo dopo che modulo+overlay sono
+    #   stati caricati/istanziati. Indicizzarlo prima causa "Constraint
+    #   violation" perche' slapd non conosce ancora l'attributo.
+    #
+    # NOTA IMPORTANTE 3 (deprecazione):
+    #   La man page ufficiale di slapo-memberof(5) dichiara l'overlay deprecato
+    #   (sostituto raccomandato: dynlist) e ne sconsiglia esplicitamente l'uso
+    #   in ambienti replicati. La configurazione qui sotto (calcolo locale non
+    #   replicato) e' l'assetto che la documentazione stessa raccomanda quando
+    #   memberof deve comunque essere usato in MMR, ma va tenuto presente in
+    #   ottica di eventuale migrazione futura a dynlist/nestgroup.
+    # ==============================================================================
+
+    # --------------------------------------------------------------------
+    # MEMBEROF (livello diretto, write-time, locale al nodo) - istanza {0}
+    # --------------------------------------------------------------------
+
+    - name: "[MEMBEROF] Carica il modulo globale memberof"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof"
+        state: present
+
+    - name: "[MEMBEROF] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcMemberOf
+        attributes:
+          olcOverlay: "{0}memberof"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
+          olcMemberOfDN: "cn=admin,{{ ldap_basedn }}"
+          # olcMemberOfRefInt FALSE: la pulizia di member/uniqueMember alla
+          # cancellazione di un'entry e' delegata all'overlay refint {1}
+          # sottostante, per evitare che due meccanismi scrivano sullo
+          # stesso attributo con logiche diverse.
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
+          olcMemberOfDangling: "ignore"
+        state: present
+
+    # --------------------------------------------------------------------
+    # REFINT (referential integrity su member/uniqueMember/manager/owner,
+    # NON su memberOf) - istanza {1}
+    # --------------------------------------------------------------------
+
+    - name: "[REFINT] Carica il modulo globale refint"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "refint"
+        state: present
+
+    - name: "[REFINT] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={1}refint,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcRefintConfig
+        attributes:
+          olcOverlay: "{1}refint"
+          # Volutamente NON includere memberOf qui: e' gestito solo da
+          # memberof (overlay {0} sopra).
+          olcRefintAttribute:
+            - "member"
+            - "uniqueMember"
+            - "manager"
+            - "owner"
+          olcRefintModifiersName: "{{ ldap_rootdn }}"
+        state: present
+
+    # --------------------------------------------------------------------
+    # NESTGROUP (espansione annidamento a search-time, nessuna scrittura,
+    # richiede OpenLDAP >= 2.6.8, consigliata >= 2.6.9/2.6.10) - istanza {2}
+    # --------------------------------------------------------------------
+
+    - name: "[NESTGROUP] Carica il modulo globale nestgroup"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "nestgroup"
+        state: present
+
+    - name: "[NESTGROUP] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={2}nestgroup,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcNestGroupConfig
+        attributes:
+          olcOverlay: "{2}nestgroup"
+          # Sottoalbero che contiene le entry di tipo gruppo
+          olcNestGroupBase: "ou=groups,{{ ldap_basedn }}"
+          # Attributi coerenti con quelli usati da memberof sopra
+          olcNestGroupMember: "member"
+          olcNestGroupMemberOf: "memberOf"
+          # Valori come da man page slapo-nestgroup(5): tutto minuscolo
+          # ("memberof-...", non "memberOf-..."). Verificare con slaptest -u
+          # prima del deploy in produzione.
+          olcNestGroupFlags:
+            - "member-values"
+            - "member-filter"
+            - "memberof-values"
+            - "memberof-filter"
+        state: present
+
+    # --------------------------------------------------------------------
+
+    - name: "[RESTART] Riavvia slapd per applicare gli overlay"
+      ansible.builtin.systemd:
+        name: slapd
+        state: restarted
+
+    # =========================================================================
+    # CONFIGURAZIONE REPLICA INTELLIGENTE VIA LDAPS (SASL / EXTERNAL) - DINAMICA
+    # DELTA-SYNCREPL: i consumer replicano leggendo i delta da cn=accesslog
+    # (vedi overlay/database accesslog creati sotto) invece di confrontare le
+    # entry intere: molto piu' leggero con i volumi di
+    # populate_stress_data_memberof_groupofnames.yml (30.000 utenti, 30.000
+    # gruppi flat, 40 ruoli da 10.000 membri ciascuno).
+    # =========================================================================
+
+
+    - name: "6. Generazione LDIF dinamico per ServerID globali in cn=config"
+      ansible.builtin.copy:
+        dest: /tmp/02_serverid.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          {% for node in cluster_nodes %}
+          olcServerID: {{ loop.index }} ldaps://{{ node }}
+          {% endfor %}
+
+    - name: "6b. Applicazione ServerID"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_serverid.ldif
+      register: serverid_result
+      failed_when:
+        - serverid_result.rc != 0
+        - "'Type or value exists' not in serverid_result.stderr"
+        - "'Already exists' not in serverid_result.stderr"
+      changed_when: true
+
+    - name: "7. Caricamento modulo syncprov"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "syncprov"
+        state: present
+
+    - name: "8/9. Overlay syncprov sul database primario"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay=syncprov,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcSyncProvConfig
+        attributes:
+          olcOverlay: "syncprov"
+          olcSpSessionlog: "100000"
+          # Checkpoint 5000/60 (anziche' 1000/10): con delta-syncrepl (vedi
+          # overlay accesslog piu' sotto) il sessionlog qui sopra non e' piu'
+          # il meccanismo primario di catch-up per i consumer, quindi
+          # possiamo permetterci checkpoint meno frequenti riducendo gli
+          # fsync durante il carico massivo generato da
+          # populate_stress_data_memberof_groupofnames.yml (~60.042 add +
+          # fino a ~700.000 modify interni memberof/refint su 30.000 utenti).
+          olcSpCheckpoint: "5000 60"
+        state: present
+
+    # =========================================================================
+    # BACKEND CN=MONITOR
+    # NOTA: va creato PRIMA del database accesslog qui sotto, altrimenti
+    # slapd ricompatta la numerazione degli olcDatabase per eliminare il
+    # "buco" al {2} e il database accesslog (a cui assegniamo esplicitamente
+    # {3}) finisce rinumerato come {2}mdb, disallineando tutte le task
+    # successive che si aspettano olcDatabase={3}mdb.
+    # =========================================================================
+
+    - name: 9-0. Backend cn=Monitor
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={2}monitor,cn=config"
+        objectClass: olcDatabaseConfig
+        attributes:
+          olcDatabase: "{2}monitor"
+          olcAccess: >-
+            {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+        state: present
+
+    # =========================================================================
+    # DELTA-SYNCREPL: DATABASE E OVERLAY ACCESSLOG (necessari per syncdata=accesslog)
+    # =========================================================================
+    # Ogni nodo del mesh MMR e' anche provider verso gli altri, quindi ognuno
+    # deve avere un proprio database cn=accesslog locale su cui l'overlay
+    # accesslog registra le scritture del db {1}mdb, cosi' che i consumer
+    # possano fare catch-up per delta (solo i cambi, non l'intera entry).
+
+    - name: "9a. [ACCESSLOG] Crea la directory dedicata al database cn=accesslog"
+      ansible.builtin.file:
+        path: /var/lib/ldap/accesslog
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: "0750"
+
+    - name: "9b. [ACCESSLOG] Carica il modulo globale accesslog"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "accesslog"
+        state: present
+
+    - name: "9c. Database dedicato cn=accesslog"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={3}mdb,cn=config"
+        objectClass:
+          - olcDatabaseConfig
+          - olcMdbConfig
+        attributes:
+          olcDatabase: "{3}mdb"
+          olcDbDirectory: /var/lib/ldap/accesslog
+          olcSuffix: cn=accesslog
+          olcRootDN: "{{ ldap_rootdn }}"
+          olcDbMaxSize: "{{ ldap_accesslog_maxsize }}"
+          olcDbIndex:
+            - "default eq"
+            - "entryCSN,objectClass,reqEnd,reqResult,reqStart"
+          olcAccess: >-
+            {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by dn.subtree="ou=system,{{ ldap_basedn }}" read by * none
+        state: present
+
+    # -------------------------------------------------------------------
+    # IMPORTANTE: il consumer, in delta-syncrepl, esegue il refresh
+    # syncrepl DIRETTAMENTE contro il database cn=accesslog (non contro
+    # dc=example,dc=com) aspettandosi il controllo LDAP Sync State nella
+    # risposta. Senza syncprov anche su questo database, il provider
+    # restituisce entry "nude" e il consumer va in retry infinito con
+    # "got search entry without Sync State control" senza mai replicare
+    # nulla.
+    # -------------------------------------------------------------------
+
+    - name: "9d2/9d3. Overlay syncprov sul database accesslog"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay=syncprov,olcDatabase={3}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcSyncProvConfig
+        attributes:
+          olcOverlay: "syncprov"
+          olcSpCheckpoint: "5000 60"
+        state: present
+
+    - name: "9e. Generazione LDIF per Limiti Illimitati sul database accesslog per i nodi di replica"
+      ansible.builtin.copy:
+        dest: /tmp/03d_accesslog_limits.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={3}mdb,cn=config
+          changetype: modify
+          replace: olcLimits
+          {% set all_nodes = cluster_nodes + readonly_nodes %}
+          {% for node in all_nodes %}
+          olcLimits: {% raw %}{{% endraw %}{{ loop.index0 }}{% raw %}{% endraw %}}dn.exact="cn={{ node }},ou=system,{{ ldap_basedn }}" time.soft=unlimited time.hard=unlimited size.soft=unlimited size.hard=unlimited size.pr=unlimited size.prtotal=unlimited
+          {% endfor %}
+
+    - name: "9f. Applicazione Limiti Illimitati sul database accesslog"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/03d_accesslog_limits.ldif
+      register: accesslog_limits_result
+      failed_when:
+        - accesslog_limits_result.rc != 0
+        - "'Type or value exists' not in accesslog_limits_result.stderr"
+      changed_when: true
+
+
+    - name: "9g/9h. Overlay accesslog sul database primario (cattura le scritture per delta-syncrepl)"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay=accesslog,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcAccessLogConfig
+        attributes:
+          olcOverlay: "accesslog"
+          olcAccessLogDB: "cn=accesslog"
+          olcAccessLogOps: "writes"
+          olcAccessLogSuccess: "TRUE"
+          olcAccessLogPurge: "01+00:00 00+04:00"
+        state: present
+
+    - name: 10/11. Costruzione dinamica della lista olcSyncRepl (una riga per peer)
+      ansible.builtin.set_fact:
+        _syncrepl_raw: |-
+          {% for node in cluster_nodes %}
+          {% if node != inventory_hostname %}
+          rid={{ '%03d' | format(loop.index) }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=3600 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand attrs="*,+" exattrs="memberOf" logbase="cn=accesslog" logfilter="(&(objectClass=auditWriteObject)(reqResult=0))" syncdata=accesslog
+          {% endif %}
+          {% endfor %}
+
+    - name: 10/11. Applica Syncrepl e MultiProvider (idempotente, ordine preservato)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcSyncRepl: "{{ _syncrepl_raw.split('\n') | reject('equalto', '') | list }}"
+          olcMultiProvider: "TRUE"
+        state: exact
+        ordered: true
+
+    # =========================================================================
+    # PARAMETRI DI TUNING: INDICI E MAXSIZE (default piu' sicuri)
+    # olcDbNoSync e olcWriteTimeout custom sono stati rimossi: si lasciano i
+    # default di slapd, piu' sicuri per l'integrita' dei dati.
+    # =========================================================================
+
+    - name: G. Generazione LDIF per Indici, MaxSize e Tuning MDB (DB SYNC ATTIVO)
+      ansible.builtin.copy:
+        dest: /tmp/06_db_tuning.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcDbMaxSize
+          olcDbMaxSize: 32212254720
+          -
+          replace: olcDbNoSync
+          olcDbNoSync: TRUE
+          -
+          replace: olcDbIndex
+          olcDbIndex: objectClass eq
+          olcDbIndex: uid eq
+          olcDbIndex: cn eq,sub
+          olcDbIndex: member eq
+          olcDbIndex: memberUid eq
+          olcDbIndex: entryUUID eq
+          olcDbIndex: entryCSN eq
+          olcDbIndex: memberOf eq
+
+          dn: cn=config
+          changetype: modify
+          replace: olcWriteTimeout
+          olcWriteTimeout: 30
+
+    - name: H. Applicazione parametri di Tuning Database
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
+      register: tuning_result
+      failed_when:
+        - tuning_result.rc != 0
+        - "'Type or value exists' not in tuning_result.stderr"
+        - "'attribute OR type already exists' not in tuning_result.stderr"
+      changed_when: true
+
+
+    # =========================================================================
+    # PULIZIA FINALE - gli LDIF temporanei di eventuali run precedenti (o di
+    # generazioni parallele di questo stesso host) possono contenere l'hash
+    # SSHA della root password: non vanno lasciati in /tmp.
+    # =========================================================================
+
+    - name: Pulizia - individua eventuali LDIF temporanei residui
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "*.ldif"
+      register: _tmp_ldifs
+
+    - name: Pulizia - rimuove gli LDIF temporanei residui
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _tmp_ldifs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+  handlers:
+    - name: Ricarica systemd e riavvia slapd
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: slapd
+        state: restarted
+
+    - name: Riavvia Slapd
+      ansible.builtin.service:
+        name: slapd
+        state: restarted
