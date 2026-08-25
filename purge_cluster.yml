@@ -1,54 +1,118 @@
 # ==============================================================================
-# TITOLO:       Epurazione Radicale OpenLDAP per Re-inizializzazione Clean
-# AUTORE:       Elia Pinto
-# DATA:         Luglio 2026
-# SCOPO:        Rimuovere pacchetti, database e configurazioni cn=config corrotti
-#               su tutti i nodi per permettere il re-deploy da zero.
+# TITOLO:       Epurazione Radicale OpenLDAP per Re-inizializzazione Clean (FORCED)
+# AUTORE:       Elia Pinto / Aggiornato per forzare stop su nodi bloccati
+# DATA:         Agosto 2026
+# SCOPO:        Rimuovere forzatamente pacchetti, database e configurazioni
+#               su tutti i nodi, gestendo i processi 'slapd' appesi.
 # ==============================================================================
 
 ---
-- name: "Reset Totale: Epurazione Nodi Cluster OpenLDAP"
-  hosts: all
+- name: "Reset Totale: Epurazione Forzata Nodi Cluster OpenLDAP"
+  hosts: cluster
   become: true
   gather_facts: false
 
   tasks:
-    - name: "[STOP] Ferma il servizio slapd se ancora attivo"
+    - name: "[CHECK_PRE] Verifica se il processo slapd esiste prima di tentare lo stop"
+      ansible.builtin.shell: "ps -ef | grep slapd | grep -v grep | awk '{print $2}'"
+      register: slapd_pid_pre
+      failed_when: false
+      changed_when: false
+
+    - name: "[STOP_GENTLE] Tentativo 1: Ferma il servizio slapd (graceful)"
       ansible.builtin.service:
         name: slapd
         state: stopped
+      # Non fallire se non è installato o già fermo
+      failed_when: false
+      register: stop_result
+
+    - name: "[CHECK_POST] Verifica se il processo slapd è ancora attivo dopo lo stop"
+      ansible.builtin.shell: "ps -ef | grep slapd | grep -v grep | awk '{print $2}'"
+      register: slapd_pid_post
+      failed_when: false
+      changed_when: false
+
+    - name: "[KILL_BRUTAL] Tentativo 2: Se ancora attivo, uccidi brutalmente il processo (fix per nodi bloccati)"
+      ansible.builtin.shell: "kill -9 {{ item }}"
+      with_items: "{{ slapd_pid_post.stdout_lines }}"
+      when: slapd_pid_post.stdout_lines | length > 0
       failed_when: false
 
-    - name: "[PURGE] Rimuovi i pacchetti con cancellazione delle configurazioni"
+    - name: "[WAIT] Attendi 5 secondi che il rilascio delle risorse da parte del kernel sia completato"
+      ansible.builtin.wait_for:
+        timeout: 5
+
+    # =========================================================================
+    # FASE DI EPURAZIONE PACCHETTI E CONFIGURAZIONE
+    # =========================================================================
+
+    - name: "[PURGE] Rimuovi i pacchetti di OpenLDAP e le sue dipendenze di runtime"
       ansible.builtin.apt:
         name:
           - slapd
           - ldap-utils
         state: absent
         purge: true
+        update_cache: true
 
-    - name: "[CLEANUP] Elimina fisicamente i residui di cn=config e runtime"
+    - name: "[AUTOREMOVE] Rimuovi dipendenze non più necessarie"
+      ansible.builtin.apt:
+        autoremove: true
+
+    - name: "[CLEANUP_CONFIG] Elimina fisicamente le directory di configurazione"
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
         - /etc/ldap/slapd.d
-        - /var/lib/ldap
-        - /tmp/01_db_init.ldif
-        - /tmp/01b_disable_anon.ldif
-        - /tmp/01c_acl_init.ldif
-        - /tmp/01e_bootstrap_dit.ldif
-        - /tmp/01_tls_config.ldif
-        - /tmp/02_replication_setup.ldif
-        - /tmp/03_enable_overlays.ldif
-        - /tmp/04_multimaster.ldif
-        - /tmp/05_monitor.ldif
-        - /tmp/06_db_tuning.ldif
+        - /etc/ldap/sasl2
+        - /etc/ldap/ldap.conf
 
-    - name: "[RECREATE] Ricrea la directory del database vuota"
+    - name: "[CLEANUP_DATA] Elimina fisicamente le directory dei database"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/ldap
+        - /var/lib/ldap/accesslog # Se usata nel play precedente
+
+    - name: "[CLEANUP_TMP] Elimina i file LDIF temporanei e i certificati generati"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      with_fileglob:
+        - /tmp/0*.ldif
+        - /tmp/ldap_certs_transit/*
+
+    # =========================================================================
+    # FASE DI RE-INIZIALIZZAZIONE PULITA
+    # =========================================================================
+
+    - name: "[RECREATE] Ricrea la directory di configurazione vuota con permessi restrittivi"
+      ansible.builtin.file:
+        path: /etc/ldap/slapd.d
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: '0700'
+
+    - name: "[RECREATE] Ricrea la directory del database vuota con permessi restrittivi"
       ansible.builtin.file:
         path: /var/lib/ldap
         state: directory
-        owner: root
-        group: root
+        owner: openldap
+        group: openldap
+        mode: '0700'
+
+    - name: "[HARDEN] Assicura che la directory sasl2 esista per mTLS"
+      ansible.builtin.file:
+        path: /etc/ldap/sasl2
+        state: directory
+        owner: openldap
+        group: openldap
         mode: '0755'
+
+    - name: "[RESTART_CLEANUP] Riavvia il demone systemd per assicurarsi che non ci siano cache del servizio"
+      ansible.builtin.systemd:
+        daemon_reload: true
