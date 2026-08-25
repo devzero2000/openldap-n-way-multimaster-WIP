@@ -67,7 +67,6 @@
       loop:
         - /etc/ldap/slapd.d
         - /etc/ldap/sasl2
-        - /etc/ldap/ldap.conf
 
     - name: "[CLEANUP_DATA] Elimina fisicamente le directory dei database"
       ansible.builtin.file:
