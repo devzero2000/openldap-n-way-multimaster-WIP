@@ -1,7 +1,0 @@
-Poiché queste repliche sono solo consumer (mai provider verso altri nodi — fanno solo olcUpdateRef verso i master), non serve creare un database/overlay accesslog locale qui: basta che le stanze olcSyncRepl parlino il protocollo delta leggendo dall'accesslog già configurato sui master.
-
-2 file modificati, eseguiti 2 comandi, file letto
-
-Unica modifica necessaria qui: alle stanze olcSyncRepl verso ciascun master ho aggiunto logbase="cn=accesslog" logfilter="(&(objectClass=auditWriteObject)(reqResult=0))" syncdata=accesslog, in modo che leggano i delta dal cn=accesslog che ora esiste su ogni master (dal play precedente), invece di un full-refresh.
-
-Non ho toccato nient'altro: questi nodi sono puri consumer (mai provider verso terzi — replicano solo in lettura e fanno olcUpdateRef verso i master), quindi non serve creare un database/overlay accesslog locale né toccare syncprov, indici, ACL, TLS o memberof/refint già presenti.
