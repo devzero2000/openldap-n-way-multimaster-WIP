@@ -15,7 +15,7 @@
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
 
-    test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
+    test_user_dn: "cn=testuser,ou=People,{{ suffix }}"
 
     node1: "{{ groups['cluster'][0] }}"
     other_nodes: "{{ groups['cluster'][1:] }}"
