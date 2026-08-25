@@ -170,7 +170,7 @@
         attributes:
           pwdAttribute: userPassword
           pwdMinLength: 12
-          pwdCheckQuality: 0
+          pwdCheckQuality: 1
           pwdMaxFailure: 5
           pwdLockout: "TRUE"
           pwdLockoutDuration: 1800
