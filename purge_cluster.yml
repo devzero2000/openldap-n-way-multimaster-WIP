@@ -51,7 +51,7 @@
       ansible.builtin.apt:
         name:
           - slapd
-          - ldap-utils
+#         - ldap-utils
         state: absent
         purge: true
         update_cache: true
