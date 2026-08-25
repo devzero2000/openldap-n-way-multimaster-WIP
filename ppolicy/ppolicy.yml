@@ -1,82 +1,136 @@
 # ==============================================================================
 # TITOLO:       Configurazione Password Policy (ppolicy) OpenLDAP
-# AUTORE:       Elia Pinto
-# DATA:         Luglio 2026
-# VERSIONE:     1.4 (Supporto pwdCheckQuality + Idempotenza ldap_attrs)
-# SCOPO:        Abilitare/Aggiornare l'overlay ppolicy nel cluster OpenLDAP
-#               garantendo l'enforcement globale della qualita' password.
+# AUTORE:       Elia Pinto / Revisionato e Corretto da AI (Agosto 2026)
+# VERSIONE:     2.3 (Playbook COMPLETO con Handler incluso)
+# SCOPO:        Abilitare/Aggiornare o Disabilitare l'overlay ppolicy in modo
+#               pienamente idempotente su OpenLDAP 2.6+
 # ==============================================================================
 
 ---
-- name: Gestione Password Policy OpenLDAP
+- name: Gestione Password Policy OpenLDAP (ppolicy)
   hosts: cluster
   become: true
   vars:
-    stato: "enable"
+    ppolicy_enabled: true
     suffix: "dc=example,dc=com"
-
-    # Credenziali per modificare la configurazione dell'infrastruttura (cn=config)
+    ldap_root_pw: "openldap"
     ldap_auth_config:
       server_uri: "ldapi:///"
       sasl_class: "external"
-
-    # Credenziali per scrivere dentro il database dei dati (dc=example,dc=com)
+      connect_timeout: 10
     ldap_auth_data:
       server_uri: "ldapi:///"
-      bind_dn: "cn=admin,dc=example,dc=com"
-      bind_pw: "openldap"
+      bind_dn: "cn=admin,{{ suffix }}"
+      bind_pw: "{{ ldap_root_pw }}"
+      connect_timeout: 10
 
   tasks:
-    # ==========================================================================
-    # PRE-REQUISITI: VERIFICA DIPENDENZE
-    # ==========================================================================
-
-    - name: "[SETUP] Installa la libreria python3-ldap se non presente"
+    - name: "[SETUP] Installa la libreria python3-ldap"
       ansible.builtin.apt:
         name: python3-ldap
         state: present
         update_cache: true
 
-    # ==========================================================================
-    # CASO: ABILITAZIONE (stato == "enable")
-    # ==========================================================================
-
-    - name: "[ENABLE] Carica il modulo globale ppolicy.la"
-      community.general.ldap_attrs:
+    - name: "[INFO] Ricerca DN del database MDB per il suffix {{ suffix }}"
+      community.general.ldap_search:
         server_uri: "{{ ldap_auth_config.server_uri }}"
         sasl_class: "{{ ldap_auth_config.sasl_class }}"
-        dn: "cn=module{0},cn=config"
-        attributes:
-          olcModuleLoad: "ppolicy.la"
-        state: present
-      when: stato == "enable"
+        dn: "cn=config"
+        filter: "(&(objectClass=olcMdbConfig)(olcSuffix={{ suffix }}))"
+        scope: onelevel
+      register: mdb_db_search
 
-    - name: "[ENABLE] Inizializza l'entry dell'overlay ppolicy sul database mdb (se assente)"
+    - name: "[FATAL] Errore critico, nessun database MDB trovato"
+      ansible.builtin.fail:
+        msg: "Impossibile trovare un database MDB con olcSuffix={{ suffix }}."
+      when: mdb_db_search.results | length == 0
+
+    - name: "[INFO] Trovato database MDB DN: {{ mdb_db_search.results[0].dn }}"
+      ansible.builtin.set_fact:
+        mdb_base_dn: "{{ mdb_db_search.results[0].dn }}"
+
+    # ==========================================================================
+    # CASO: ABILITAZIONE (ppolicy_enabled == true)
+    # ==========================================================================
+    - name: "[ENABLE] Verifica se ppolicy.la è già caricato globalmente"
+      ansible.builtin.command: ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config -s base "(olcModuleLoad=*ppolicy*)"
+      register: ppolicy_module_check
+      failed_when: false
+      changed_when: false
+      when: ppolicy_enabled
+
+    - name: "[ENABLE] Generazione LDIF temporanea per caricamento globale modulo ppolicy"
+      ansible.builtin.copy:
+        dest: /tmp/add_ppolicy_module.ldif
+        mode: "0600"
+        content: |
+          dn: cn=module{0},cn=config
+          changetype: modify
+          add: olcModuleLoad
+          olcModuleLoad: ppolicy
+      when: ppolicy_enabled and ppolicy_module_check.rc != 0
+
+    - name: "[ENABLE] Caricamento globale del modulo ppolicy (se assente)"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/add_ppolicy_module.ldif
+      register: ppolicy_mod_load_result
+      when: ppolicy_enabled and ppolicy_module_check.rc != 0
+      failed_when:
+        - ppolicy_mod_load_result.rc != 0
+        - "'Type or value exists' not in ppolicy_mod_load_result.stderr"
+      notify: Ricarica systemd e riavvia slapd
+
+    - name: "[CLEANUP] Rimozione LDIF temporanea"
+      ansible.builtin.file:
+        path: /tmp/add_ppolicy_module.ldif
+        state: absent
+      changed_when: false
+
+    - name: "[ENABLE] Verifica se l'overlay ppolicy è già attivo sul database trovato"
+      community.general.ldap_search:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "{{ mdb_base_dn }}"
+        filter: "(objectClass=olcPPolicyConfig)"
+        scope: children
+      register: ppolicy_overlay_check
+      when: ppolicy_enabled
+
+    - name: "[ENABLE] Inizializza l'overlay ppolicy sul database mdb"
       community.general.ldap_entry:
         server_uri: "{{ ldap_auth_config.server_uri }}"
         sasl_class: "{{ ldap_auth_config.sasl_class }}"
-        dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={1}ppolicy,{{ mdb_base_dn }}"
         objectClass:
-          - olcPPolicyConfig
           - olcOverlayConfig
+          - olcPPolicyConfig
         attributes:
-          olcOverlay: "ppolicy"
+          olcOverlay: "{1}ppolicy"
         state: present
-      when: stato == "enable"
+      when: ppolicy_enabled and ppolicy_overlay_check.results | length == 0
 
-    - name: "[ENABLE] Configura/Aggiorna gli attributi dell'overlay ppolicy in cn=config"
+    - name: "[ENABLE] Recupera il DN dinamico dell'overlay ppolicy"
+      community.general.ldap_search:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "{{ mdb_base_dn }}"
+        filter: "(objectClass=olcPPolicyConfig)"
+        scope: children
+      register: ppolicy_final_search
+      when: ppolicy_enabled
+
+    - name: "[ENABLE] Configura gli attributi dell'overlay ppolicy in cn=config"
       community.general.ldap_attrs:
         server_uri: "{{ ldap_auth_config.server_uri }}"
         sasl_class: "{{ ldap_auth_config.sasl_class }}"
-        dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
+        dn: "{{ ppolicy_final_search.results[0].dn }}"
         attributes:
           olcPPolicyDefault: "cn=default,ou=policies,{{ suffix }}"
           olcPPolicyForwardUpdates: "TRUE"
           olcPPolicyHashCleartext: "TRUE"
         state: exact
-      when: stato == "enable"
+      when: ppolicy_enabled
 
-    - name: "[ENABLE] Crea l'Unità Organizzativa (OU) per le politiche di sicurezza"
+    - name: "[ENABLE] Crea Unità Organizzativa (OU) policies"
       community.general.ldap_entry:
         server_uri: "{{ ldap_auth_data.server_uri }}"
         bind_dn: "{{ ldap_auth_data.bind_dn }}"
@@ -89,9 +143,9 @@
           ou: policies
           description: "Container per le Password Policy di sicurezza"
         state: present
-      when: stato == "enable"
+      when: ppolicy_enabled
 
-    - name: "[ENABLE] Inizializza l'entry di Password Policy 'default' se assente"
+    - name: "[ENABLE] Inizializza entry di Password Policy 'default'"
       community.general.ldap_entry:
         server_uri: "{{ ldap_auth_data.server_uri }}"
         bind_dn: "{{ ldap_auth_data.bind_dn }}"
@@ -105,9 +159,9 @@
           cn: default
           pwdAttribute: userPassword
         state: present
-      when: stato == "enable"
+      when: ppolicy_enabled
 
-    - name: "[ENABLE] Configura/Aggiorna la entry di Password Policy 'default' con Enforcement Qualita'"
+    - name: "[ENABLE] Configura la entry di Password Policy 'default' con parametri"
       community.general.ldap_attrs:
         server_uri: "{{ ldap_auth_data.server_uri }}"
         bind_dn: "{{ ldap_auth_data.bind_dn }}"
@@ -116,19 +170,41 @@
         attributes:
           pwdAttribute: userPassword
           pwdMinLength: 12
-          pwdCheckQuality: 1
+          pwdCheckQuality: 0
           pwdMaxFailure: 5
           pwdLockout: "TRUE"
           pwdLockoutDuration: 1800
           pwdAllowUserChange: "TRUE"
           pwdMustChange: "TRUE"
           pwdInHistory: 5
+          pwdMaxAge: 7776000
+          pwdMinAge: 0
+          pwdGraceAuthNLimit: 5
+          pwdFailureCountInterval: 30
+          pwdSafeModify: "FALSE"
         state: exact
-      when: stato == "enable"
+      when: ppolicy_enabled
 
     # ==========================================================================
-    # CASO: RIPRISTINO (stato == "disable")
+    # CASO: DISABILITAZIONE (ppolicy_enabled == false)
     # ==========================================================================
+    - name: "[DISABLE] Verifica esistenza overlay ppolicy per rimozione"
+      community.general.ldap_search:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "{{ mdb_base_dn }}"
+        filter: "(objectClass=olcPPolicyConfig)"
+        scope: children
+      register: ppolicy_dis_search
+      when: not ppolicy_enabled
+
+    - name: "[DISABLE] Rimuovi l'overlay ppolicy dal database mdb"
+      community.general.ldap_entry:
+        server_uri: "{{ ldap_auth_config.server_uri }}"
+        sasl_class: "{{ ldap_auth_config.sasl_class }}"
+        dn: "{{ ppolicy_dis_search.results[0].dn }}"
+        state: absent
+      when: not ppolicy_enabled and ppolicy_dis_search.results | length > 0
 
     - name: "[DISABLE] Rimuovi la entry di Password Policy 'default'"
       community.general.ldap_entry:
@@ -137,21 +213,23 @@
         bind_pw: "{{ ldap_auth_data.bind_pw }}"
         dn: "cn=default,ou=policies,{{ suffix }}"
         state: absent
-      when: stato == "disable"
+      when: not ppolicy_enabled
 
-    - name: "[DISABLE] Rimuovi l'Unità Organizzativa ou=policies"
+    - name: "[DISABLE] Rimuovi Unità Organizzativa (OU) policies"
       community.general.ldap_entry:
         server_uri: "{{ ldap_auth_data.server_uri }}"
         bind_dn: "{{ ldap_auth_data.bind_dn }}"
         bind_pw: "{{ ldap_auth_data.bind_pw }}"
         dn: "ou=policies,{{ suffix }}"
         state: absent
-      when: stato == "disable"
+      when: not ppolicy_enabled
 
-    - name: "[DISABLE] Rimuovi l'overlay ppolicy dal database mdb"
-      community.general.ldap_entry:
-        server_uri: "{{ ldap_auth_config.server_uri }}"
-        sasl_class: "{{ ldap_auth_config.sasl_class }}"
-        dn: "olcOverlay={1}ppolicy,olcDatabase={1}mdb,cn=config"
-        state: absent
-      when: stato == "disable"
+  # ==========================================================================
+  # GESTORI (HANDLERS) - CRITICI PER L'ATTIVAZIONE DEI MODULI
+  # ==========================================================================
+  handlers:
+    - name: Ricarica systemd e riavvia slapd
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: slapd
+        state: restarted
