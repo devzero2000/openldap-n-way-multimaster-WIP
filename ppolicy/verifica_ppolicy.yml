@@ -103,6 +103,6 @@
           - local_policy_search.results is defined and local_policy_search.results | length > 0
           # La policy deve avere pwdCheckQuality attivo (impostato a 0)
           - local_policy_search.results[0].pwdCheckQuality is defined
-          - local_policy_search.results[0].pwdCheckQuality | int == 0
+          - local_policy_search.results[0].pwdCheckQuality | int >= 1
         fail_msg: "CRITICO: Il nodo {{ inventory_hostname }} non ha la PPolicy coerente!"
         success_msg: "OK: Il nodo {{ inventory_hostname }} è configurato correttamente."
