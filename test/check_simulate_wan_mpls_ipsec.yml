@@ -8,7 +8,7 @@
 
 ---
 - name: Audit della Simulazione WAN MPLS + IPSec sul Cluster
-  hosts: cluster
+  hosts: ldap_all
   become: true
   vars:
     iface: "eth1"

@@ -1,0 +1,181 @@
+# ==============================================================================
+# TITOLO:       Verifica Convergenza Replica Dataset Custom Scale (Conteggi)
+# SCOPO:        Confermare che TUTTI i nodi (master + repliche read-only)
+#               abbiano ricevuto l'intero dataset custom-scale, contando
+#               separatamente entry (utenti/gruppi) e il totale delle
+#               appartenenze (valori "member:" sommati su tutti i gruppi) -
+#               quest'ultimo intercetta anche il caso di un'entry presente
+#               ma con la lista membri incompleta, che un conteggio di sole
+#               entry non rileverebbe.
+# ==============================================================================
+---
+- name: "Conteggio locale del dataset custom-scale su ciascun nodo"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+
+  tasks:
+    # NOTA: qui si usa slapcat (dump diretto dei file del database) invece
+    # di ldapsearch. slapcat bypassa del tutto il protocollo LDAP - niente
+    # size limit (il problema che aveva questo stesso file in precedenza,
+    # dove nemmeno "-z 0" lato client bastava perche' il limite era
+    # configurato come hard limit sul server), niente ACL, niente bind.
+    # Stesso identico pattern gia' usato con successo per tutta questa
+    # sessione di debug tramite lo script conta.sh manuale.
+
+    - name: "[COUNT] Utenti custom-scale-user-*"
+      ansible.builtin.shell: >
+        slapcat -b "{{ suffix }}" -s "ou=People,{{ suffix }}" | grep -c "^dn: uid=custom-scale-user-"
+      register: user_count_raw
+      changed_when: false
+      failed_when: false
+      # failed_when:false: grep -c ritorna rc=1 se zero corrispondenze -
+      # e' un dato legittimo (0), non un errore del comando.
+
+    - name: "[COUNT] Gruppi custom-scale-group-* (generici)"
+      ansible.builtin.shell: >
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-group-"
+      register: group_count_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "[COUNT] Gruppi deep-tier"
+      ansible.builtin.shell: >
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-deep-tier-"
+      register: deep_tier_count_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "[COUNT] Gruppi radice deep-nesting"
+      ansible.builtin.shell: >
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-root-deep-"
+      register: root_deep_count_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "[COUNT] Totale valori 'member:' su tutti i gruppi custom-scale (somma appartenenze)"
+      ansible.builtin.shell: >
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | awk '
+        /^dn: cn=custom-scale-(group|deep-tier|root-deep)-/ { inrecord=1; next }
+        /^dn:/ { inrecord=0; next }
+        inrecord && /^member:/ { count++ }
+        END { print count+0 }
+        '
+      register: member_count_raw
+      changed_when: false
+      failed_when: false
+
+    - name: "[COMPUTA] Estrai i conteggi numerici da ciascun output"
+      ansible.builtin.set_fact:
+        n_users: "{{ user_count_raw.stdout | trim | default('0', true) | int }}"
+        n_groups: "{{ group_count_raw.stdout | trim | default('0', true) | int }}"
+        n_deep_tier: "{{ deep_tier_count_raw.stdout | trim | default('0', true) | int }}"
+        n_root_deep: "{{ root_deep_count_raw.stdout | trim | default('0', true) | int }}"
+        n_memberships: "{{ member_count_raw.stdout | trim | default('0', true) | int }}"
+
+    - name: "[REPORT LOCALE] Conteggi su questo nodo"
+      ansible.builtin.debug:
+        msg:
+          - "Nodo: {{ inventory_hostname }}"
+          - "Utenti custom-scale:          {{ n_users }}"
+          - "Gruppi generici:              {{ n_groups }}"
+          - "Gruppi deep-tier:             {{ n_deep_tier }}"
+          - "Gruppi radice deep-nesting:   {{ n_root_deep }}"
+          - "Totale appartenenze (member:): {{ n_memberships }}"
+
+# =============================================================================
+# CONFRONTO INCROCIATO FRA TUTTI I NODI
+# =============================================================================
+- name: "Confronto conteggi fra tutti i nodi (master + repliche)"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    all_nodes: "{{ groups['cluster'] + groups['readonlyreplica'] }}"
+    reference_node: "{{ (groups['cluster'] | sort | first) }}"
+
+    # Se vuoi anche validare i conteggi contro i numeri attesi dal generatore
+    # (non solo la coerenza fra nodi), tienili allineati a
+    # create_custom_scale_data_nested_group_memberof.yml
+    total_users: 8000
+    total_groups: 30000
+    deep_nesting_levels: 15
+    deep_nesting_root_groups: 3
+
+  tasks:
+    - name: "[TABELLA] Riepilogo conteggi per nodo"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}:
+          utenti={{ hostvars[item].n_users }}
+          gruppi={{ hostvars[item].n_groups }}
+          deep_tier={{ hostvars[item].n_deep_tier }}
+          root_deep={{ hostvars[item].n_root_deep }}
+          appartenenze={{ hostvars[item].n_memberships }}
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso conteggio utenti del nodo di riferimento ({{ reference_node }})"
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].n_users == hostvars[reference_node].n_users
+        fail_msg: >-
+          NON CONVERGENTE: {{ item }} ha {{ hostvars[item].n_users }} utenti,
+          {{ reference_node }} ne ha {{ hostvars[reference_node].n_users }}.
+        success_msg: "{{ item }}: utenti allineati a {{ reference_node }}"
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso conteggio gruppi generici del nodo di riferimento"
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].n_groups == hostvars[reference_node].n_groups
+        fail_msg: >-
+          NON CONVERGENTE: {{ item }} ha {{ hostvars[item].n_groups }} gruppi,
+          {{ reference_node }} ne ha {{ hostvars[reference_node].n_groups }}.
+        success_msg: "{{ item }}: gruppi generici allineati a {{ reference_node }}"
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso conteggio gruppi deep-tier del nodo di riferimento"
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].n_deep_tier == hostvars[reference_node].n_deep_tier
+        fail_msg: "NON CONVERGENTE su deep-tier: {{ item }} vs {{ reference_node }}"
+        success_msg: "{{ item }}: gruppi deep-tier allineati a {{ reference_node }}"
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso conteggio gruppi radice del nodo di riferimento"
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].n_root_deep == hostvars[reference_node].n_root_deep
+        fail_msg: "NON CONVERGENTE su gruppi radice: {{ item }} vs {{ reference_node }}"
+        success_msg: "{{ item }}: gruppi radice allineati a {{ reference_node }}"
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso totale appartenenze (member:) del nodo di riferimento"
+      ansible.builtin.assert:
+        that:
+          - hostvars[item].n_memberships == hostvars[reference_node].n_memberships
+        fail_msg: >-
+          NON CONVERGENTE: {{ item }} ha {{ hostvars[item].n_memberships }}
+          appartenenze totali, {{ reference_node }} ne ha
+          {{ hostvars[reference_node].n_memberships }} - possibile perdita di
+          dati sulle liste membri (non solo entry mancanti, ma contenuto
+          incompleto di entry che pure esistono su entrambi i nodi).
+        success_msg: "{{ item }}: totale appartenenze allineato a {{ reference_node }}"
+      loop: "{{ all_nodes }}"
+
+    - name: "[COERENZA CON I PARAMETRI ATTESI] I conteggi sul nodo di riferimento corrispondono a quanto generato?"
+      ansible.builtin.assert:
+        that:
+          - hostvars[reference_node].n_users | int == total_users
+          - hostvars[reference_node].n_groups | int == total_groups
+          - hostvars[reference_node].n_deep_tier | int == deep_nesting_levels
+          - hostvars[reference_node].n_root_deep | int == deep_nesting_root_groups
+        fail_msg: >-
+          I conteggi su {{ reference_node }} non corrispondono ai parametri
+          attesi (total_users/total_groups/deep_nesting_*) - dataset
+          incompleto, non ancora generato, o generato con parametri diversi
+          da quelli impostati qui in cima al file.
+        success_msg: "OK: i conteggi corrispondono ai parametri attesi del generatore."

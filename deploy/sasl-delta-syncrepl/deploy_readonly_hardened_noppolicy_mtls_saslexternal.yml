@@ -1,0 +1,577 @@
+# ==============================================================================
+# TITOLO:       Configurazione Replica Read-Only OpenLDAP (Hardened SASL/mTLS)
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Deploy corazzato per nodi di sola lettura sincronizzati via Syncrepl,
+#               iterando sugli host del gruppo readonlyreplica e configurando l'HA.
+# ==============================================================================
+
+---
+- name: Configurazione Read-Only Replica OpenLDAP - HARDENED SASL EXTERNAL mTLS
+  hosts: readonlyreplica
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+    ldap_admin_group: "cn=administrators,ou=groups,dc=example,dc=com"
+
+    # Cluster di nodi master di riferimento da cui definire la replica HA in syncrepl
+    cluster_nodes: "{{ groups['cluster'] }}"
+    master_server: "{{ groups['cluster'][0] }}"
+
+    # Variabili infrastruttura PKI / SSL
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+
+  tasks:
+    # =========================================================================
+    # FASE PRELIMINARE: GENERAZIONE (SU MASTER) E FETCH CERTIFICATI SSL/TLS
+    # =========================================================================
+
+    - name: Certificati - Directory temporanea locale sul control node
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: /tmp/ldap_certs_transit
+        state: directory
+        mode: "0700"
+      run_once: true
+
+    - name: Certificati - Generazione chiave privata sul master per ciascuna replica
+      delegate_to: "{{ master_server }}"
+      ansible.builtin.command: "openssl genrsa -out /tmp/{{ item }}.key 2048"
+      args:
+        creates: "/tmp/{{ item }}.key"
+      with_items: "{{ groups['readonlyreplica'] }}"
+      changed_when: true
+
+    - name: Certificati - Generazione estensioni SAN dinamiche sul master per ciascuna replica
+      delegate_to: "{{ master_server }}"
+      ansible.builtin.copy:
+        dest: "/tmp/{{ item }}.ext"
+        mode: "0600"
+        content: |
+          authorityKeyIdentifier=keyid,issuer
+          basicConstraints=CA:FALSE
+          keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = {{ item }}
+          DNS.2 = {{ item | split('.') | first }}
+          DNS.3 = localhost
+          IP.1 = {{ hostvars[item]['ansible_facts']['default_ipv4']['address'] | default('127.0.0.1') }}
+          IP.2 = 127.0.0.1
+      with_items: "{{ groups['readonlyreplica'] }}"
+
+    - name: Certificati - Generazione CSR sul master per ciascuna replica
+      delegate_to: "{{ master_server }}"
+      ansible.builtin.command: >
+        openssl req -new -key /tmp/{{ item }}.key  -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
+        -out /tmp/{{ item }}.csr
+      args:
+        creates: "/tmp/{{ item }}.csr"
+      with_items: "{{ groups['readonlyreplica'] }}"
+      changed_when: true
+
+    - name: Certificati - Firma certificato sul master usando la CA locale
+      delegate_to: "{{ master_server }}"
+      ansible.builtin.command: >
+        openssl x509 -req -in /tmp/{{ item }}.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key
+        -CAcreateserial -out /tmp/{{ item }}.crt -days 1825 -sha256 -extfile /tmp/{{ item }}.ext
+      args:
+        creates: "/tmp/{{ item }}.crt"
+      with_items: "{{ groups['readonlyreplica'] }}"
+      changed_when: true
+
+    - name: Certificati - Fetch dinamico verso il Control Node dei certificati per ciascuna replica
+      delegate_to: "{{ master_server }}"
+      ansible.builtin.fetch:
+        src: "/tmp/{{ item }}"
+        dest: "/tmp/ldap_certs_transit/{{ item }}"
+        flat: true
+      with_items:
+        - "ca.crt"
+        - "{{ groups['readonlyreplica'] | map('regex_replace', '$', '.key') | list }}"
+        - "{{ groups['readonlyreplica'] | map('regex_replace', '$', '.crt') | list }}"
+
+    # =========================================================================
+    # FASE BASE: INSTALLAZIONE E CONFIGURAZIONE SLAPD (SOLO CN=CONFIG)
+    # =========================================================================
+
+    - name: 1. Installazione di OpenLDAP e utility client
+      ansible.builtin.apt:
+        name:
+          - slapd
+          - ldap-utils
+          - python-is-python3
+          - python3-ldap
+        state: present
+        update_cache: true
+
+    - name: OS Tuning - Assicura che la directory di override systemd per slapd esista
+      ansible.builtin.file:
+        path: /etc/systemd/system/slapd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: OS Tuning - Configura il limite dei file aperti (nofile) per slapd in systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slapd.service.d/limits.conf
+        mode: "0644"
+        content: |
+          [Service]
+          LimitNOFILE=65536
+          LimitNPROC=65536
+      notify: Ricarica systemd e riavvia slapd
+
+    - name: Certificati - Assicura che la directory sasl2 esista sulla replica (post-installazione slapd)
+      ansible.builtin.file:
+        path: /etc/ldap/sasl2
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: "0755"
+
+    - name: Certificati - Distribuzione e assegnazione permessi restrittivi sulla replica corrente
+      ansible.builtin.copy:
+        src: "/tmp/ldap_certs_transit/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: openldap
+        group: openldap
+        mode: "{{ item.mode }}"
+      with_items:
+        - { src: "ca.crt", dest: "{{ ssl_ca_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
+
+    - name: Certificati - Pulizia locale control node
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: /tmp/ldap_certs_transit
+        state: absent
+      run_once: true
+
+    - name: "Garantisci che slapd sia attivo"
+      ansible.builtin.service:
+        name: slapd
+        state: started
+
+    - name: 2. Configurazione dei parametri di default in /etc/ldap/ldap.conf
+      ansible.builtin.blockinfile:
+        path: /etc/ldap/ldap.conf
+        block: |
+          BASE    {{ ldap_basedn }}
+          URI     ldaps://localhost
+          TLS_CACERT {{ ssl_ca_path }}
+          TLS_REQCERT demand
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
+
+    - name: 2b. Configurazione livello Log avanzato (stats sync)
+      ansible.builtin.copy:
+        dest: /tmp/01_loglevel.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcLogLevel
+          olcLogLevel: stats sync
+
+    - name: 2c. Applicazione livello di log
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
+      register: log_init_result
+      failed_when: log_init_result.rc != 0
+      changed_when: true
+
+    - name: "2d. Tuning dei thread e limiti connessioni"
+      ansible.builtin.copy:
+        dest: /tmp/01_threads_tuning.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcThreads
+          olcThreads: 32
+          -
+          replace: olcConnMaxPending
+          olcConnMaxPending: 200
+          -
+          replace: olcConnMaxPendingAuth
+          olcConnMaxPendingAuth: 50
+
+    - name: "2e. Applicazione tuning thread"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_threads_tuning.ldif
+      register: threads_result
+      failed_when: threads_result.rc != 0
+      changed_when: true
+
+    - name: 3. Configurazione della password di Root in formato SSHA
+      ansible.builtin.command: slappasswd -s {{ ldap_rootpw }}
+      register: ldap_hashed_pw
+      changed_when: false
+
+    - name: 4. Creazione file LDIF per la configurazione del Database base
+      ansible.builtin.copy:
+        dest: /tmp/01_db_init.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSuffix
+          olcSuffix: {{ ldap_basedn }}
+          -
+          replace: olcRootDN
+          olcRootDN: {{ ldap_rootdn }}
+          -
+          replace: olcRootPW
+          olcRootPW: {{ ldap_hashed_pw.stdout }}
+
+    - name: 5. Applicazione configurazione Database di base
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_db_init.ldif
+      register: db_init_result
+      failed_when: "'ERR' in db_init_result.stderr and 'Duplicate' not in db_init_result.stderr"
+      changed_when: true
+
+    - name: A. Blocco dei Bind Anonimi a livello globale
+      ansible.builtin.copy:
+        dest: /tmp/01b_disable_anon.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          add: olcRequires
+          olcRequires: authc
+          -
+          add: olcDisallows
+          olcDisallows: bind_anon
+
+    - name: B. Applicazione blocco anonimi
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01b_disable_anon.ldif
+      register: anon_result
+      failed_when:
+        - anon_result.rc != 0
+        - "'Type or value exists' not in anon_result.stderr"
+      changed_when: true
+
+    # =========================================================================
+    # ACL SUL DATABASE PRINCIPALE
+    # NOTA: mancavano completamente in questo play. Senza una olcAccess
+    # esplicita il database eredita l'ACL di default di slapd ("to * by *
+    # read"), che concede lettura piena su TUTTO l'albero - incluso
+    # userPassword - a qualunque identita' autenticata. Replicata qui la
+    # stessa policy del deploy multi-master (userPassword/pwdReset e gli
+    # attributi ppolicy leggibili solo da self/root/admin group/nodi di
+    # replica; resto dell'albero in lettura per gli utenti autenticati).
+    # I permessi di scrittura sono mantenuti per coerenza con il master ma
+    # sono di fatto inerti: le scritture locali vengono deviate ai master
+    # tramite olcUpdateRef prima ancora di arrivare a valutare l'ACL.
+    # =========================================================================
+
+    - name: "Enable ppolicy module (necessario per lo schema pwdReset/pwdChangedTime usato dall'ACL)"
+      community.general.ldap_attrs:
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "ppolicy"
+        state: present
+
+    - name: "C. Generazione LDIF per ACL sul database principale (allineate al deploy multi-master)"
+      ansible.builtin.copy:
+        dest: /tmp/01c_acl_init.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcAccess
+          olcAccess: {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by * break
+          olcAccess: {1}to dn.base="" by anonymous read by * read
+          olcAccess: {2}to dn.base="cn=Subschema" by anonymous read by * read
+          olcAccess: {3}to attrs=userPassword,pwdReset
+            by self write
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.subtree="ou=system,{{ ldap_basedn }}" read
+            by * auth
+          olcAccess: {4}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
+            by self read
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.subtree="ou=system,{{ ldap_basedn }}" read
+            by * none
+          olcAccess: {5}to dn.subtree="{{ ldap_basedn }}"
+            by dn.exact="{{ ldap_rootdn }}" write
+            by group.exact="{{ ldap_admin_group }}" write
+            by dn.subtree="ou=system,{{ ldap_basedn }}" read
+            by self write
+            by users read
+            by * none
+
+    - name: "D. Applicazione ACL sul database principale"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01c_acl_init.ldif
+      register: acl_result
+      failed_when:
+        - acl_result.rc != 0
+      changed_when: true
+
+    # =========================================================================
+    # CONFIGURAZIONE TLS, AUTHZREGEXP E RIAVVIO
+    # =========================================================================
+
+    - name: "[LDAPS] Aggiunta della regola AuthzRegexp per i certificati mTLS"
+      ansible.builtin.copy:
+        dest: /tmp/01_authz_config.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          add: olcAuthzRegexp
+          olcAuthzRegexp: "^cn=([^,]+),.*" "cn=$1,ou=system,{{ ldap_basedn }}"
+
+    - name: "[LDAPS] Applicazione AuthzRegexp in cn=config"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_authz_config.ldif
+      register: authz_add_result
+      failed_when:
+        - authz_add_result.rc != 0
+        - "'Type or value exists' not in authz_add_result.stderr"
+        - "'Attribute or value exists' not in authz_add_result.stderr"
+      changed_when: true
+
+    - name: "[LDAPS] Configurazione parametri TLS in cn=config"
+      ansible.builtin.copy:
+        dest: /tmp/01_tls_config.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcTLSVerifyClient
+          olcTLSVerifyClient: try
+          -
+          replace: olcTLSCACertificateFile
+          olcTLSCACertificateFile: {{ ssl_ca_path }}
+          -
+          replace: olcTLSCertificateFile
+          olcTLSCertificateFile: {{ ssl_cert_path }}
+          -
+          replace: olcTLSCertificateKeyFile
+          olcTLSCertificateKeyFile: {{ ssl_key_path }}
+
+    - name: "[LDAPS] Applicazione configurazione TLS"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_tls_config.ldif
+      register: tls_apply_result
+      failed_when:
+        - tls_apply_result.rc != 0
+      changed_when: true
+
+    - name: Configurazione ascolto slapd su tutte le interfacce
+      ansible.builtin.lineinfile:
+        path: /etc/default/slapd
+        regexp: "^SLAPD_SERVICES="
+        line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
+
+    ###########################################################################
+    # CONFIGURAZIONE MEMBEROF NESTED GROUP REFINT
+    # #########################################################################
+    # SCOPO:        Caricamento moduli e configurazione corretta di:
+    #               - memberof   {0}  (statico, diretto, locale al nodo, escluso
+    #                                   da replica; olcMemberOfRefInt: FALSE
+    #                                   perche' la referential integrity sui
+    #                                   valori "member"/"uniqueMember" e' delegata
+    #                                   all'overlay refint standalone qui sotto,
+    #                                   per evitare doppia gestione)
+    #               - refint     {1}  (referential integrity su member/
+    #                                   uniqueMember/manager/owner; NON su
+    #                                   memberOf, che resta di competenza
+    #                                   esclusiva di memberof)
+    #               - nestgroup  {2}  (espansione a query-time dei gruppi
+    #                                   annidati, nessuna scrittura, quindi
+    #                                   nativamente safe in MMR)
+    #               uso la class groupOfNames
+    #
+    # NOTA IMPORTANTE 1 (da fare a parte, non gestito da questo playbook):
+    #   memberOf va escluso dalla replica sulle stanze syncrepl di OGNI nodo
+    #   del mesh MMR, su TUTTI i collegamenti verso TUTTI i peer, es.:
+    #       olcSyncrepl: ... exattrs="memberOf"
+    #   Senza questa esclusione, su ogni singolo link, le scritture locali di
+    #   memberof entrano in conflitto con i valori replicati dagli altri master.
+    #
+    # NOTA IMPORTANTE 2:
+    #   syncprov va aggiunto per ultimo (istanza {3}) nel playbook successivo,
+    #   cosi' da catturare correttamente anche le modifiche derivate generate
+    #   internamente da memberof/refint.
+    #
+    # NOTA IMPORTANTE 3 (deprecazione):
+    #   La man page ufficiale di slapo-memberof(5) dichiara l'overlay deprecato
+    #   (sostituto raccomandato: dynlist) e ne sconsiglia esplicitamente l'uso
+    #   in ambienti replicati. La configurazione qui sotto (calcolo locale non
+    #   replicato) e' l'assetto che la documentazione stessa raccomanda quando
+    #   memberof deve comunque essere usato in MMR, ma va tenuto presente in
+    #   ottica di eventuale migrazione futura a dynlist/nestgroup.
+    # ==============================================================================
+
+    # --------------------------------------------------------------------
+    # MEMBEROF (livello diretto, write-time, locale al nodo) - istanza {0}
+    # --------------------------------------------------------------------
+
+    - name: "[MEMBEROF] Carica il modulo globale memberof"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof"
+        state: present
+
+    - name: "[MEMBEROF] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcMemberOf
+        attributes:
+          olcOverlay: "{0}memberof"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
+          olcMemberOfDN: "cn=admin,{{ ldap_basedn }}"
+          # olcMemberOfRefInt FALSE: la pulizia di member/uniqueMember alla
+          # cancellazione di un'entry e' delegata all'overlay refint {1}
+          # sottostante, per evitare che due meccanismi scrivano sullo
+          # stesso attributo con logiche diverse.
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
+          olcMemberOfDangling: "ignore"
+        state: present
+
+    - name: Riavvio completo per inizializzare i contesti TLS
+      ansible.builtin.service:
+        name: slapd
+        state: restarted
+
+    # =========================================================================
+    # CONFIGURAZIONE SYNCREPL MULTIPLA PER HA (VERSO TUTTI I MASTER)
+    # DELTA-SYNCREPL: legge i delta dal database cn=accesslog di ciascun master
+    # (configurato lato master, vedi deploy multi-master), non l'intera entry.
+    # Questo nodo e' solo consumer: non serve un accesslog locale, ne'
+    # l'overlay accesslog, perche' questa replica non e' mai provider per
+    # nessun altro peer (fa solo olcUpdateRef verso i master).
+    # =========================================================================
+
+    - name: Generazione LDIF Syncrepl di High Availability verso tutti i nodi del cluster
+      ansible.builtin.copy:
+        dest: /tmp/04_readonly_sync_ha.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSyncRepl
+          {% for node in cluster_nodes %}
+          olcSyncRepl: rid={{ 100 + loop.index }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=3600 network-timeout=15 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf" logbase="cn=accesslog" logfilter="(&(objectClass=auditWriteObject)(reqResult=0))" syncdata=accesslog
+          {% endfor %}
+
+    - name: Applicazione configurazione Syncrepl HA Read-Only
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/04_readonly_sync_ha.ldif
+      register: sync_apply_result
+      failed_when: >
+        sync_apply_result.rc != 0 and
+        'Already exists' not in sync_apply_result.stderr and
+        'Duplicate' not in sync_apply_result.stderr and
+        'Type or value exists' not in sync_apply_result.stderr
+      changed_when: true
+
+    # =========================================================================
+    # TUNING DEL DATABASE MDB E MONITORAGGIO (SOLO CONFIGURAZIONE LOCALE)
+    # =========================================================================
+
+    - name: Generazione LDIF per Indici e Tuning MDB
+      ansible.builtin.copy:
+        dest: /tmp/06_db_tuning.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcDbMaxSize
+          olcDbMaxSize: 32212254720
+          -
+          replace: olcDbNoSync
+          olcDbNoSync: TRUE
+          -
+          replace: olcDbIndex
+          olcDbIndex: objectClass eq
+          olcDbIndex: uid eq
+          olcDbIndex: cn eq,sub
+          olcDbIndex: member eq
+          olcDbIndex: memberUid eq
+          olcDbIndex: entryUUID eq
+          olcDbIndex: entryCSN eq
+          olcDbIndex: memberOf eq
+
+    - name: Applicazione parametri di Tuning Database
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
+      register: tuning_result
+      failed_when:
+        - tuning_result.rc != 0
+        - "'Type or value exists' not in tuning_result.stderr"
+        - "'attribute OR type already exists' not in tuning_result.stderr"
+      changed_when: true
+
+    - name: Generazione LDIF per configurazione olcUpdateRef verso i Master
+      ansible.builtin.copy:
+        dest: /tmp/07_update_ref.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          {% for node in cluster_nodes %}
+          {% if not loop.first %}-
+          {% endif %}
+          add: olcUpdateRef
+          olcUpdateRef: ldaps://{{ node }}:636
+          {% endfor %}
+
+    - name: Applicazione direttiva olcUpdateRef sulla replica Read-Only
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/07_update_ref.ldif
+      register: updateref_result
+      failed_when:
+        - updateref_result.rc != 0
+        - "'Type or value exists' not in updateref_result.stderr"
+        - "'attribute OR type already exists' not in updateref_result.stderr"
+      changed_when: true
+
+    - name: Generazione LDIF per backend cn=Monitor
+      ansible.builtin.copy:
+        dest: /tmp/05_monitor.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={2}monitor,cn=config
+          changetype: add
+          objectClass: olcDatabaseConfig
+          olcDatabase: {2}monitor
+          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by * none
+
+    - name: Applicazione configurazione backend cn=Monitor
+      ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
+      register: monitor_result
+      failed_when:
+        - monitor_result.rc != 0
+        - "'Already exists' not in monitor_result.stderr"
+        - "'Type or value exists' not in monitor_result.stderr"
+        - "'only one monitor database allowed' not in monitor_result.stderr"
+      changed_when: true
+
+    - name: Riavvio finale del servizio slapd sulla replica Read-Only
+      ansible.builtin.service:
+        name: slapd
+        state: restarted
+
+  handlers:
+    - name: Ricarica systemd e riavvia slapd
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: slapd
+        state: restarted

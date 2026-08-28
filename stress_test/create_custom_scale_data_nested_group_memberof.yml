@@ -1,97 +1,324 @@
 # ==============================================================================
-# TITOLO:       Generazione Dataset Scalato (8k/30k + Deep Nesting - MemberOf / Nested)
+# TITOLO:       Generazione Dataset Scalato (MemberOf / Nested Group) - IMPORT A BATCH
+#
+# SOMMARIO POPOLAZIONE DI RIFERIMENTO (stima di produzione):
+#   Utenti totali:            ~8.000
+#     - nominativi (persone):   ~800
+#         di cui Cloud Architect: ~40 (sottoinsieme, variabile "cloud_architects")
+#         50 (# cloud account) * 5 (# servizi con utenze tecniche)
+#          * 7 (# stage) * 3 (# installazioni/servizio, cluster per region)
+#     - tecnici (deploy/servizi): ~7.200 (= total_users - nominal_users)
+#   Gruppi totali:             ~30.000
+#     50 (# cloud account) * 20 (# medio servizi/account)
+#      * 7 (# stage) * 4 (# medio ruoli/servizio)
+#   Gruppi per utenza (medi, alta varianza):
+#     - utente nominale "normale":  ~50   (30.000 / 800, arrotondato per eccesso)
+#     - utenza tecnica di deploy:   ~150  (20 servizi * 7 stage, arrotondato)
+#     - Cloud Architect:            ~300  (2 account medi * 20 servizi * 7 stage)
+#
+# Tutte le dimensioni sopra sono parametriche (vedi vars sotto) - modificale
+# per tarare il test su scale diverse senza toccare la logica dello script.
+#
+# IMPORT A BATCH (novita' rispetto alla versione precedente):
+# Un unico ldapmodify continuo su ~38.000 entry (~1,13M scritture effettive
+# contando il lavoro di memberof) genera un burst di scrittura molto intenso
+# e sostenuto. Con dati concreti (confronto diretto fra gli export completi
+# di 3 nodi via slapcat) abbiamo osservato entry presenti sul nodo che le ha
+# scritte, con contextCSN gia' avanzato ben oltre il loro timestamp, ma MAI
+# arrivate a NESSUNO dei consumer - identiche su tutti, senza alcun errore
+# nei log. Il quadro e' coerente con un limite/comportamento di syncprov
+# sotto burst di scrittura molto intensi: la mitigazione pratica e' spezzare
+# l'unico grande import in batch piu' piccoli, con una breve pausa fra un
+# batch e l'altro, per dare all'overlay il tempo di registrare/consegnare
+# correttamente ogni gruppo di modifiche prima che arrivi il successivo.
 # ==============================================================================
 ---
-- name: "Generazione e Iniezione Dataset Custom (Scale 8k/30k - MemberOf / Nested)"
-  hosts: ubuntu24lts1.example.com
+- name: "Generazione e Iniezione Dataset Custom (MemberOf / Nested Group) - Import a Batch"
+  hosts: "{{ groups['cluster'] | sort | first }}"
   become: true
   vars:
     suffix: "dc=example,dc=com"
-    ldif_path: "/tmp/custom_scale_data.ldif"
+    ldif_dir: "/tmp/custom_scale_batches"
     ldap_pw: "openldap"
 
+    # --- Dimensioni popolazione (tutte modificabili) ------------------------
+    total_users: 8000
+    nominal_users: 800          # sottoinsieme di total_users, i primi N indici
+    cloud_architects: 40        # sottoinsieme di nominal_users, i primi N indici
+    total_groups: 30000
+
+    avg_groups_architect: 300   # media gruppi/utente per i Cloud Architect
+    avg_groups_nominal: 50      # media gruppi/utente per i nominali "normali"
+    avg_groups_technical: 150   # media gruppi/utente per le utenze tecniche
+    group_count_variance: 0.3   # variazione (deviazione standard relativa)
+
+    # --- Struttura di deep nesting dedicata (invariata, ora parametrica) ----
+    deep_nesting_levels: 15
+    deep_nesting_target_user_index: 5000   # deve essere <= total_users
+    deep_nesting_root_groups: 3
+    deep_nesting_anchor_step: 500          # deve essere <= total_groups
+
+    random_seed: 42             # riproducibilità fra run diversi
+
+    # --- Parametri di batching (novita') -------------------------------------
+    batch_size: 200              # entry LDIF per batch (dn: multiple per file)
+    batch_pause_seconds: 5       # pausa fra un batch e il successivo
+    batch_timeout_seconds: 120   # timeout per singolo batch (ampio margine)
+    batch_retries: 15
+    batch_retry_delay: 15
+
   tasks:
-    - name: "[TEMPLATING] Genera lo script Python per il dataset isolato"
+    - name: "[SETUP] Assicura la presenza del comando 'time'"
+      ansible.builtin.command: which time
+      register: time_bin_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SETUP] Installa il pacchetto 'time' se assente"
+      ansible.builtin.apt:
+        name: time
+        state: present
+      when: time_bin_check.rc != 0
+
+    - name: "[CLEANUP PRELIMINARE] Rimuovi eventuali batch residui da un run precedente"
+      ansible.builtin.file:
+        path: "{{ ldif_dir }}"
+        state: absent
+
+    - name: "[TEMPLATING] Genera lo script Python per il dataset a batch"
       ansible.builtin.copy:
-        dest: /tmp/generate_custom_scale_ldif.py
+        dest: /tmp/generate_custom_scale_ldif_batched.py
         mode: '0755'
         content: |
           #!/usr/bin/env python3
           import hashlib
           import base64
           import os
+          import random
 
           suffix = "{{ suffix }}"
-          total_users = 8000
-          total_groups = 30000
+          total_users = {{ total_users }}
+          nominal_users = {{ nominal_users }}
+          cloud_architects = {{ cloud_architects }}
+          total_groups = {{ total_groups }}
+
+          avg_groups_architect = {{ avg_groups_architect }}
+          avg_groups_nominal = {{ avg_groups_nominal }}
+          avg_groups_technical = {{ avg_groups_technical }}
+          group_count_variance = {{ group_count_variance }}
+
+          deep_nesting_levels = {{ deep_nesting_levels }}
+          deep_nesting_target_user_index = {{ deep_nesting_target_user_index }}
+          deep_nesting_root_groups = {{ deep_nesting_root_groups }}
+          deep_nesting_anchor_step = {{ deep_nesting_anchor_step }}
+
+          batch_size = {{ batch_size }}
+          ldif_dir = "{{ ldif_dir }}"
+
+          random.seed({{ random_seed }})
+
+          assert cloud_architects <= nominal_users <= total_users
+          assert deep_nesting_target_user_index <= total_users
+          assert deep_nesting_root_groups * deep_nesting_anchor_step <= total_groups
 
           def make_ssha_password(password_plain):
               salt = os.urandom(4)
               ctx = hashlib.sha1(password_plain.encode('utf-8'))
               ctx.update(salt)
-              ssha_hash = base64.b64encode(ctx.digest() + salt).decode('utf-8')
-              return "{SSHA}" + ssha_hash
+              return "{SSHA}" + base64.b64encode(ctx.digest() + salt).decode('utf-8')
 
-          with open("{{ ldif_path }}", "w") as f:
-              f.write(f"dn: ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: People\n\n")
-              f.write(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n\n")
+          # Accumula i membri di ciascuno dei gruppi "generici" prima di
+          # scriverli: la distribuzione e' guidata per UTENTE (ogni utente
+          # sceglie i propri gruppi in base alla fascia di appartenenza), non
+          # per gruppo - e' l'unico modo per rispettare le medie per-utente
+          # richieste (50 / 150 / 300).
+          group_members = {i: [] for i in range(1, total_groups + 1)}
 
-              # 1. 8.000 Utenze con prefisso specifico
-              for i in range(1, total_users + 1):
-                  username = f"custom-scale-user-{i}"
-                  ssha_password = make_ssha_password(f"{username}.1")
-                  f.write(f"dn: uid={username},ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Custom User {i}\nsn: ScaleUser{i}\nuserPassword: {ssha_password}\n\n")
-              
-              # 2. Catena di Deep Nesting dedicata (15 livelli)
-              depth_levels = 15
-              for d in range(depth_levels, 0, -1):
-                  group_name = f"cn=custom-scale-deep-tier-{d},ou=groups,{suffix}"
-                  f.write(f"dn: {group_name}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-deep-tier-{d}\ndescription: Livello profondo {d}\n")
-                  if d == depth_levels:
-                      f.write(f"member: uid=custom-scale-user-5000,ou=People,{suffix}\n")
-                  else:
-                      f.write(f"member: cn=custom-scale-deep-tier-{d+1},ou=groups,{suffix}\n")
+          def assign_user_to_groups(user_dn, avg_count):
+              count = max(1, int(random.gauss(avg_count, avg_count * group_count_variance)))
+              count = min(count, total_groups)
+              for g in random.sample(range(1, total_groups + 1), count):
+                  group_members[g].append(user_dn)
+
+          # A differenza della versione precedente, i record LDIF vengono
+          # accumulati in una LISTA invece di essere scritti direttamente su
+          # un unico file - vengono poi suddivisi in batch alla fine.
+          records = []
+
+          records.append(f"dn: ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: People\n")
+          records.append(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n")
+
+          # 1. Utenti: architect (1..cloud_architects) - nominali
+          #    (cloud_architects+1..nominal_users) - tecnici (nominal_users+1..total_users)
+          #
+          # NOTA: test_user_standard_index/test_check_group_index e
+          # test_user_architect_index sono le stesse identita' usate dal
+          # play "verify_performance": senza una garanzia esplicita,
+          # l'assegnazione puramente casuale non assicura affatto che
+          # user-100 sia davvero in group-100, ne' che l'architect finisca
+          # sotto un gruppo radice.
+          test_user_standard_index = 100
+          test_user_architect_index = 1
+          test_check_group_index = 100
+
+          for i in range(1, total_users + 1):
+              username = f"custom-scale-user-{i}"
+              dn = f"uid={username},ou=People,{suffix}"
+              ssha_password = make_ssha_password(f"{username}.1")
+              records.append(f"dn: {dn}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Custom User {i}\nsn: ScaleUser{i}\nuserPassword: {ssha_password}\n")
+
+              if i <= cloud_architects:
+                  assign_user_to_groups(dn, avg_groups_architect)
+              elif i <= nominal_users:
+                  assign_user_to_groups(dn, avg_groups_nominal)
+              else:
+                  assign_user_to_groups(dn, avg_groups_technical)
+
+              # Appartenenza ESPLICITA garantita (con dedup, per non
+              # produrre un valore "member:" duplicato se il sorteggio
+              # casuale aveva gia' scelto lo stesso gruppo)
+              if i == test_user_standard_index:
+                  if dn not in group_members[test_check_group_index]:
+                      group_members[test_check_group_index].append(dn)
+
+          # 2. Catena di Deep Nesting dedicata
+          target_user_dn = f"uid=custom-scale-user-{deep_nesting_target_user_index},ou=People,{suffix}"
+          for d in range(deep_nesting_levels, 0, -1):
+              group_name = f"cn=custom-scale-deep-tier-{d},ou=groups,{suffix}"
+              lines = f"dn: {group_name}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-deep-tier-{d}\ndescription: Livello profondo {d}\n"
+              if d == deep_nesting_levels:
+                  lines += f"member: {target_user_dn}\n"
+              else:
+                  lines += f"member: cn=custom-scale-deep-tier-{d+1},ou=groups,{suffix}\n"
+              records.append(lines)
+
+          # 3. I gruppi generici, popolati dalla distribuzione per-utente
+          #    calcolata sopra. Un gruppo senza alcun membro violerebbe lo
+          #    schema (groupOfNames richiede almeno un "member"): con questa
+          #    densita' non capita mai per caso, ma teniamo un fallback.
+          for i in range(1, total_groups + 1):
+              lines = f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=custom-scale-group-{i}\ndescription: Gruppo custom {i}\n"
+              members = group_members[i]
+              if not members:
+                  members = [f"cn=admin,{suffix}"]
+              for member_dn in members:
+                  lines += f"member: {member_dn}\n"
+              records.append(lines)
+
+          # 4. Gruppi Radice con Deep Nesting (ancorati a gruppi generici gia' esistenti)
+          architect_dn = f"uid=custom-scale-user-{test_user_architect_index},ou=People,{suffix}"
+          for i in range(1, deep_nesting_root_groups + 1):
+              anchor_group = i * deep_nesting_anchor_step
+              lines = f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=custom-scale-root-deep-{i}\ndescription: Radice profonda {i}\n"
+              lines += f"member: cn=custom-scale-deep-tier-1,ou=groups,{suffix}\n"
+              lines += f"member: cn=custom-scale-group-{anchor_group},ou=groups,{suffix}\n"
+              if i == 1:
+                  lines += f"member: {architect_dn}\n"
+              records.append(lines)
+
+          # --- Suddivisione in batch e scrittura su file separati ---
+          os.makedirs(ldif_dir, exist_ok=True)
+          num_batches = (len(records) + batch_size - 1) // batch_size
+          for b in range(num_batches):
+              chunk = records[b * batch_size : (b + 1) * batch_size]
+              fname = os.path.join(ldif_dir, f"batch_{b:05d}.ldif")
+              with open(fname, "w") as f:
+                  f.write("\n".join(chunk))
                   f.write("\n")
 
-              # 3. 30.000 Gruppi con prefisso specifico e alta densità per l'utente 1 (Cloud Architect ~300 gruppi)
-              for i in range(1, total_groups + 1):
-                  f.write(f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=custom-scale-group-{i}\ndescription: Gruppo custom {i}\n")
-                  
-                  start_user = ((i * 15) % total_users) + 1
-                  for u in range(start_user, start_user + 4):
-                      actual_u = u if u <= total_users else (u % total_users) + 1
-                      f.write(f"member: uid=custom-scale-user-{actual_u},ou=People,{suffix}\n")
-                  
-                  if i <= 300:
-                      f.write(f"member: uid=custom-scale-user-1,ou=People,{suffix}\n")
+          print(f"Record totali: {len(records)}")
+          print(f"Batch generati: {num_batches} (dimensione {batch_size} record/batch)")
 
-                  if i > 1 and i % 2 != 0:
-                      f.write(f"member: cn=custom-scale-group-{i-1},ou=groups,{suffix}\n")
-                      
-                  f.write("\n")
-              
-              # 4. Gruppi Radice con Deep Nesting
-              for i in range(1, 4):
-                  f.write(f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=custom-scale-root-deep-{i}\ndescription: Radice profonda {i}\n")
-                  f.write(f"member: cn=custom-scale-deep-tier-1,ou=groups,{suffix}\n")
-                  f.write(f"member: cn=custom-scale-group-{i*500},ou=groups,{suffix}\n")
-                  f.write("\n")
-
-    - name: "[EXECUTE] Esegui script di generazione LDIF"
-      ansible.builtin.command: python3 /tmp/generate_custom_scale_ldif.py
+    - name: "[EXECUTE] Esegui script di generazione LDIF a batch"
+      ansible.builtin.command: python3 /tmp/generate_custom_scale_ldif_batched.py
+      register: gen_result
       changed_when: true
 
-    - name: "[IMPORT] Inietta il dataset nel cluster"
-      ansible.builtin.command: >
-        ldapmodify -a -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
-      register: ldapadd_res
-      changed_when: true
-      failed_when: "ldapadd_res.rc != 0 and 'Already exists' not in ldapadd_res.stderr"
+    - name: "[REPORT] Riepilogo generazione"
+      ansible.builtin.debug:
+        msg: "{{ gen_result.stdout_lines }}"
 
-    - name: "[CLEANUP] Rimuovi script temporaneo"
+    - name: "[LISTA] Trova tutti i file batch generati, in ordine"
+      ansible.builtin.find:
+        paths: "{{ ldif_dir }}"
+        patterns: "batch_*.ldif"
+      register: batch_files_raw
+
+    - name: "[LISTA] Ordina i batch per nome (garantisce l'ordine di import)"
+      ansible.builtin.set_fact:
+        batch_files: "{{ batch_files_raw.files | map(attribute='path') | sort | list }}"
+
+    - name: "[REPORT] Numero di batch da importare"
+      ansible.builtin.debug:
+        msg: "{{ batch_files | length }} batch da importare, con {{ batch_pause_seconds }}s di pausa fra uno e l'altro"
+
+    # =========================================================================
+    # IMPORT A BATCH - un ldapmodify per ciascun file, con pausa fra un batch
+    # e il successivo. failed_when tratta ESPLICITAMENTE rc==124 (kill da
+    # timeout) come un fallimento vero, indipendentemente dal contenuto dello
+    # stderr - un batch troncato dal timeout non deve mai passare per
+    # "successo" solo perche' non ha fatto in tempo a scrivere una riga di
+    # errore "ldap_add:" prima di essere ucciso.
+    # =========================================================================
+
+    - name: "[TIMING] Segna l'orario di inizio dell'import a batch"
+      ansible.builtin.set_fact:
+        batch_import_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: "[IMPORT] Applica ciascun batch (cronometrato, con retry se slapd non risponde)"
+      ansible.builtin.shell: >
+        time timeout {{ batch_timeout_seconds }} ldapmodify -a -c -H ldapi:/// -x
+        -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ batch_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+        pause: "{{ batch_pause_seconds }}"
+      register: batch_results
+      changed_when: true
+      # until: ritenta lo STESSO batch (non passa al successivo) se fallisce -
+      # se slapd e' andato giu' a meta', questo da' il tempo di riprendersi
+      # prima di insistere, invece di procedere alla cieca sul batch dopo.
+      # "-a -c" (append + continuous mode) rende il retry sicuro: le entry
+      # gia' scritte nel tentativo precedente daranno "Already exists"
+      # (tollerato), quelle rimaste verranno scritte per davvero al retry.
+      until: >
+        not (
+          batch_results.rc == 124 or
+          (batch_results.rc != 0 and
+            (batch_results.stderr_lines
+              | select('match', '^ldap_add:')
+              | reject('search', 'Already exists')
+              | list
+              | length > 0))
+        )
+      retries: "{{ batch_retries }}"
+      delay: "{{ batch_retry_delay }}"
+      failed_when: >
+        batch_results.rc == 124 or
+        (batch_results.rc != 0 and
+          (batch_results.stderr_lines
+            | select('match', '^ldap_add:')
+            | reject('search', 'Already exists')
+            | list
+            | length > 0))
+
+    - name: "[TIMING] Segna l'orario di fine dell'import a batch"
+      ansible.builtin.set_fact:
+        batch_import_end_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: "[REPORT] Tempo totale di import (dall'inizio del primo batch alla fine dell'ultimo)"
+      ansible.builtin.debug:
+        msg: >-
+          {{ (((batch_import_end_epoch | int) - (batch_import_start_epoch | int)) / 60) | round(1) }}
+          minuti totali su {{ batch_files | length }} batch ({{ batch_size }} entry/batch,
+          {{ batch_pause_seconds }}s di pausa fra un batch e l'altro)
+
+    - name: "[CLEANUP] Rimuovi script e batch LDIF temporanei"
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
-        - "/tmp/generate_custom_scale_ldif.py"
-        - "{{ ldif_path }}"
+        - "/tmp/generate_custom_scale_ldif_batched.py"
+        - "{{ ldif_dir }}"

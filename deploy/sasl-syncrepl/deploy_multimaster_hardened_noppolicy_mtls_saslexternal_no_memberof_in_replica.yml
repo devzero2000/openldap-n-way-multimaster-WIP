@@ -1,0 +1,896 @@
+# ==============================================================================
+# TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
+# ==============================================================================
+
+---
+- name: Configurazione Cluster OpenLDAP Multi-Master dinamico (N-Way) - HARDENED SASL EXTERNAL mTLS
+  hosts: cluster
+  become: true
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    ldap_basedn: "dc=example,dc=com"
+    ldap_rootdn: "cn=admin,dc=example,dc=com"
+    ldap_rootpw: "openldap"
+
+    ldap_admin_group: "cn=administrators,ou=groups,dc=example,dc=com"
+
+    # cluster_nodes ordinato alfabeticamente: la scelta del nodo coordinatore/CA
+    # (ca_server) diventa deterministica e stabile anche se l'ordine con cui
+    # l'inventory elenca gli host cambia (inventory dinamico incluso), e resta
+    # coerente con quanto calcolato dal play delle repliche read-only.
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    ca_server: "{{ cluster_nodes[0] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+
+    # Variabili infrastruttura PKI / SSL
+    # pki_dir: directory PERSISTENTE (non /tmp) sul nodo coordinatore per CA e
+    # chiavi/CSR/cert dei nodi. Deve persistere tra un run e l'altro: i task
+    # "creates:" sotto dipendono da questo per non rigenerare una CA diversa
+    # ad ogni esecuzione, e non deve restare leggibile da altri utenti locali.
+    pki_dir: "/etc/ldap/pki"
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+    ssl_cert_path: "/etc/ldap/sasl2/ldap-server.crt"
+    ssl_key_path: "/etc/ldap/sasl2/ldap-server.key"
+
+  tasks:
+    # =========================================================================
+    # FASE PRELIMINARE: INSTALLAZIONE SLAPD E PREPARAZIONE DIRECTORY SASL2
+    # =========================================================================
+
+    - name: 1. Installazione di OpenLDAP e utility client (anticipata per creare utente openldap)
+      ansible.builtin.apt:
+        name:
+          - slapd
+          - ldap-utils
+          - python-is-python3
+        state: present
+        update_cache: true
+
+    - name: OS Tuning - Assicura che la directory di override systemd per slapd esista
+      ansible.builtin.file:
+        path: /etc/systemd/system/slapd.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: OS Tuning - Configura il limite dei file aperti (nofile) per slapd in systemd
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slapd.service.d/limits.conf
+        mode: "0644"
+        content: |
+          [Service]
+          LimitNOFILE=65536
+          LimitNPROC=65536
+      notify: Ricarica systemd e riavvia slapd
+
+
+    - name: Certificati - Assicura che la directory sasl2 esista sui nodi del cluster
+      ansible.builtin.file:
+        path: /etc/ldap/sasl2
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: "0755"
+
+    # =========================================================================
+    # FASE PRELIMINARE: GENERAZIONE E DISTRIBUZIONE CERTIFICATI SSL/TLS
+    # =========================================================================
+
+    - name: Certificati - Installa openssl sulla CA
+      ansible.builtin.apt:
+        name: openssl
+        state: present
+      when: inventory_hostname == ca_server
+
+    - name: Certificati - Directory temporanea locale sul control node
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: /tmp/ldap_certs_transit
+        state: directory
+        mode: "0700"
+      run_once: true
+
+    - name: Certificati - Directory persistente per il materiale PKI sul nodo coordinatore
+      ansible.builtin.file:
+        path: "{{ pki_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: inventory_hostname == ca_server
+
+    - name: Certificati - Generazione Autorità di Certificazione (Solo sul primo nodo)
+      when: inventory_hostname == ca_server
+      block:
+        - name: CA - Genera chiave privata
+          ansible.builtin.command: "openssl genrsa -out {{ pki_dir }}/ca.key 4096"
+          args:
+            creates: "{{ pki_dir }}/ca.key"
+          changed_when: true
+
+        - name: CA - Applica permessi restrittivi alla chiave privata
+          ansible.builtin.file:
+            path: "{{ pki_dir }}/ca.key"
+            owner: root
+            group: root
+            mode: "0600"
+
+        - name: CA - Genera certificato root
+          ansible.builtin.command: >
+            openssl req -x509 -new -nodes -key {{ pki_dir }}/ca.key -sha256 -days 3650
+            -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN=Cyber Actors Local CA"
+            -out {{ pki_dir }}/ca.crt
+          args:
+            creates: "{{ pki_dir }}/ca.crt"
+          changed_when: true
+
+    - name: Server Cert - Genera chiave per ciascun nodo del cluster
+      ansible.builtin.command: "openssl genrsa -out {{ pki_dir }}/{{ item }}.key 2048"
+      args:
+        creates: "{{ pki_dir }}/{{ item }}.key"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+      changed_when: true
+
+    - name: Server Cert - Applica permessi restrittivi alle chiavi dei nodi
+      ansible.builtin.file:
+        path: "{{ pki_dir }}/{{ item }}.key"
+        owner: root
+        group: root
+        mode: "0600"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+
+    - name: Server Cert - Genera estensioni SAN dinamiche per ciascun nodo
+      ansible.builtin.copy:
+        dest: "{{ pki_dir }}/{{ item }}.ext"
+        mode: "0600"
+        content: |
+          authorityKeyIdentifier=keyid,issuer
+          basicConstraints=CA:FALSE
+          keyUsage = digitalSignature, nonRepudiation, keyEncipherment, dataEncipherment
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = {{ item }}
+          DNS.2 = {{ item | split('.') | first }}
+          DNS.3 = localhost
+          IP.1 = {{ hostvars[item]['ansible_facts']['default_ipv4']['address'] | default('127.0.0.1') }}
+          IP.2 = 127.0.0.1
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+
+    - name: Server Cert - Genera CSR per ciascun nodo del cluster
+      ansible.builtin.command: >
+        openssl req -new -key {{ pki_dir }}/{{ item }}.key -subj "/C=IT/ST=Lazio/L=Rome/O=Cyber Actors/CN={{ item }}"
+        -out {{ pki_dir }}/{{ item }}.csr
+      args:
+        creates: "{{ pki_dir }}/{{ item }}.csr"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+      changed_when: true
+
+    - name: Server Cert - Firma certificato per ciascun nodo usando la CA locale
+      ansible.builtin.command: >
+        openssl x509 -req -in {{ pki_dir }}/{{ item }}.csr -CA {{ pki_dir }}/ca.crt -CAkey {{ pki_dir }}/ca.key
+        -CAcreateserial -out {{ pki_dir }}/{{ item }}.crt -days 1825 -sha256 -extfile {{ pki_dir }}/{{ item }}.ext
+      args:
+        creates: "{{ pki_dir }}/{{ item }}.crt"
+      with_items: "{{ cluster_nodes }}"
+      when: inventory_hostname == ca_server
+      changed_when: true
+
+    - name: Certificati - Fetch dinamico verso il Control Node di tutti i certificati
+      ansible.builtin.fetch:
+        src: "{{ pki_dir }}/{{ item }}"
+        dest: "/tmp/ldap_certs_transit/{{ item }}"
+        flat: true
+      with_items:
+        - "ca.crt"
+        - "{{ cluster_nodes | map('regex_replace', '$', '.key') | list }}"
+        - "{{ cluster_nodes | map('regex_replace', '$', '.crt') | list }}"
+      loop_control:
+        extended: true
+      when: inventory_hostname == ca_server
+
+    - name: Certificati - Distribuzione e assegnazione permessi restrittivi (Hardened)
+      ansible.builtin.copy:
+        src: "/tmp/ldap_certs_transit/{{ item.src }}"
+        dest: "{{ item.dest }}"
+        owner: openldap
+        group: openldap
+        mode: "{{ item.mode }}"
+      with_items:
+        - { src: "ca.crt", dest: "{{ ssl_ca_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.crt", dest: "{{ ssl_cert_path }}", mode: "0644" }
+        - { src: "{{ inventory_hostname }}.key", dest: "{{ ssl_key_path }}", mode: "0600" }
+
+    - name: Certificati - Pulizia locale control node
+      delegate_to: localhost
+      become: false
+      ansible.builtin.file:
+        path: /tmp/ldap_certs_transit
+        state: absent
+      run_once: true
+
+    # =========================================================================
+    # FASE CLUSTER: LOGICA DI CONFIGURAZIONE BASE
+    # =========================================================================
+
+    - name: "Garantisci che slapd sia attivo per accettare configurazioni"
+      ansible.builtin.service:
+        name: slapd
+        state: started
+
+    - name: 2. Configurazione dei parametri di default in /etc/ldap/ldap.conf
+      ansible.builtin.blockinfile:
+        path: /etc/ldap/ldap.conf
+        block: |
+          BASE    {{ ldap_basedn }}
+          URI     ldaps://localhost
+          TLS_CACERT {{ ssl_ca_path }}
+          TLS_REQCERT demand
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - DEFAULT LDAP SETTINGS"
+
+    - name: 2b. Generazione LDIF configurazione livello Log avanzato (stats sync)
+      ansible.builtin.copy:
+        dest: /tmp/01_loglevel.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcLogLevel
+          olcLogLevel: stats sync
+
+    - name: 2c. Applicazione livello di log a cn=config
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_loglevel.ldif
+      register: log_init_result
+      failed_when: log_init_result.rc != 0
+      changed_when: true
+
+    - name: "2d. Tuning dei thread e limiti connessioni in cn=config"
+      ansible.builtin.copy:
+        dest: /tmp/01_threads_tuning.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcThreads
+          olcThreads: 16
+          -
+          replace: olcConnMaxPending
+          olcConnMaxPending: 200
+          -
+          replace: olcConnMaxPendingAuth
+          olcConnMaxPendingAuth: 50
+
+    - name: "2e. Applicazione tuning thread"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01_threads_tuning.ldif
+      register: threads_result
+      failed_when: threads_result.rc != 0
+      changed_when: true
+
+    # -------------------------------------------------------------------
+    # Hash della root password: generato UNA SOLA VOLTA (sul nodo
+    # coordinatore) e distribuito a tutti i nodi tramite hostvars, invece
+    # che rigenerato con un salt diverso da ciascun host ad ogni run.
+    # no_log:true su entrambi i task: il comando stesso contiene la
+    # password in chiaro nei suoi argomenti, e l'hash risultante non deve
+    # comparire nei log/output di Ansible.
+    # -------------------------------------------------------------------
+
+    - name: 3. Genera l'hash SSHA della password di root (solo sul nodo coordinatore)
+      ansible.builtin.command: "slappasswd -s {{ ldap_rootpw }}"
+      register: _root_pw_hash
+      changed_when: false
+      no_log: true
+      when: inventory_hostname == ca_server
+
+    - name: 4. Configurazione di base del database (suffix, rootDN, rootPW)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcSuffix: "{{ ldap_basedn }}"
+          olcRootDN: "{{ ldap_rootdn }}"
+          olcRootPW: "{{ hostvars[ca_server]._root_pw_hash.stdout }}"
+        state: exact
+      no_log: true
+
+    - name: A/B. Blocco dei Bind Anonimi a livello globale
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=config"
+        attributes:
+          olcRequires: "authc"
+          olcDisallows: "bind_anon"
+        state: present
+
+    - name: Enable ppolicy module
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "ppolicy"
+        state: present
+
+    - name: C/D. ACL Globali (SASL External a livello zero + protezione password/lockout)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcAccess:
+            - >-
+              {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by * break
+            - >-
+              {1}to dn.base="" by anonymous read by * read
+            - >-
+              {2}to dn.base="cn=Subschema" by anonymous read by * read
+            - >-
+              {3}to attrs=userPassword,pwdReset
+              by self write
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by * auth
+            - >-
+              {4}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
+              by self read
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by * none
+            - >-
+              {5}to dn.subtree="{{ ldap_basedn }}"
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by self write
+              by users read
+              by * none
+        state: exact
+        ordered: true
+
+    # =========================================================================
+    # INIZIALIZZAZIONE DEL DIT (Radice + Sottostruttura)
+    # Con l'ACL {0} sopra, il bind SASL/EXTERNAL come root peercred ha gia'
+    # "manage" su tutto il database: non serve piu' un bind semplice con
+    # rootdn/rootpw, e quindi la password di root non compare piu' in chiaro
+    # nella riga di comando (visibile in `ps aux` e nei log Ansible) in
+    # nessun task di questa fase.
+    # =========================================================================
+
+    - name: E/F. Crea la radice del DIT
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "{{ ldap_basedn }}"
+        objectClass:
+          - top
+          - dcObject
+          - organization
+        attributes:
+          o: "example.com"
+          dc: "example"
+        state: present
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2a. Crea le Organizational Unit di base
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "ou={{ item }},{{ ldap_basedn }}"
+        objectClass: organizationalUnit
+        attributes:
+          ou: "{{ item }}"
+        state: present
+      loop:
+        - system
+        - groups
+        - people
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2b. Crea il gruppo amministratori
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "{{ ldap_admin_group }}"
+        objectClass: groupOfNames
+        attributes:
+          cn: "administrators"
+          member: "cn=admin,{{ ldap_basedn }}"
+        state: present
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2b2. Crea ou=policies (contenitore Password Policy)
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "ou=policies,{{ ldap_basedn }}"
+        objectClass:
+          - top
+          - organizationalUnit
+        attributes:
+          ou: "policies"
+          description: "Container per le Password Policy di sicurezza"
+        state: present
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2b3. Crea la Password Policy 'default' con tutti i parametri
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=default,ou=policies,{{ ldap_basedn }}"
+        objectClass:
+          - top
+          - device
+          - pwdPolicy
+        attributes:
+          cn: "default"
+          pwdAttribute: "userPassword"
+          pwdMinLength: "12"
+          pwdCheckQuality: "1"
+          pwdMaxFailure: "5"
+          pwdLockout: "TRUE"
+          pwdLockoutDuration: "1800"
+          pwdAllowUserChange: "TRUE"
+          pwdMustChange: "TRUE"
+          pwdInHistory: "5"
+          pwdMaxAge: "7776000"
+          pwdMinAge: "0"
+          pwdGraceAuthNLimit: "5"
+          pwdFailureCountInterval: "30"
+          pwdSafeModify: "FALSE"
+        state: present
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: E2/F2c. Crea l'identità applicativa (mTLS) di ciascun nodo (cluster + readonly)
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn={{ item }},ou=system,{{ ldap_basedn }}"
+        objectClass: applicationProcess
+        attributes:
+          cn: "{{ item }}"
+        state: present
+      loop: "{{ (cluster_nodes + readonly_nodes) | unique }}"
+      run_once: true
+      delegate_to: "{{ ca_server }}"
+
+    - name: F3/F4. Generazione e applicazione Limiti Illimitati per tutti i nodi (Cluster + Readonly)
+      ansible.builtin.copy:
+        dest: /tmp/01f_limits_repl.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcLimits
+          {% set all_nodes = cluster_nodes + readonly_nodes %}
+          {% for node in all_nodes %}
+          olcLimits: {% raw %}{{% endraw %}{{ loop.index0 }}{% raw %}{% endraw %}}dn.exact="cn={{ node }},ou=system,{{ ldap_basedn }}" time.soft=unlimited time.hard=unlimited size.soft=unlimited size.hard=unlimited size.pr=unlimited size.prtotal=unlimited
+          {% endfor %}
+
+    - name: F4. Applicazione Limiti Replica
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/01f_limits_repl.ldif
+      register: limits_result
+      failed_when:
+        - limits_result.rc != 0
+        - "'Type or value exists' not in limits_result.stderr"
+      changed_when: true
+
+    # =========================================================================
+    # INIEZIONE PARAMETRI TLS, AUTHZREGEXP
+    # =========================================================================
+
+    - name: "[LDAPS] AuthzRegexp per i certificati mTLS + parametri TLS"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=config"
+        attributes:
+          olcAuthzRegexp: '"^cn=([^,]+),.*" "cn=$1,ou=system,{{ ldap_basedn }}"'
+          olcTLSVerifyClient: "try"
+          olcTLSCACertificateFile: "{{ ssl_ca_path }}"
+          olcTLSCertificateFile: "{{ ssl_cert_path }}"
+          olcTLSCertificateKeyFile: "{{ ssl_key_path }}"
+        state: exact
+
+    - name: 14. Configurazione ascolto slapd su tutte le interfacce di rete (PRIMA del riavvio)
+      ansible.builtin.lineinfile:
+        path: /etc/default/slapd
+        regexp: "^SLAPD_SERVICES="
+        line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
+
+    - name: "[FORZATURA] Riavvio completo per inizializzare i contesti Client TLS interni"
+      ansible.builtin.service:
+        name: slapd
+        state: restarted
+
+    ###########################################################################
+    # CONFIGURAZIONE MEMBEROF NESTED GROUP REFINT
+    # #########################################################################
+    # SCOPO:        Caricamento moduli e configurazione corretta di:
+    #               - memberof   {0}  (statico, diretto, locale al nodo, escluso
+    #                                   da replica; olcMemberOfRefInt: FALSE
+    #                                   perche' la referential integrity sui
+    #                                   valori "member"/"uniqueMember" e' delegata
+    #                                   all'overlay refint standalone qui sotto,
+    #                                   per evitare doppia gestione)
+    #               - refint     {1}  (referential integrity su member/
+    #                                   uniqueMember/manager/owner; NON su
+    #                                   memberOf, che resta di competenza
+    #                                   esclusiva di memberof)
+    #               - nestgroup  {2}  (espansione a query-time dei gruppi
+    #                                   annidati, nessuna scrittura, quindi
+    #                                   nativamente safe in MMR)
+    #               uso la class groupOfNames
+    #
+    # NOTA IMPORTANTE 1 (da fare a parte, non gestito da questo playbook):
+    #   memberOf va escluso dalla replica sulle stanze syncrepl di OGNI nodo
+    #   del mesh MMR, su TUTTI i collegamenti verso TUTTI i peer, es.:
+    #       olcSyncrepl: ... exattrs="memberOf"
+    #   Senza questa esclusione, su ogni singolo link, le scritture locali di
+    #   memberof entrano in conflitto con i valori replicati dagli altri master.
+    #
+    # NOTA IMPORTANTE 2:
+    #   syncprov va aggiunto per ultimo (istanza {3}) nel playbook successivo,
+    #   cosi' da catturare correttamente anche le modifiche derivate generate
+    #   internamente da memberof/refint.
+    #
+    # NOTA IMPORTANTE 3 (deprecazione):
+    #   La man page ufficiale di slapo-memberof(5) dichiara l'overlay deprecato
+    #   (sostituto raccomandato: dynlist) e ne sconsiglia esplicitamente l'uso
+    #   in ambienti replicati. La configurazione qui sotto (calcolo locale non
+    #   replicato) e' l'assetto che la documentazione stessa raccomanda quando
+    #   memberof deve comunque essere usato in MMR, ma va tenuto presente in
+    #   ottica di eventuale migrazione futura a dynlist/nestgroup.
+    # ==============================================================================
+
+    # --------------------------------------------------------------------
+    # MEMBEROF (livello diretto, write-time, locale al nodo) - istanza {0}
+    # --------------------------------------------------------------------
+
+    - name: "[MEMBEROF] Carica il modulo globale memberof"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "memberof"
+        state: present
+
+    - name: "[MEMBEROF] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcMemberOf
+        attributes:
+          olcOverlay: "{0}memberof"
+          olcMemberOfGroupOC: "groupOfNames"
+          olcMemberOfMemberAD: "member"
+          olcMemberOfMemberOfAD: "memberOf"
+          olcMemberOfDN: "cn=admin,{{ ldap_basedn }}"
+          # olcMemberOfRefInt FALSE: la pulizia di member/uniqueMember alla
+          # cancellazione di un'entry e' delegata all'overlay refint {1}
+          # sottostante, per evitare che due meccanismi scrivano sullo
+          # stesso attributo con logiche diverse.
+          olcMemberOfAddCheck: "TRUE"
+          olcMemberOfRefInt: "FALSE"
+          olcMemberOfDangling: "ignore"
+        state: present
+
+    # --------------------------------------------------------------------
+    # REFINT (referential integrity su member/uniqueMember/manager/owner,
+    # NON su memberOf) - istanza {1}
+    # --------------------------------------------------------------------
+
+    - name: "[REFINT] Carica il modulo globale refint"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "refint"
+        state: present
+
+    - name: "[REFINT] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={1}refint,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcRefintConfig
+        attributes:
+          olcOverlay: "{1}refint"
+          # Volutamente NON includere memberOf qui: e' gestito solo da
+          # memberof (overlay {0} sopra).
+          olcRefintAttribute:
+            - "member"
+            - "uniqueMember"
+            - "manager"
+            - "owner"
+          olcRefintModifiersName: "{{ ldap_rootdn }}"
+        state: present
+
+    # --------------------------------------------------------------------
+    # NESTGROUP (espansione annidamento a search-time, nessuna scrittura,
+    # richiede OpenLDAP >= 2.6.8, consigliata >= 2.6.9/2.6.10) - istanza {2}
+    # --------------------------------------------------------------------
+
+    - name: "[NESTGROUP] Carica il modulo globale nestgroup"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "nestgroup"
+        state: present
+
+    - name: "[NESTGROUP] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={2}nestgroup,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcNestGroupConfig
+        attributes:
+          olcOverlay: "{2}nestgroup"
+          # Sottoalbero che contiene le entry di tipo gruppo
+          olcNestGroupBase: "ou=groups,{{ ldap_basedn }}"
+          # Attributi coerenti con quelli usati da memberof sopra
+          olcNestGroupMember: "member"
+          olcNestGroupMemberOf: "memberOf"
+          # Valori come da man page slapo-nestgroup(5): tutto minuscolo
+          # ("memberof-...", non "memberOf-..."). Verificare con slaptest -u
+          # prima del deploy in produzione.
+          olcNestGroupFlags:
+            - "member-values"
+            - "member-filter"
+            - "memberof-values"
+            - "memberof-filter"
+        state: present
+
+    # --------------------------------------------------------------------
+    # PPOLICY - creato QUI (prima che ServerID/syncprov/syncrepl rendano il
+    # mesh "vivo" piu' sotto), non in un play separato su un mesh gia' in
+    # replica: e' esattamente questa la differenza che evita la contesa
+    # vista aggiungendo l'overlay a caldo. L'indice {3} e' deterministico
+    # in questo punto del play (memberof=0, refint=1, nestgroup=2 sono gia'
+    # stati creati poco sopra, in questo stesso play, senza alcun altro
+    # overlay che possa essersi inserito nel frattempo).
+    # --------------------------------------------------------------------
+
+    - name: "[PPOLICY] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={3}ppolicy,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcPPolicyConfig
+        attributes:
+          olcOverlay: "{3}ppolicy"
+          olcPPolicyDefault: "cn=default,ou=policies,{{ ldap_basedn }}"
+          olcPPolicyForwardUpdates: "TRUE"
+          olcPPolicyHashCleartext: "TRUE"
+        state: present
+
+    # --------------------------------------------------------------------
+
+    - name: "[RESTART] Riavvia slapd per applicare gli overlay"
+      ansible.builtin.systemd:
+        name: slapd
+        state: restarted
+
+    # =========================================================================
+    # PARAMETRI DI TUNING: INDICI E MAXSIZE
+    # IMPORTANTE: va applicato PRIMA di abilitare syncprov/syncrepl (piu' sotto).
+    # Cambiare olcDbIndex/olcDbMaxSize/olcDbNoSync su un database {1}mdb che
+    # ha gia' sessioni syncrepl "refreshAndPersist" attive verso gli altri
+    # master puo' bloccare slapd in attesa di un lock esclusivo che le
+    # connessioni di replica non rilasciano (mesh multi-master gia' "vivo").
+    # Tenendo il tuning qui, il database e' ancora "locale" e isolato quando
+    # viene modificato.
+    # =========================================================================
+
+    - name: G. Generazione LDIF per Indici, MaxSize e Tuning MDB (DB SYNC ATTIVO)
+      ansible.builtin.copy:
+        dest: /tmp/06_db_tuning.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcDbMaxSize
+          olcDbMaxSize: 32212254720
+          -
+          replace: olcDbNoSync
+          olcDbNoSync: TRUE
+          -
+          replace: olcDbIndex
+          olcDbIndex: objectClass eq
+          olcDbIndex: uid eq
+          olcDbIndex: cn eq,sub
+          olcDbIndex: member eq
+          olcDbIndex: memberUid eq
+          olcDbIndex: entryUUID eq
+          olcDbIndex: entryCSN eq
+          olcDbIndex: memberOf eq
+
+          dn: cn=config
+          changetype: modify
+          replace: olcWriteTimeout
+          olcWriteTimeout: 30
+
+    - name: H. Applicazione parametri di Tuning Database
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/06_db_tuning.ldif
+      register: tuning_result
+      failed_when:
+        - tuning_result.rc != 0
+        - "'Type or value exists' not in tuning_result.stderr"
+        - "'attribute OR type already exists' not in tuning_result.stderr"
+      changed_when: true
+
+    # =========================================================================
+    # BACKEND CN=MONITOR
+    # IMPORTANTE: come il tuning sopra, va creato PRIMA di abilitare
+    # syncprov/syncrepl (piu' sotto). Aggiungere un nuovo database a
+    # cn=config mentre il mesh multi-master ha gia' sessioni syncrepl
+    # "refreshAndPersist" attive puo' bloccare slapd in attesa di un lock
+    # che le connessioni di replica non rilasciano.
+    # =========================================================================
+
+    - name: 12. Generazione LDIF per inizializzazione/aggiornamento del backend cn=Monitor
+      ansible.builtin.copy:
+        dest: /tmp/05_monitor.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={2}monitor,cn=config
+          changetype: add
+          objectClass: olcDatabaseConfig
+          olcDatabase: {2}monitor
+          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+
+    - name: 13. Applicazione configurazione backend cn=Monitor
+      ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
+      register: monitor_result
+      failed_when:
+        - monitor_result.rc != 0
+        - "'Already exists' not in monitor_result.stderr"
+        - "'Type or value exists' not in monitor_result.stderr"
+        - "'only one monitor database allowed' not in monitor_result.stderr"
+      changed_when: true
+
+    # =========================================================================
+    # CONFIGURAZIONE REPLICA INTELLIGENTE VIA LDAPS (SASL / EXTERNAL) - DINAMICA
+    # Da qui in poi il mesh multi-master diventa "vivo": nessuna ulteriore
+    # modifica strutturale a cn=config dopo questo punto.
+    # =========================================================================
+
+    - name: "6. Generazione LDIF dinamico per ServerID globali in cn=config"
+      ansible.builtin.copy:
+        dest: /tmp/02_serverid.ldif
+        mode: "0600"
+        content: |
+          dn: cn=config
+          changetype: modify
+          replace: olcServerID
+          {% for node in cluster_nodes %}
+          olcServerID: {{ loop.index }} ldaps://{{ node }}
+          {% endfor %}
+
+    - name: "6b. Applicazione ServerID"
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/02_serverid.ldif
+      register: serverid_result
+      failed_when:
+        - serverid_result.rc != 0
+        - "'Type or value exists' not in serverid_result.stderr"
+        - "'Already exists' not in serverid_result.stderr"
+      changed_when: true
+
+    - name: "7. Caricamento modulo syncprov"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "syncprov"
+        state: present
+
+    - name: "8/9. Overlay syncprov sul database primario"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay=syncprov,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcSyncProvConfig
+        attributes:
+          olcOverlay: "syncprov"
+          # 2.000.000 (era 100.000): con dataset di scala (es. custom-scale,
+          # ~1.13M operazioni di appartenenza) il vecchio limite veniva
+          # superato durante un singolo import, costringendo i consumer che
+          # non stavano al passo a un refresh completo (fase di Present)
+          # invece del leggero catch-up via log (fase di Delete). Un margine
+          # ampio evita di ricadere in quello scenario per import di questa
+          # entita'.
+          olcSpSessionlog: "2000000"
+          olcSpCheckpoint: "1000 10"
+        state: present
+
+    - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (SASL EXTERNAL) - Completamente Dinamico
+      ansible.builtin.copy:
+        dest: /tmp/04_multimaster.ldif
+        mode: "0600"
+        content: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSyncRepl
+          {% for node in cluster_nodes %}
+          {% if node != inventory_hostname %}
+          olcSyncRepl: rid={{ "%03d" | format(loop.index) }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=3600 network-timeout=30 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand attrs="*,+" exattrs="memberOf"
+          {% endif %}
+          {% endfor %}
+          -
+          replace: olcMultiProvider
+          olcMultiProvider: TRUE
+
+    - name: 11. Applicazione configurazione Syncrepl e MultiProvider
+      ansible.builtin.command: ldapmodify -Y EXTERNAL -H ldapi:/// -f /tmp/04_multimaster.ldif
+      register: multimaster_result
+      failed_when: >
+        multimaster_result.rc != 0 and
+        'Already exists' not in multimaster_result.stderr and
+        'Duplicate' not in multimaster_result.stderr and
+        'typeIsCritical' not in multimaster_result.stderr and
+        'Type or value exists' not in multimaster_result.stderr
+      changed_when: true
+
+    # =========================================================================
+    # PULIZIA FINALE - gli LDIF temporanei possono contenere l'hash SSHA
+    # della root password: non vanno lasciati in /tmp.
+    # =========================================================================
+
+    - name: Pulizia - individua eventuali LDIF temporanei residui
+      ansible.builtin.find:
+        paths: /tmp
+        patterns: "*.ldif"
+      register: _tmp_ldifs
+
+    - name: Pulizia - rimuove gli LDIF temporanei residui
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ _tmp_ldifs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+  handlers:
+
+    - name: Ricarica systemd e riavvia slapd
+      ansible.builtin.systemd:
+        daemon_reload: true
+        name: slapd
+        state: restarted
+
+    - name: Riavvia Slapd
+      ansible.builtin.service:
+        name: slapd
+        state: restarted

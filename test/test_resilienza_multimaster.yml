@@ -1,0 +1,292 @@
+# ==============================================================================
+# TITOLO:  Test di resilienza multi-master OpenLDAP
+# SCOPO:   1) Ferma slapd su node1
+#          2) Crea un utente di test su node2 (con password)
+#          3) Verifica che la scrittura arrivi su node3 e su tutte le repliche
+#             read-only, nonostante node1 sia giu'
+#          4) Riavvia node1 e verifica che recuperi l'utente da solo (catch-up)
+#          5) Se tutti i controlli precedenti sono ok, cancella l'utente di
+#             test da node2 e verifica che la cancellazione si propaghi
+#             ovunque
+#
+# node1/node2/node3 sono determinati in modo deterministico da
+# groups['cluster'] ordinato alfabeticamente - stessa convenzione usata nei
+# play di deploy (ca_server/master_server).
+# ==============================================================================
+
+---
+# =============================================================================
+# STEP -1 - PRE-CLEANUP: rimuove un eventuale utente di test residuo da un
+# run precedente, prima ancora di iniziare. Tollerante: se l'utente non
+# esiste ("No such object"), non fallisce - è il caso normale.
+# =============================================================================
+- name: "STEP -1 - Pulizia preliminare (idempotenza)"
+  hosts: "{{ (groups['cluster'] | sort)[1] }}"
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+  tasks:
+    - name: Cancella l'utente di test se residuo da un run precedente
+      ansible.builtin.command: timeout 30 ldapdelete -Y EXTERNAL -H ldapi:/// "{{ test_user_dn }}"
+      register: precleanup_result
+      changed_when: precleanup_result.rc == 0
+      failed_when:
+        - precleanup_result.rc != 0
+        - "'No such object' not in precleanup_result.stderr"
+
+- name: "STEP -1b - Attendi che la pulizia preliminare si propaghi ovunque"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+  tasks:
+    - name: Attendi che l'utente sia assente su ogni nodo prima di iniziare
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base
+      register: precleanup_check
+      until: precleanup_check.rc != 0
+      retries: 12
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Fallisci se un nodo ha ancora l'utente residuo (impedirebbe un test pulito)
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} ha ancora {{ test_user_dn }} dopo la pulizia
+          preliminare - risolvi manualmente prima di rilanciare il test.
+      when: precleanup_check.rc == 0
+
+# =============================================================================
+# STEP 0 - BASELINE: conferma mirata che l'utente di test non sia già
+# presente (query diretta sul suo DN, non un conteggio dell'intero albero -
+# nessun rischio di size limit, qualunque sia il volume di dati nel DB)
+# =============================================================================
+- name: "STEP 0 - Baseline pre-test"
+  hosts: "{{ (groups['cluster'] | sort)[1] }}"
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+  tasks:
+    - name: Query mirata sull'utente di test (deve risultare assente a questo punto)
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base
+      register: baseline_check
+      failed_when: false
+      changed_when: false
+
+    - name: Mostra baseline
+      ansible.builtin.debug:
+        msg: >-
+          Baseline: {{ 'utente di test già presente (inatteso a questo punto)'
+          if baseline_check.rc == 0 else 'utente di test assente, come previsto' }}
+
+# =============================================================================
+# STEP 1 - FERMA SLAPD SU NODE1
+# =============================================================================
+- name: "STEP 1 - Ferma slapd su node1"
+  hosts: "{{ groups['cluster'] | sort | first }}"
+  become: true
+  tasks:
+    - name: Richiesta di stop
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: stopped
+      failed_when: false
+      # failed_when:false - lo stop di slapd puo' segnalare fallimento
+      # anche quando la richiesta e' comunque partita (bug noto di slapd
+      # sotto stress che non si ferma pulito entro il timeout dello
+      # script LSB) - il vero controllo e' pgrep, subito sotto.
+
+    - name: Attendi la finestra di chiusura pulita
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Verifica esplicita che nessun processo slapd sia rimasto vivo
+      ansible.builtin.command: pgrep -x slapd
+      register: node1_orphan_check
+      failed_when: false
+      changed_when: false
+      until: node1_orphan_check.rc != 0
+      retries: 3
+      delay: 5
+
+    - name: Forza la chiusura di un eventuale processo slapd orfano
+      ansible.builtin.command: pkill -9 -x slapd
+      when: node1_orphan_check.rc == 0
+      changed_when: true
+      failed_when: false
+
+    - name: Conferma finale che node1 sia davvero giu'
+      ansible.builtin.command: pgrep -x slapd
+      register: node1_final_check
+      failed_when: node1_final_check.rc == 0
+      changed_when: false
+      # Se questo fallisce, node1 NON e' davvero giu' - il test perderebbe
+      # di significato (STEP 2/3 presuppongono che node1 sia irraggiungibile).
+
+    - name: Conferma che node1 sia giu'
+      ansible.builtin.debug:
+        msg: "node1 ({{ inventory_hostname }}) fermato e verificato (nessun processo residuo)."
+
+# =============================================================================
+# STEP 2 - CREA UTENTE DI TEST SU NODE2 (CON PASSWORD)
+# =============================================================================
+- name: "STEP 2 - Crea utente di test su node2"
+  hosts: "{{ (groups['cluster'] | sort)[1] }}"
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+    test_user_pw: "TestPassword123!"
+  tasks:
+    - name: Genera LDIF per l'utente di test
+      ansible.builtin.copy:
+        dest: /tmp/resilience_test_user.ldif
+        mode: "0600"
+        content: |
+          dn: {{ test_user_dn }}
+          changetype: add
+          objectClass: top
+          objectClass: inetOrgPerson
+          cn: Resilience Test
+          sn: Test
+          userPassword: {{ test_user_pw }}
+
+    - name: Applica creazione utente (deve riuscire con node1 giu')
+      ansible.builtin.command: timeout 30 ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/resilience_test_user.ldif
+      register: create_result
+      changed_when: true
+
+    - name: Conferma locale su node2
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base
+      register: local_check
+      changed_when: false
+      failed_when: "'result: 0 Success' not in local_check.stdout"
+
+    - name: Pulizia LDIF temporaneo
+      ansible.builtin.file:
+        path: /tmp/resilience_test_user.ldif
+        state: absent
+
+# =============================================================================
+# STEP 3 - VERIFICA PROPAGAZIONE SU NODE3 E SU TUTTE LE REPLICHE READ-ONLY
+# =============================================================================
+- name: "STEP 3 - Verifica propagazione (node3 + repliche read-only)"
+  hosts:
+    - "{{ (groups['cluster'] | sort)[2] }}"
+    - readonlyreplica
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+    test_user_pw: "TestPassword123!"
+  tasks:
+    - name: Attendi la propagazione della entry (con retry, la replica non e' istantanea)
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base
+      register: propagation_check
+      until: "'result: 0 Success' in propagation_check.stdout"
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: Verifica che il bind con la password funzioni (hash arrivato integro)
+      ansible.builtin.command: >
+        timeout 10 ldapwhoami -x -D "{{ test_user_dn }}" -w "{{ test_user_pw }}"
+        -H ldaps://{{ inventory_hostname }}:636
+      register: bind_check
+      changed_when: false
+      failed_when: bind_check.rc != 0
+
+    - name: Report per nodo
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: entry presente, bind con password riuscito."
+
+# =============================================================================
+# STEP 4 - RIAVVIA NODE1, VERIFICA CATCH-UP AUTOMATICO
+# =============================================================================
+- name: "STEP 4 - Riavvia node1 e verifica il recupero automatico"
+  hosts: "{{ groups['cluster'] | sort | first }}"
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+  tasks:
+    - name: Riavvia slapd
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: started
+
+    - name: Attendi che slapd sia di nuovo responsivo
+      ansible.builtin.command: timeout 10 ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config -s base dn
+      register: slapd_ready
+      until: slapd_ready.rc == 0
+      retries: 15
+      delay: 5
+      changed_when: false
+
+    - name: Attendi che node1 recuperi l'utente da solo (catch-up automatico)
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base
+      register: catchup_check
+      until: "'result: 0 Success' in catchup_check.stdout"
+      retries: 12
+      delay: 5
+      changed_when: false
+
+    - name: Report
+      ansible.builtin.debug:
+        msg: "node1 ({{ inventory_hostname }}) ha recuperato l'utente autonomamente dopo il riavvio."
+
+# =============================================================================
+# STEP 5 - CLEANUP: CANCELLA L'UTENTE DI TEST DA NODE2, VERIFICA PROPAGAZIONE
+# =============================================================================
+- name: "STEP 5 - Cancella utente di test da node2"
+  hosts: "{{ (groups['cluster'] | sort)[1] }}"
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+  tasks:
+    - name: Cancella l'utente di test
+      ansible.builtin.command: timeout 30 ldapdelete -Y EXTERNAL -H ldapi:/// "{{ test_user_dn }}"
+      register: delete_result
+      changed_when: true
+
+- name: "STEP 5b - Verifica che la cancellazione si propaghi ovunque"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  vars:
+    ldap_basedn: "dc=example,dc=com"
+    test_user_dn: "cn=resilience-test,ou=people,{{ ldap_basedn }}"
+  tasks:
+    - name: Attendi che l'utente sparisca da ogni nodo
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base
+      register: delete_check
+      until: delete_check.rc != 0
+      retries: 12
+      delay: 5
+      changed_when: false
+      failed_when: false
+
+    - name: Report finale per nodo
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}:
+          {{ 'OK - utente rimosso correttamente' if delete_check.rc != 0
+             else 'ATTENZIONE - utente ancora presente dopo la cancellazione' }}
+
+    - name: Fallisci esplicitamente se un nodo non ha ricevuto la cancellazione
+      ansible.builtin.fail:
+        msg: "{{ inventory_hostname }} non ha ancora rimosso {{ test_user_dn }} dopo i retry disponibili."
+      when: delete_check.rc == 0

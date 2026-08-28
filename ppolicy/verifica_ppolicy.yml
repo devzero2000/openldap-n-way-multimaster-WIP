@@ -1,108 +1,259 @@
 # ==============================================================================
-# TITOLO:       Verifica Password Policy e Replicazione OpenLDAP Multi-Master (FIXED)
-# SCOPO:        Verificare che la PPolicy e l'overlay siano presenti e coerenti
-#               su tutti i nodi del cluster, gestendo gli errori di rete.
+# TITOLO:       Test Completo Password Policy e Replicazione Multi-Master
+# SCOPO:        1. Cleanup e creazione utente su Node1.
+#               2. Test vincolo Lunghezza Minima (pwdMinLength).
+#               3. Test Cronologia Password (pwdInHistory) verificata su Node2/3.
+#               4. Test Lockout Distribuito (pwdMaxFailure) su nodi incrociati.
+#               5. Cleanup finale.
+#
+# CORREZIONI rispetto alla versione precedente:
+# - ldaps:// (TLS) invece di ldap:// in chiaro per tutte le operazioni di rete
+#   che trasportano credenziali verso gli altri nodi (coerente col resto
+#   dell'infrastruttura, che non ha mai traffico LDAP in chiaro fra i nodi).
+# - Verifica lockout basata solo sul testo "Account locked", non piu' anche
+#   su rc==49 (Invalid Credentials) come alternativa sufficiente: rc==49 si
+#   verifica per QUALSIASI bind fallito con password sbagliata, non solo per
+#   un account bloccato - usarlo da solo avrebbe potuto dare falsi positivi.
+# - node1/other_nodes ora deterministici (groups['cluster'] | sort), coerenti
+#   con la stessa convenzione usata nei play di deploy.
+# - ou=people (quella creata dal deploy reale), non piu' ou=users (contenitore
+#   parallelo mai usato altrove).
+# - Niente piu' slappasswd con password in chiaro sulla riga di comando (visibile
+#   in ps aux, e senza no_log finiva anche nei log Ansible): l'entry viene
+#   creata con userPassword in chiaro, e' olcPPolicyHashCleartext=TRUE
+#   sull'overlay a farsi carico dell'hashing lato server.
 # ==============================================================================
 
 ---
-- name: Verifica Password Policy e Replica OpenLDAP
+- name: Test Completo Password Policy OpenLDAP Multi-Master
   hosts: cluster
   become: true
-  # Impostiamo un seriale per non saturare il cluster se il check è lento
-  serial: 1 
+  gather_facts: false
   vars:
     suffix: "dc=example,dc=com"
-    bind_dn: "cn=admin,{{ suffix }}"
+    bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
-    policy_dn: "cn=default,ou=policies,{{ suffix }}"
-    # N.B. Non hard-codiamo {1}mdb, usiamo la ricerca dinamica se possibile.
-    # Ma per un semplice check di esistenza, ldapi:/// col suffix è sufficiente.
+    ssl_ca_path: "/etc/ldap/sasl2/ca.crt"
+
+    test_user_dn: "cn=testuser,ou=people,{{ suffix }}"
+
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    node1: "{{ cluster_nodes[0] }}"
+    other_nodes: "{{ cluster_nodes[1:] }}"
 
   tasks:
     # ==========================================================================
-    # 1. VERIFICA LOCALE SU CN=CONFIG (Overlay)
+    # FASE 0: CLEANUP PREVENTIVO E CREAZIONE UTENTE
     # ==========================================================================
-    - name: "[LOCAL] Cerca l'overlay ppolicy in cn=config (ldapi)"
-      community.general.ldap_search:
-        server_uri: "ldapi:///"
-        sasl_class: "external"
-        dn: "cn=config"
-        filter: "(olcOverlay=ppolicy)" # Cerca l'overlay ppolicy indipendentemente dall'indice
-        scope: children # Cerca in tutta la sottostruttura di config
-      register: local_overlay_search
-      # Non falliamo qui, gestiamo l'assenza nel debug
-      failed_when: false 
 
-    - name: "[LOCAL] Report Stato Overlay Locale"
-      ansible.builtin.debug:
-        msg: >-
-          Stato Overlay ppolicy su cn=config: 
-          {{ 'TROVATO' if local_overlay_search.results is defined and local_overlay_search.results | length > 0 
-             else 'NON TROVATO o ERRORE' }}
-
-    # ==========================================================================
-    # 2. VERIFICA LOCALE SUI DATI (Policy Entry e pwdCheckQuality)
-    # ==========================================================================
-    - name: "[LOCAL] Cerca l'entry della Password Policy sul DB locale (ldapi)"
-      community.general.ldap_search:
+    - name: "[SETUP] Cleanup utente residuo da esecuzioni precedenti su node1"
+      community.general.ldap_entry:
         server_uri: "ldapi:///"
         bind_dn: "{{ bind_dn }}"
         bind_pw: "{{ bind_pw }}"
-        dn: "{{ policy_dn }}"
-        scope: "base"
-      register: local_policy_search
-      failed_when: false
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
 
-    - name: "[LOCAL] Report e Debug Parametri Policy Locale"
-      ansible.builtin.debug:
-        msg:
-          - "Stato Entry Policy 'default': {{ 'Trovata' if local_policy_search.results is defined and local_policy_search.results | length > 0 else 'ASSENTE' }}"
-          - "pwdMinLength: {{ local_policy_search.results[0].pwdMinLength | default('N/A') }}"
-          - "pwdCheckQuality: {{ local_policy_search.results[0].pwdCheckQuality | default('N/A') }}"
-          - "pwdLockout: {{ local_policy_search.results[0].pwdLockout | default('N/A') }}"
-      when: local_policy_search.results is defined and local_policy_search.results | length > 0
-
-    # ==========================================================================
-    # 3. VERIFICA CROSS-NODE / REPLICA (Ogni nodo interroga tutti gli ALTRI)
-    # ==========================================================================
-    - name: "[CROSS-CHECK] Interrogazione incrociata: Nodo {{ inventory_hostname }} interroga TUTTI i nodi"
-      community.general.ldap_search:
-        server_uri: "ldap://{{ item }}/"
+    - name: "[SETUP] Assicura la presenza di ou=people (gia' creata dal deploy)"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
         bind_dn: "{{ bind_dn }}"
         bind_pw: "{{ bind_pw }}"
-        dn: "{{ policy_dn }}"
-        scope: "base"
-      loop: "{{ groups['cluster'] }}"
-      register: cross_node_results
-      failed_when: false # Cruciale: se un nodo è giù, il task non deve fallire, registriamo l'errore
+        dn: "ou=people,{{ suffix }}"
+        objectClass: [top, organizationalUnit]
+        attributes: { ou: people }
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
 
-    - name: "[CROSS-CHECK] Report Esito Replica (Host per Host)"
-      ansible.builtin.debug:
-        msg: >-
-          Host {{ inventory_hostname }} -> Interrogando {{ item.item }}: 
-          {% if item.failed %}
-            CONNESSIONE FALLITA (Timeout o Host irraggiungibile)
-          {% elif item.results is defined and item.results | length > 0 %}
-            REPLICA OK (Policy trovata)
-          {% else %}
-            REPLICA FALLITA (Policy assente sul nodo remoto)
-          {% endif %}
-      loop: "{{ cross_node_results.results }}"
-      loop_control:
-        label: "{{ item.item }}"
+    - name: "[SETUP] Crea l'utente di test su node1 (userPassword in chiaro, hash lato server via ppolicy)"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        objectClass: [top, person, organizationalPerson, inetOrgPerson]
+        attributes:
+          cn: testuser
+          sn: Test
+          userPassword: "PasswordIniziale123!"
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
 
     # ==========================================================================
-    # 4. ASSERT FINALE DI COERENZA
+    # FASE 1: TEST LUNGHEZZA MINIMA (pwdMinLength = 12)
     # ==========================================================================
-    - name: "[ASSERT] Verifica consistenza stato policy sul nodo corrente"
+    - name: "[TEST 1 - LUNGHEZZA] Tenta di impostare una password troppo corta (< 12 car.) su node1"
+      community.general.ldap_passwd:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "PasswordIniziale123!"
+        dn: "{{ test_user_dn }}"
+        passwd: "Corta1!"
+      register: short_pw_test
+      ignore_errors: true
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
+
+    - name: "[VERIFICA 1] Valida che PPolicy blocchi la password troppo corta"
       ansible.builtin.assert:
         that:
-          # Il nodo locale deve avere l'overlay caricato
-          - local_overlay_search.results is defined and local_overlay_search.results | length > 0
-          # Il nodo locale deve avere la entry cn=default
-          - local_policy_search.results is defined and local_policy_search.results | length > 0
-          # La policy deve avere pwdCheckQuality attivo (impostato a 0)
-          - local_policy_search.results[0].pwdCheckQuality is defined
-          - local_policy_search.results[0].pwdCheckQuality | int >= 1
-        fail_msg: "CRITICO: Il nodo {{ inventory_hostname }} non ha la PPolicy coerente!"
-        success_msg: "OK: Il nodo {{ inventory_hostname }} è configurato correttamente."
+          - short_pw_test is failed
+        fail_msg: "ERRORE: La password troppo corta (< 12 car.) e' stata accettata da PPolicy!"
+        success_msg: "OK: PPolicy ha rifiutato correttamente la password troppo corta."
+      run_once: true
+
+    # ==========================================================================
+    # FASE 2: CAMBIO PASSWORD REGOLARE E TEST CRONOLOGIA (pwdInHistory = 5)
+    # ==========================================================================
+
+    - name: "[FASE 2] L'utente esegue un cambio password REGOLARE su node1"
+      community.general.ldap_passwd:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "PasswordIniziale123!"
+        dn: "{{ test_user_dn }}"
+        passwd: "NuovaPasswordValida456!"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
+
+    - name: "[PAUSA] Pausa per sincronizzazione syncrepl della nuova password e di pwdHistory"
+      ansible.builtin.pause:
+        seconds: 2
+      run_once: true
+
+    - name: "[TEST 2 - CRONOLOGIA] Tenta di riutilizzare la password VECCHIA ('PasswordIniziale123!') su un NODO SECONDARIO"
+      community.general.ldap_passwd:
+        server_uri: "ldaps://{{ item }}:636/"
+        ca_path: "{{ ssl_ca_path }}"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "NuovaPasswordValida456!"
+        dn: "{{ test_user_dn }}"
+        passwd: "PasswordIniziale123!"
+      loop: "{{ other_nodes }}"
+      register: history_pw_test
+      failed_when: false
+      run_once: true
+      no_log: true
+
+    - name: >-
+        [VERIFICA 2] Valida che l'attributo pwdHistory sia stato replicato
+        e la vecchia password rifiutata sui nodi secondari
+      ansible.builtin.assert:
+        that:
+          - item.details is defined
+          - "'Constraint violation' in item.details or 'Password is in history' in item.details"
+        fail_msg: "ERRORE: Il nodo {{ item.item }} ha permesso il riutilizzo della vecchia password! pwdHistory non si e' replicato."
+        success_msg: "OK: Replicazione pwdHistory verificata! Il nodo {{ item.item }} ha bloccato il riutilizzo della vecchia password."
+      loop: "{{ history_pw_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 3: TEST LOCKOUT DISTRIBUITO (pwdMaxFailure = 5 e pwdLockout = TRUE)
+    # ==========================================================================
+
+    - name: "[TEST 3 - LOCKOUT] Genera fallimenti di login distribuiti su tutti i nodi del cluster"
+      ansible.builtin.command: >
+        ldapsearch -H ldaps://{{ item }}:636/
+        -D "{{ test_user_dn }}"
+        -w "PasswordSbagliataErrata!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      loop: "{{ cluster_nodes }}"
+      register: failures_test
+      failed_when: false
+      run_once: true
+      changed_when: false
+      no_log: true
+      environment:
+        LDAPTLS_CACERT: "{{ ssl_ca_path }}"
+
+    - name: "[TEST 3 - LOCKOUT] Completa i tentativi falliti per superare la soglia (pwdMaxFailure=5) su node1"
+      ansible.builtin.command: >
+        ldapsearch -H ldaps://{{ node1 }}:636/
+        -D "{{ test_user_dn }}"
+        -w "PasswordSbagliataErrata!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      loop: [1, 2]
+      failed_when: false
+      run_once: true
+      changed_when: false
+      no_log: true
+      environment:
+        LDAPTLS_CACERT: "{{ ssl_ca_path }}"
+
+    # NOTA: OpenLDAP, per design di sicurezza, non distingue mai nel messaggio
+    # di errore un bind fallito per "account bloccato" da uno fallito per
+    # "password sbagliata" (entrambi restituiscono il generico "Invalid
+    # credentials (49)"), a meno di impostare esplicitamente
+    # olcPPolicyUseLockout: TRUE sull'overlay - cosa che qui NON facciamo di
+    # proposito, per non permettere a un attaccante di scoprire quali account
+    # sono bloccati/esistono tramite i messaggi di errore. La verifica del
+    # lockout va quindi fatta leggendo direttamente l'attributo
+    # pwdAccountLockedTime (bind da amministratore), non deducendolo dal
+    # messaggio di errore di un bind fallito.
+
+    - name: "[VERIFICA 3a] Attendi (con retry) che pwdAccountLockedTime si propaghi sul nodo secondario"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ test_user_dn }}" -s base pwdAccountLockedTime
+      register: locked_attr_check
+      delegate_to: "{{ other_nodes[0] }}"
+      until: "'pwdAccountLockedTime:' in locked_attr_check.stdout"
+      retries: 12
+      delay: 3
+      run_once: true
+      changed_when: false
+
+    - name: "[VERIFICA 3a] Valida che pwdAccountLockedTime sia presente e replicato sul nodo secondario"
+      ansible.builtin.assert:
+        that:
+          - "'pwdAccountLockedTime:' in locked_attr_check.stdout"
+        fail_msg: "ERRORE CRITICO: pwdAccountLockedTime non risulta impostato su {{ other_nodes[0] }} dopo i retry disponibili - il lockout non si e' replicato."
+        success_msg: "OK: Replicazione pwdAccountLockedTime verificata! L'account risulta BLOCCATO (attributo presente) anche sul nodo {{ other_nodes[0] }}."
+      run_once: true
+
+    - name: "[VERIFICA 3b] Conferma end-to-end: il bind con la password corretta deve comunque fallire (account bloccato)"
+      ansible.builtin.command: >
+        ldapsearch -H ldaps://{{ other_nodes[0] }}:636/
+        -D "{{ test_user_dn }}"
+        -w "NuovaPasswordValida456!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      register: lockout_check
+      failed_when: false
+      run_once: true
+      changed_when: false
+      no_log: true
+      environment:
+        LDAPTLS_CACERT: "{{ ssl_ca_path }}"
+
+    - name: "[VERIFICA 3b] Il bind con la password corretta deve comunque fallire (account bloccato)"
+      ansible.builtin.assert:
+        that:
+          - lockout_check.rc != 0
+        fail_msg: "ERRORE CRITICO: il bind con la password corretta e' riuscito su {{ other_nodes[0] }} nonostante l'account dovrebbe essere bloccato!"
+        success_msg: "OK: il bind e' stato correttamente rifiutato (il motivo esatto non e' rivelato per design di sicurezza)."
+      run_once: true
+
+    # ==========================================================================
+    # FASE 4: CLEANUP FINALE
+    # ==========================================================================
+
+    - name: "[CLEANUP] Rimuovi l'utente di test a fine esecuzione su node1"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true

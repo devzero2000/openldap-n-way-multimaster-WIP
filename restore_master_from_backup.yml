@@ -1,0 +1,70 @@
+---
+- name: Ripristino OpenLDAP su Master e piallatura delle Repliche
+  hosts: cluster
+  become: true
+  vars:
+    ldap_data_dir: "/var/lib/ldap"
+
+  pre_tasks:
+    - name: Verifica che la variabile backup_file sia stata definita
+      ansible.builtin.fail:
+        msg: "ERRORE: Devi specificare il file di backup. Usa: --extra-vars 'backup_file=/percorso/file.ldif'"
+      when: backup_file is not defined
+
+  tasks:
+
+    # --- 1. STOP DI SLAPD SU TUTTI I NODI ---
+    - name: "Arresto del servizio OpenLDAP (slapd)"
+      ansible.builtin.systemd:
+        name: slapd
+        state: stopped
+
+    # --- 2. OPERAZIONI SUI NODI MASTER ---
+    - name: Configurazione Nodi Master
+      when: inventory_hostname in groups['cluster']
+      block:
+        - name: "[Master] Rimozione del vecchio database LMDB"
+          ansible.builtin.file:
+            path: "{{ ldap_data_dir }}/data.mdb"
+            state: absent
+
+        - name: "[Master] Copia del file LDIF pulito sui server target"
+          ansible.builtin.copy:
+            src: "{{ backup_file }}"
+            dest: "/tmp/restore.ldif"
+            owner: openldap
+            group: openldap
+            mode: '0640'
+
+        - name: "[Master] Importazione dei dati tramite slapadd"
+          ansible.builtin.command: >
+            slapadd -v -l /tmp/restore.ldif
+          register: slapadd_result
+          changed_when: slapadd_result.rc == 0
+
+        - name: "[Master] Rimozione del file temporaneo LDIF"
+          ansible.builtin.file:
+            path: "/tmp/restore.ldif"
+            state: absent
+
+    # --- 3. OPERAZIONI SUI NODI READ-ONLY (PIALLATURA) ---
+    - name: Configurazione Nodi Read-Only
+      when: inventory_hostname in groups['readonlyreplica']
+      block:
+        - name: "[Read-Only] Rimozione totale del database per forzare il bootstrap automatico"
+          ansible.builtin.file:
+            path: "{{ ldap_data_dir }}/data.mdb"
+            state: absent
+
+    # --- 4. PERMESSI E AVVIO SU TUTTI I NODI ---
+    - name: "Ripristino dei permessi sulla directory LDAP"
+      ansible.builtin.file:
+        path: "{{ ldap_data_dir }}"
+        owner: openldap
+        group: openldap
+        recurse: true
+
+    - name: "Avvio del servizio OpenLDAP (slapd)"
+      ansible.builtin.systemd:
+        name: slapd
+        state: started

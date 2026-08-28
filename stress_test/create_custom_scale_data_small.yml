@@ -1,0 +1,199 @@
+# ==============================================================================
+# TITOLO:       Generazione Dataset RIDOTTO (MemberOf / Nested Group / Refint)
+# SCOPO:        Versione in scala ridotta, con namespace DISTINTO (csmall-*)
+#               dal dataset custom-scale a piena scala, per poter convivere
+#               per iterazioni rapide (con e senza simulazione WAN) invece
+#               che per il test di performance a piena scala. Stessa logica
+#               a 3 fasce del generatore completo, stessi overlay coinvolti
+#               (memberof, nestgroup, refint), ma numeri piccoli.
+#
+# IMPORTANTE: rispetto al generatore a piena scala, qui vengono aggiunte
+# APPARTENENZE ESPLICITE GARANTITE per gli utenti di test (oltre a quelle
+# casuali normali), perche' con assegnazione puramente casuale non c'e'
+# garanzia che una coppia utente/gruppo specifica esista - i play di verifica
+# hanno bisogno di relazioni note per testare in modo deterministico.
+# ==============================================================================
+---
+- name: "Generazione Dataset RIDOTTO (MemberOf / Nested Group / Refint)"
+  hosts: "{{ groups['cluster'] | sort | first }}"
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_path: "/tmp/custom_scale_data_small.ldif"
+    ldap_pw: "openldap"
+
+    # --- Dimensioni ridotte (stessa struttura del generatore a piena scala) ---
+    total_users: 100
+    nominal_users: 20
+    cloud_architects: 2
+    total_groups: 200
+
+    avg_groups_architect: 30
+    avg_groups_nominal: 8
+    avg_groups_technical: 15
+    group_count_variance: 0.3
+
+    deep_nesting_levels: 5
+    deep_nesting_target_user_index: 50      # utenza tecnica, ancora della catena
+    deep_nesting_root_groups: 2
+    deep_nesting_anchor_step: 20
+
+    random_seed: 42
+
+    # --- Appartenenze esplicite garantite per i test (vedi verify_*) ---
+    test_user_standard_index: 10            # nominale "normale"
+    test_user_architect_index: 1            # Cloud Architect
+    test_check_group_index: 10              # target_check_group per METRICA 3
+    test_refint_user_index: 15              # utente dedicato al test refint
+
+  tasks:
+    - name: "[TEMPLATING] Genera lo script Python per il dataset ridotto"
+      ansible.builtin.copy:
+        dest: /tmp/generate_custom_scale_ldif_small.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import hashlib
+          import base64
+          import os
+          import random
+
+          suffix = "{{ suffix }}"
+          total_users = {{ total_users }}
+          nominal_users = {{ nominal_users }}
+          cloud_architects = {{ cloud_architects }}
+          total_groups = {{ total_groups }}
+
+          avg_groups_architect = {{ avg_groups_architect }}
+          avg_groups_nominal = {{ avg_groups_nominal }}
+          avg_groups_technical = {{ avg_groups_technical }}
+          group_count_variance = {{ group_count_variance }}
+
+          deep_nesting_levels = {{ deep_nesting_levels }}
+          deep_nesting_target_user_index = {{ deep_nesting_target_user_index }}
+          deep_nesting_root_groups = {{ deep_nesting_root_groups }}
+          deep_nesting_anchor_step = {{ deep_nesting_anchor_step }}
+
+          test_user_standard_index = {{ test_user_standard_index }}
+          test_user_architect_index = {{ test_user_architect_index }}
+          test_check_group_index = {{ test_check_group_index }}
+          test_refint_user_index = {{ test_refint_user_index }}
+
+          random.seed({{ random_seed }})
+
+          assert cloud_architects <= nominal_users <= total_users
+          assert deep_nesting_target_user_index <= total_users
+          assert deep_nesting_root_groups * deep_nesting_anchor_step <= total_groups
+          assert test_check_group_index <= total_groups
+          assert test_refint_user_index <= total_users
+
+          def make_ssha_password(password_plain):
+              salt = os.urandom(4)
+              ctx = hashlib.sha1(password_plain.encode('utf-8'))
+              ctx.update(salt)
+              return "{SSHA}" + base64.b64encode(ctx.digest() + salt).decode('utf-8')
+
+          group_members = {i: [] for i in range(1, total_groups + 1)}
+
+          def assign_user_to_groups(user_dn, avg_count):
+              count = max(1, int(random.gauss(avg_count, avg_count * group_count_variance)))
+              count = min(count, total_groups)
+              for g in random.sample(range(1, total_groups + 1), count):
+                  group_members[g].append(user_dn)
+
+          with open("{{ ldif_path }}", "w") as f:
+              f.write(f"dn: ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: People\n\n")
+              f.write(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n\n")
+
+              for i in range(1, total_users + 1):
+                  username = f"csmall-user-{i}"
+                  dn = f"uid={username},ou=People,{suffix}"
+                  ssha_password = make_ssha_password(f"{username}.1")
+                  f.write(f"dn: {dn}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Custom User {i}\nsn: ScaleUser{i}\nuserPassword: {ssha_password}\n\n")
+
+                  if i <= cloud_architects:
+                      assign_user_to_groups(dn, avg_groups_architect)
+                  elif i <= nominal_users:
+                      assign_user_to_groups(dn, avg_groups_nominal)
+                  else:
+                      assign_user_to_groups(dn, avg_groups_technical)
+
+                  # Appartenenze ESPLICITE garantite per i test deterministici
+                  # (in aggiunta a quelle casuali sopra, non le sostituiscono -
+                  # ma con dedup: se il sorteggio casuale aveva GIA' scelto lo
+                  # stesso gruppo per questo utente, non lo si aggiunge una
+                  # seconda volta, altrimenti l'LDIF avrebbe un valore
+                  # "member:" duplicato nella stessa entry, rifiutato da
+                  # slapd con "value #0 provided more than once")
+                  if i == test_user_standard_index:
+                      if dn not in group_members[test_check_group_index]:
+                          group_members[test_check_group_index].append(dn)
+                  if i == test_refint_user_index:
+                      # aggiunto esplicitamente ad almeno 3 gruppi noti, per
+                      # avere piu' punti da verificare dopo la cancellazione
+                      for g in (1, 2, 3):
+                          if dn not in group_members[g]:
+                              group_members[g].append(dn)
+
+              target_user_dn = f"uid=csmall-user-{deep_nesting_target_user_index},ou=People,{suffix}"
+              for d in range(deep_nesting_levels, 0, -1):
+                  group_name = f"cn=csmall-deep-tier-{d},ou=groups,{suffix}"
+                  f.write(f"dn: {group_name}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: csmall-deep-tier-{d}\ndescription: Livello profondo {d}\n")
+                  if d == deep_nesting_levels:
+                      f.write(f"member: {target_user_dn}\n")
+                  else:
+                      f.write(f"member: cn=csmall-deep-tier-{d+1},ou=groups,{suffix}\n")
+                  f.write("\n")
+
+              for i in range(1, total_groups + 1):
+                  f.write(f"dn: cn=csmall-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=csmall-group-{i}\ndescription: Gruppo custom {i}\n")
+                  members = group_members[i]
+                  if not members:
+                      members = [f"cn=admin,{suffix}"]
+                  for member_dn in members:
+                      f.write(f"member: {member_dn}\n")
+                  f.write("\n")
+
+              # Gruppi Radice: l'anchor_group=1 (il primo) include ESPLICITAMENTE
+              # l'architect di test, cosi' METRICA 4 (espansione annidata) ha
+              # sempre una relazione nota da verificare
+              architect_dn = f"uid=csmall-user-{test_user_architect_index},ou=People,{suffix}"
+              for i in range(1, deep_nesting_root_groups + 1):
+                  anchor_group = i * deep_nesting_anchor_step
+                  f.write(f"dn: cn=csmall-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=csmall-root-deep-{i}\ndescription: Radice profonda {i}\n")
+                  f.write(f"member: cn=csmall-deep-tier-1,ou=groups,{suffix}\n")
+                  f.write(f"member: cn=csmall-group-{anchor_group},ou=groups,{suffix}\n")
+                  if i == 1:
+                      f.write(f"member: {architect_dn}\n")
+                  f.write("\n")
+
+    - name: "[EXECUTE] Esegui script di generazione LDIF"
+      ansible.builtin.command: python3 /tmp/generate_custom_scale_ldif_small.py
+      changed_when: true
+
+    - name: "[IMPORT] Inietta il dataset ridotto nel cluster (cronometrato: costo memberof in scrittura)"
+      ansible.builtin.shell: >
+        time timeout 300 ldapmodify -a -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
+      args:
+        executable: /bin/bash
+      register: ldapadd_res
+      changed_when: true
+      failed_when: >
+        ldapadd_res.rc != 0 and
+        (ldapadd_res.stderr_lines
+          | select('match', '^ldap_add:')
+          | reject('search', 'Already exists')
+          | list
+          | length > 0)
+
+    - name: "[REPORT] Tempo di import"
+      ansible.builtin.debug:
+        msg: "{{ ldapadd_res.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+
+    - name: "[CLEANUP] Rimuovi script e LDIF temporanei"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_custom_scale_ldif_small.py"
+        - "{{ ldif_path }}"

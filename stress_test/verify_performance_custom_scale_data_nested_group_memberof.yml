@@ -1,9 +1,14 @@
 # ==============================================================================
 # TITOLO:       Test di Performance Dataset Custom (MemberOf + Nested Group)
+#
+# Le identita' di test (indici 1, 100, 5000) assumono il modello a fasce del
+# play di creazione: utente 1 e' un Cloud Architect (fino a ~300 gruppi),
+# utente 100 e' un nominale "normale" (~50 gruppi), utente 5000 e' un'utenza
+# tecnica (~150 gruppi) ed e' anche l'anchor della catena di deep nesting.
 # ==============================================================================
 ---
 - name: "Validazione Performance Estesa su Cluster (MemberOf + Nested Group Scale)"
-  hosts: cluster
+  hosts: ldap_all
   become: true
   vars:
     suffix: "dc=example,dc=com"
@@ -14,57 +19,115 @@
     test_user_deep: "uid=custom-scale-user-5000,ou=People,dc=example,dc=com"
     test_user_deep_pw: "custom-scale-user-5000.1"
     target_deep_root_group: "cn=custom-scale-root-deep-1,ou=groups,{{ suffix }}"
-    target_small_group: "cn=custom-scale-group-500,ou=groups,{{ suffix }}"
     target_check_group: "cn=custom-scale-group-100,ou=groups,{{ suffix }}"
 
   tasks:
 
+    - name: "[SETUP] Verifica presenza del comando 'time' (GNU time, non il builtin di shell)"
+      ansible.builtin.command: which time
+      register: time_bin_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SETUP] Installa il pacchetto 'time' se assente (serve per le metriche sotto)"
+      ansible.builtin.apt:
+        name: time
+        state: present
+      when: time_bin_check.rc != 0
+
+    # NOTA: qui uso ansible.builtin.shell (non command) perche' "time" e' quasi
+    # sempre un builtin di shell - command non passa mai per una shell e non lo
+    # troverebbe come binario standalone. Il report finale legge
+    # "stderr_lines", dove sia il builtin di bash sia /usr/bin/time scrivono
+    # il proprio output per default.
+    #
+    # -x forza il simple bind: senza, i tool ldap* di OpenLDAP tentano SASL di
+    # default, e -D/-w da soli non bastano a selezionare il simple bind.
+    #
+    # ldapi:/// (socket Unix locale) al posto di ldap://localhost: oltre a non
+    # esporre credenziali in chiaro sulla rete (anche solo in loopback), evita
+    # l'overhead dello stack TCP nella misura di latenza - piu' rappresentativo
+    # del costo реale della query lato server.
+    #
+    # no_log:true su tutti i task che contengono password sulla riga di comando.
+
     - name: "[METRICA 1] Lettura istantanea attributo persistente memberOf su utente standard"
-      ansible.builtin.command: >
-        time ldapsearch -H ldap://localhost -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
         -b "{{ test_user_standard }}" -s base "(objectClass=*)" memberOf
+      args:
+        executable: /bin/bash
       register: query_1_time
       changed_when: false
+      no_log: true
 
     - name: "[METRICA 2] Lettura attributo persistente memberOf su Cloud Architect (~300 gruppi)"
-      ansible.builtin.command: >
-        time ldapsearch -H ldap://localhost -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
         -b "{{ test_user_architect }}" -s base "(objectClass=*)" memberOf
+      args:
+        executable: /bin/bash
       register: query_2_time
       changed_when: false
+      no_log: true
 
     - name: "[METRICA 3] Verifica puntuale utente-gruppo tramite attributo persistente (Filtro combinato)"
-      ansible.builtin.command: >
-        time ldapsearch -H ldap://localhost -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
         -b "ou=People,{{ suffix }}" -s sub "(&(uid=custom-scale-user-100)(memberOf={{ target_check_group }}))" dn
+      args:
+        executable: /bin/bash
       register: query_3_time
       changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA 3] La coppia utente-100/gruppo-100 garantita deve risultare presente"
+      ansible.builtin.assert:
+        that:
+          - "'uid=custom-scale-user-100,' in query_3_time.stdout"
+        fail_msg: "ERRORE: la coppia utente-100/gruppo-100 garantita dal generatore non risulta - dato mancante o memberof non coerente."
+        success_msg: "OK: coppia utente-gruppo garantita trovata correttamente."
 
     - name: "[METRICA 4] Query inversa per utenti ereditati nel gruppo radice profondo (Nested Expansion)"
-      ansible.builtin.command: >
-        time ldapsearch -H ldap://localhost -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
         -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ target_deep_root_group }}))" dn
+      args:
+        executable: /bin/bash
       register: query_4_time
       changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA 4] L'architect garantito deve comparire nell'espansione nidificata"
+      ansible.builtin.assert:
+        that:
+          - "'uid=custom-scale-user-1,' in query_4_time.stdout"
+        fail_msg: "ERRORE: l'architect di test non compare nell'espansione nidificata sotto {{ target_deep_root_group }} - dato mancante o nestgroup non coerente."
+        success_msg: "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
 
     - name: "[METRICA 5] Estrazione memberOf su utente in fondo alla catena di deep nesting (15 livelli)"
-      ansible.builtin.command: >
-        time ldapsearch -H ldap://localhost -D "{{ test_user_deep }}" -w "{{ test_user_deep_pw }}"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_deep }}" -w "{{ test_user_deep_pw }}"
         -b "{{ test_user_deep }}" -s base "(objectClass=*)" memberOf
+      args:
+        executable: /bin/bash
       register: query_5_time
       changed_when: false
+      no_log: true
 
     - name: "[METRICA 6] Ispezione membri strutturali diretti del gruppo radice complesso"
-      ansible.builtin.command: >
-        time ldapsearch -H ldap://localhost -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
         -b "{{ target_deep_root_group }}" -s base "(objectClass=*)" member
+      args:
+        executable: /bin/bash
       register: query_6_time
       changed_when: false
+      no_log: true
 
     - name: "[STABILITÀ] Controllo sincronizzazione Multi-Master (contextCSN)"
       ansible.builtin.command: >
-        ldapsearch -H ldap://localhost -D "cn=admin,{{ suffix }}" -w "openldap"
-        -b "{{ suffix }}" -s base "(objectClass=*)" contextCSN
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ suffix }}" -s base "(objectClass=*)" contextCSN
       register: context_csn_res
       changed_when: false
 
@@ -77,12 +140,12 @@
       ansible.builtin.debug:
         msg:
           - "=================================================================="
-          - " REPORT PERFORMANCE (SCALE 8k/30k + DEEP - MEMBEROF / NESTED)     "
+          - " REPORT PERFORMANCE (MEMBEROF / NESTED - MODELLO A FASCE)         "
           - "=================================================================="
           - "1. Dimensione fisica database LMDB su disco:"
           - "{{ mdb_disk_size.stdout }}"
           - "------------------------------------------------------------------"
-          - "2. Latenza lettura memberOf persistente su utente standard:"
+          - "2. Latenza lettura memberOf persistente su utente standard (~50 gruppi):"
           - "{{ query_1_time.stderr_lines }}"
           - "------------------------------------------------------------------"
           - "3. Latenza lettura memberOf persistente su Cloud Architect (~300 gruppi):"
@@ -94,7 +157,7 @@
           - "5. Latenza query inversa ricorsiva (Deep Root MemberOf Expansion):"
           - "{{ query_4_time.stderr_lines }}"
           - "------------------------------------------------------------------"
-          - "6. Latenza lettura memberOf su utente in fondo alla catena di deep nesting:"
+          - "6. Latenza lettura memberOf su utente tecnico in fondo alla catena di deep nesting (~150 gruppi):"
           - "{{ query_5_time.stderr_lines }}"
           - "------------------------------------------------------------------"
           - "7. Latenza lettura membri strutturali diretti del gruppo radice complesso:"
