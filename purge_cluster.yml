@@ -82,7 +82,6 @@
         state: absent
       with_fileglob:
         - /tmp/0*.ldif
-        - /tmp/ldap_certs_transit/*
 
     # =========================================================================
     # FASE DI RE-INIZIALIZZAZIONE PULITA

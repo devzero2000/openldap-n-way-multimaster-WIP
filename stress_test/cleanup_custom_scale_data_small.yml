@@ -1,0 +1,88 @@
+# ==============================================================================
+# TITOLO:       Pulizia Dataset RIDOTTO (MemberOf / Nested Group / Refint)
+# ==============================================================================
+---
+- name: "Pulizia Dataset RIDOTTO (MemberOf / Nested Group / Refint)"
+  hosts: "{{ groups['cluster'] | sort | first }}"
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_path: "/tmp/custom_scale_delete_small.ldif"
+    ldap_pw: "openldap"
+
+    # Devono coincidere con create_custom_scale_data_small.yml
+    total_users: 100
+    total_groups: 200
+    deep_nesting_levels: 5
+    deep_nesting_root_groups: 2
+
+  tasks:
+    - name: "[TEMPLATING] Genera script Python per la rimozione selettiva"
+      ansible.builtin.copy:
+        dest: /tmp/generate_custom_scale_delete_small.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          suffix = "{{ suffix }}"
+          total_users = {{ total_users }}
+          total_groups = {{ total_groups }}
+          deep_nesting_levels = {{ deep_nesting_levels }}
+          deep_nesting_root_groups = {{ deep_nesting_root_groups }}
+
+          with open("{{ ldif_path }}", "w") as f:
+              for i in range(1, deep_nesting_root_groups + 1):
+                  f.write(f"dn: cn=csmall-root-deep-{i},ou=groups,{suffix}\nchangetype: delete\n\n")
+
+              for i in range(total_groups, 0, -1):
+                  f.write(f"dn: cn=csmall-group-{i},ou=groups,{suffix}\nchangetype: delete\n\n")
+
+              for d in range(deep_nesting_levels, 0, -1):
+                  f.write(f"dn: cn=csmall-deep-tier-{d},ou=groups,{suffix}\nchangetype: delete\n\n")
+
+              for i in range(1, total_users + 1):
+                  f.write(f"dn: uid=csmall-user-{i},ou=People,{suffix}\nchangetype: delete\n\n")
+
+    - name: "[EXECUTE] Genera file LDIF di cancellazione"
+      ansible.builtin.command: python3 /tmp/generate_custom_scale_delete_small.py
+      changed_when: true
+
+    - name: "[APPLY] Esegui la rimozione dal cluster (cronometrato: costo memberof in cancellazione)"
+      ansible.builtin.shell: >
+        time timeout 300 ldapmodify -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
+      args:
+        executable: /bin/bash
+      register: ldapdel_res
+      changed_when: true
+      failed_when: >
+        ldapdel_res.rc != 0 and
+        (ldapdel_res.stderr_lines
+          | select('match', '^ldap_delete:')
+          | reject('search', 'No such object')
+          | list
+          | length > 0)
+
+    - name: "[REPORT] Tempo di cancellazione"
+      ansible.builtin.debug:
+        msg: "{{ ldapdel_res.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+
+    - name: "[VERIFICA] Conferma che il dataset ridotto sia stato rimosso completamente"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ suffix }}" -s sub
+        "(|(cn=csmall-*)(uid=csmall-*))" dn
+      register: leftover_check
+      changed_when: false
+
+    - name: "[VERIFICA] Nessuna entry residua del dataset ridotto"
+      ansible.builtin.assert:
+        that:
+          - "'numEntries' not in leftover_check.stdout or 'numEntries: 0' in leftover_check.stdout"
+        fail_msg: "ATTENZIONE: risultano ancora entry csmall-* dopo la pulizia del dataset ridotto."
+        success_msg: "OK: nessuna entry residua del dataset ridotto."
+
+    - name: "[CLEANUP] Rimuovi file temporanei"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_custom_scale_delete_small.py"
+        - "{{ ldif_path }}"

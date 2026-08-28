@@ -1,6 +1,6 @@
 ---
 - name: Validazione e Test Cluster OpenLDAP Multi-Master 3-Way over LDAPS
-  hosts: cluster
+  hosts: ldap_all
   become: true
   vars:
     ldap_basedn: "dc=example,dc=com"

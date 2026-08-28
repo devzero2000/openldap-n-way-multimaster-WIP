@@ -10,7 +10,7 @@
 
 ---
 - name: "Gestione Cluster: Riavvio OpenLDAP"
-  hosts: cluster
+  hosts: ldap_all
   become: true
   gather_facts: false # Velocizza l'esecuzione saltando il recupero dei facts
 

@@ -1,0 +1,239 @@
+# ==============================================================================
+# TITOLO:       Verifica Dataset RIDOTTO (MemberOf + Nested Group + Refint)
+# SCOPO:        Stesse metriche di lettura del play di verifica a piena scala
+#               (memberof/nestgroup), piu' un test dedicato di refint:
+#               cancella UN utente (non tutti), verifica che i gruppi che lo
+#               referenziavano abbiano perso il riferimento pendente, poi lo
+#               ricrea per lasciare il dataset intatto per run successivi.
+#
+# Le relazioni di test (utente standard nel gruppo target, architect sotto il
+# gruppo radice, utente refint in 3 gruppi noti) sono GARANTITE dal generatore
+# ridotto (create_custom_scale_data_small.yml) - non presuppongono nulla di
+# casuale.
+# ==============================================================================
+---
+- name: "Validazione Dataset RIDOTTO (MemberOf + Nested Group + Refint)"
+  hosts: ldap_all
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    admin_dn: "cn=admin,dc=example,dc=com"
+    admin_pw: "openldap"
+
+    test_user_standard: "uid=csmall-user-10,ou=People,dc=example,dc=com"
+    test_user_standard_pw: "csmall-user-10.1"
+    test_user_architect: "uid=csmall-user-1,ou=People,dc=example,dc=com"
+    test_user_architect_pw: "csmall-user-1.1"
+    test_user_deep: "uid=csmall-user-50,ou=People,dc=example,dc=com"
+    test_user_deep_pw: "csmall-user-50.1"
+
+    target_deep_root_group: "cn=csmall-root-deep-1,ou=groups,{{ suffix }}"
+    target_check_group: "cn=csmall-group-10,ou=groups,{{ suffix }}"
+
+    refint_test_user_dn: "uid=csmall-user-15,ou=People,{{ suffix }}"
+    refint_test_user_pw: "csmall-user-15.1"
+    refint_test_groups:
+      - "cn=csmall-group-1,ou=groups,{{ suffix }}"
+      - "cn=csmall-group-2,ou=groups,{{ suffix }}"
+      - "cn=csmall-group-3,ou=groups,{{ suffix }}"
+
+  tasks:
+
+    - name: "[SETUP] Verifica presenza del comando 'time'"
+      ansible.builtin.command: which time
+      register: time_bin_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SETUP] Installa il pacchetto 'time' se assente"
+      ansible.builtin.apt:
+        name: time
+        state: present
+      when: time_bin_check.rc != 0
+
+    # =========================================================================
+    # PARTE 1: MEMBEROF + NESTGROUP (lettura) - stesse metriche del play a
+    # piena scala, ora garantite deterministiche dal generatore
+    # =========================================================================
+
+    - name: "[METRICA 1] Lettura memberOf persistente su utente standard"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
+        -b "{{ test_user_standard }}" -s base "(objectClass=*)" memberOf
+      args:
+        executable: /bin/bash
+      register: query_1_time
+      changed_when: false
+      no_log: true
+
+    - name: "[METRICA 2] Lettura memberOf persistente su Cloud Architect"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
+        -b "{{ test_user_architect }}" -s base "(objectClass=*)" memberOf
+      args:
+        executable: /bin/bash
+      register: query_2_time
+      changed_when: false
+      no_log: true
+
+    - name: "[METRICA 3] Verifica puntuale utente-gruppo (garantita dal generatore)"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(uid=csmall-user-10)(memberOf={{ target_check_group }}))" dn
+      register: query_3_result
+      changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA 3] La coppia utente/gruppo garantita deve risultare presente"
+      ansible.builtin.assert:
+        that:
+          - "'numEntries: 1' in query_3_result.stdout"
+        fail_msg: "ERRORE: la coppia utente-10/gruppo-10 garantita dal generatore non risulta - memberof non coerente."
+        success_msg: "OK: coppia utente-gruppo garantita trovata correttamente."
+
+    - name: "[METRICA 4] Query inversa nested expansion sotto il gruppo radice (architect garantito)"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldapi:/// -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
+        -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberof={{ target_deep_root_group }}))" dn
+      register: query_4_result
+      changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA 4] L'architect garantito deve comparire nell'espansione nidificata"
+      ansible.builtin.assert:
+        that:
+          - "'uid=csmall-user-1,' in query_4_result.stdout"
+        fail_msg: "ERRORE: l'architect di test non compare nell'espansione nidificata sotto {{ target_deep_root_group }} - nestgroup non coerente."
+        success_msg: "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+
+    - name: "[METRICA 5] memberOf su utente in fondo alla catena di deep nesting"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_deep }}" -w "{{ test_user_deep_pw }}"
+        -b "{{ test_user_deep }}" -s base "(objectClass=*)" memberOf
+      args:
+        executable: /bin/bash
+      register: query_5_time
+      changed_when: false
+      no_log: true
+
+    - name: "[METRICA 6] Membri strutturali diretti del gruppo radice"
+      ansible.builtin.shell: >
+        time ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
+        -b "{{ target_deep_root_group }}" -s base "(objectClass=*)" member
+      args:
+        executable: /bin/bash
+      register: query_6_time
+      changed_when: false
+      no_log: true
+
+    # =========================================================================
+    # PARTE 2: TEST DEDICATO REFINT - cancella UN utente, verifica pulizia
+    # dei riferimenti pendenti nei gruppi che lo referenziavano, poi lo
+    # ricrea. Eseguito UNA SOLA VOLTA (run_once), delegato al primo master.
+    # =========================================================================
+
+    - name: "[REFINT] Verifica che l'utente di test sia presente nei 3 gruppi noti PRIMA della cancellazione"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ item }}" -s base member
+      register: refint_before
+      loop: "{{ refint_test_groups }}"
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster'] | sort | first }}"
+
+    - name: "[REFINT] Assert - il riferimento deve esistere PRIMA della cancellazione"
+      ansible.builtin.assert:
+        that:
+          - "refint_test_user_dn in item.stdout"
+        fail_msg: "SETUP ERRATO: {{ refint_test_user_dn }} non risulta membro di {{ item.item }} prima del test - il generatore non ha applicato la garanzia esplicita."
+      loop: "{{ refint_before.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[REFINT] Cancella l'utente di test (cronometrato)"
+      ansible.builtin.shell: >
+        time timeout 60 ldapdelete -Y EXTERNAL -H ldapi:/// "{{ refint_test_user_dn }}"
+      args:
+        executable: /bin/bash
+      register: refint_delete_res
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ groups['cluster'] | sort | first }}"
+
+    - name: "[REFINT REPORT] Tempo di cancellazione (costo refint su 3 gruppi)"
+      ansible.builtin.debug:
+        msg: "{{ refint_delete_res.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+      run_once: true
+
+    - name: "[REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ item }}" -s base member
+      register: refint_after
+      loop: "{{ refint_test_groups }}"
+      until: refint_test_user_dn not in refint_after.stdout
+      retries: 12
+      delay: 3
+      changed_when: false
+      run_once: true
+      delegate_to: "{{ groups['cluster'] | sort | first }}"
+
+    - name: "[VERIFICA REFINT] Il riferimento pendente deve essere sparito da tutti e 3 i gruppi"
+      ansible.builtin.assert:
+        that:
+          - "refint_test_user_dn not in item.stdout"
+        fail_msg: "ERRORE: {{ item.item }} ha ancora un riferimento pendente a {{ refint_test_user_dn }} dopo la cancellazione - refint non ha ripulito."
+        success_msg: "OK: {{ item.item }} ripulito correttamente da refint."
+      loop: "{{ refint_after.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[REFINT] Ricrea l'utente di test (lascia il dataset intatto per run successivi)"
+      ansible.builtin.command: >
+        ldapadd -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: {{ refint_test_user_dn }}
+          objectClass: top
+          objectClass: inetOrgPerson
+          uid: csmall-user-15
+          cn: Custom User 15
+          sn: ScaleUser15
+          userPassword: {{ refint_test_user_pw }}
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ groups['cluster'] | sort | first }}"
+
+    - name: "[REFINT] Ri-aggiungi l'utente ricreato ai 3 gruppi noti (refint lo aveva rimosso, era corretto farlo)"
+      ansible.builtin.command: >
+        ldapmodify -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: {{ item }}
+          changetype: modify
+          add: member
+          member: {{ refint_test_user_dn }}
+      loop: "{{ refint_test_groups }}"
+      changed_when: true
+      run_once: true
+      delegate_to: "{{ groups['cluster'] | sort | first }}"
+
+    # =========================================================================
+    # REPORT FINALE
+    # =========================================================================
+
+    - name: "[REPORT] Riepilogo dataset ridotto"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " REPORT DATASET RIDOTTO - MEMBEROF / NESTGROUP / REFINT           "
+          - "=================================================================="
+          - "1. memberOf utente standard: {{ query_1_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+          - "2. memberOf Cloud Architect:  {{ query_2_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+          - "3. Coppia utente/gruppo garantita: OK"
+          - "4. Espansione nidificata (nestgroup) sotto gruppo radice: OK"
+          - "5. memberOf utente deep-nesting: {{ query_5_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+          - "6. Membri diretti gruppo radice: {{ query_6_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+          - "7. Refint (cancellazione + pulizia riferimenti su 3 gruppi): OK"
+          - "=================================================================="

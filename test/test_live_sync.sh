@@ -2,7 +2,7 @@
 
 # Configurazione
 BASE_DN="dc=example,dc=com"
-USER_DN="cn=sync-test-user,ou=users,$BASE_DN"
+USER_DN="cn=sync-test-user,ou=People,$BASE_DN"
 PASS_V1="OldPassword123!"
 PASS_V2="NewPassword456!"
 

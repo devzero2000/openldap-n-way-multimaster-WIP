@@ -1,59 +1,238 @@
 # ==============================================================================
-# TITOLO:       Pulizia e Rimozione Dataset Custom (Scale 8k/30k - MemberOf / Nested)
+# TITOLO:       Pulizia Dataset Custom (MemberOf / Nested Group) - RIMOZIONE A BATCH
+#
+# NOTA SULL'ORDINE DI CANCELLAZIONE: i gruppi generici (custom-scale-group-N)
+# vengono cancellati in ordine DISCENDENTE (N, N-1, ..., 1). Il generatore
+# assegna membership tramite campionamento casuale per-utente, quindi non ci
+# sono piu' dipendenze dirette gruppo->gruppo prevedibili come nella vecchia
+# versione a catena; l'ordine discendente resta comunque la scelta piu' sicura
+# in generale per minimizzare l'eventuale lavoro di pulizia dell'overlay
+# refint su riferimenti pendenti verso gruppi che stanno per essere rimossi
+# anch'essi nello stesso batch.
+#
+# RIMOZIONE A BATCH (stessa logica del create): un'unica cancellazione
+# continua su ~38.000 entry genera lo stesso tipo di burst di scrittura
+# intenso e sostenuto visto nell'import (qui in cancellazione: memberof deve
+# ripulire memberOf su ogni utente per ogni gruppo rimosso) - con dati
+# concreti abbiamo osservato che un burst di questa intensita' puo' causare
+# buchi silenziosi nella replica (entry che restano da qualche parte ma non
+# arrivano ovunque, senza alcun errore nei log) o rendere slapd
+# temporaneamente non responsivo. La cancellazione viene quindi spezzata in
+# batch piu' piccoli, con una pausa fra un batch e l'altro.
 # ==============================================================================
 ---
-- name: "Pulizia Totale Dataset Custom (MemberOf / Nested)"
-  hosts: ubuntu24lts1.example.com
+- name: "Pulizia Dataset Custom (MemberOf / Nested Group) - Rimozione a Batch"
+  hosts: "{{ groups['cluster'] | sort | first }}"
   become: true
   vars:
     suffix: "dc=example,dc=com"
-    ldif_path: "/tmp/custom_scale_delete.ldif"
+    ldif_dir: "/tmp/custom_scale_delete_batches"
     ldap_pw: "openldap"
 
+    # Devono coincidere con i valori usati nel play di creazione
+    total_users: 8000
+    total_groups: 30000
+    deep_nesting_levels: 15
+    deep_nesting_root_groups: 3
+
+    # --- Parametri di batching (stessi del create) ---------------------------
+    batch_size: 200
+    batch_pause_seconds: 5
+    batch_timeout_seconds: 120
+    batch_retries: 15
+    batch_retry_delay: 15
+
+    # --- Parametri di attesa post-cancellazione per la verifica finale -------
+    # dopo un burst di cancellazioni pesante, slapd puo' restare per qualche
+    # istante non responsivo mentre finisce di elaborare - la verifica non
+    # deve fallire a freddo al primo tentativo, deve aspettare che torni su.
+    post_cleanup_wait_retries: 20
+    post_cleanup_wait_delay: 5
+
   tasks:
-    - name: "[TEMPLATING] Genera script Python per la rimozione selettiva"
+    - name: "[SETUP] Assicura la presenza del comando 'time'"
+      ansible.builtin.command: which time
+      register: time_bin_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SETUP] Installa il pacchetto 'time' se assente"
+      ansible.builtin.apt:
+        name: time
+        state: present
+      when: time_bin_check.rc != 0
+
+    - name: "[CLEANUP PRELIMINARE] Rimuovi eventuali batch residui da un run precedente"
+      ansible.builtin.file:
+        path: "{{ ldif_dir }}"
+        state: absent
+
+    - name: "[TEMPLATING] Genera script Python per la rimozione a batch"
       ansible.builtin.copy:
-        dest: /tmp/generate_custom_scale_delete.py
+        dest: /tmp/generate_custom_scale_delete_batched.py
         mode: '0755'
         content: |
           #!/usr/bin/env python3
+          import os
+
           suffix = "{{ suffix }}"
-          total_users = 8000
-          total_groups = 30000
-          depth_levels = 15
+          total_users = {{ total_users }}
+          total_groups = {{ total_groups }}
+          deep_nesting_levels = {{ deep_nesting_levels }}
+          deep_nesting_root_groups = {{ deep_nesting_root_groups }}
+          batch_size = {{ batch_size }}
+          ldif_dir = "{{ ldif_dir }}"
 
-          with open("{{ ldif_path }}", "w") as f:
-              # 1. Rimuovi i gruppi radice complessi
-              for i in range(1, 4):
-                  f.write(f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: delete\n\n")
+          records = []
 
-              # 2. Rimuovi i 30.000 gruppi custom
-              for i in range(1, total_groups + 1):
-                  f.write(f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: delete\n\n")
+          # 1. Rimuovi i gruppi radice complessi (nulla li referenzia, primi da togliere)
+          for i in range(1, deep_nesting_root_groups + 1):
+              records.append(f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: delete\n")
 
-              # 3. Rimuovi i livelli della catena di deep nesting
-              for d in range(1, depth_levels + 1):
-                  f.write(f"dn: cn=custom-scale-deep-tier-{d},ou=groups,{suffix}\nchangetype: delete\n\n")
+          # 2. Rimuovi i gruppi generici, in ordine DISCENDENTE
+          for i in range(total_groups, 0, -1):
+              records.append(f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: delete\n")
 
-              # 4. Rimuovi gli 8.000 utenti custom
-              for i in range(1, total_users + 1):
-                  f.write(f"dn: uid=custom-scale-user-{i},ou=People,{suffix}\nchangetype: delete\n\n")
+          # 3. Rimuovi i livelli della catena di deep nesting (dal piu' profondo,
+          #    nessuno li referenzia piu' una volta tolti i gruppi radice sopra)
+          for d in range(deep_nesting_levels, 0, -1):
+              records.append(f"dn: cn=custom-scale-deep-tier-{d},ou=groups,{suffix}\nchangetype: delete\n")
 
-    - name: "[EXECUTE] Genera file LDIF di cancellazione"
-      ansible.builtin.command: python3 /tmp/generate_custom_scale_delete.py
+          # 4. Rimuovi gli utenti (ultimi: nessun gruppo li referenzia piu')
+          for i in range(1, total_users + 1):
+              records.append(f"dn: uid=custom-scale-user-{i},ou=People,{suffix}\nchangetype: delete\n")
+
+          os.makedirs(ldif_dir, exist_ok=True)
+          num_batches = (len(records) + batch_size - 1) // batch_size
+          for b in range(num_batches):
+              chunk = records[b * batch_size : (b + 1) * batch_size]
+              fname = os.path.join(ldif_dir, f"batch_{b:05d}.ldif")
+              with open(fname, "w") as f:
+                  f.write("\n".join(chunk))
+                  f.write("\n")
+
+          print(f"Record totali: {len(records)}")
+          print(f"Batch generati: {num_batches} (dimensione {batch_size} record/batch)")
+
+    - name: "[EXECUTE] Genera i batch LDIF di cancellazione"
+      ansible.builtin.command: python3 /tmp/generate_custom_scale_delete_batched.py
+      register: gen_result
       changed_when: true
 
-    - name: "[APPLY] Esegui la rimozione massiva dal cluster"
-      ansible.builtin.command: >
-        ldapmodify -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
-      register: ldapdel_res
-      changed_when: true
-      failed_when: "ldapdel_res.rc != 0 and 'No such object' not in ldapdel_res.stderr"
+    - name: "[REPORT] Riepilogo generazione"
+      ansible.builtin.debug:
+        msg: "{{ gen_result.stdout_lines }}"
 
-    - name: "[CLEANUP] Rimuovi file temporanei"
+    - name: "[LISTA] Trova tutti i file batch generati, in ordine"
+      ansible.builtin.find:
+        paths: "{{ ldif_dir }}"
+        patterns: "batch_*.ldif"
+      register: batch_files_raw
+
+    - name: "[LISTA] Ordina i batch per nome (garantisce l'ordine di cancellazione)"
+      ansible.builtin.set_fact:
+        batch_files: "{{ batch_files_raw.files | map(attribute='path') | sort | list }}"
+
+    - name: "[REPORT] Numero di batch da cancellare"
+      ansible.builtin.debug:
+        msg: "{{ batch_files | length }} batch da cancellare, con {{ batch_pause_seconds }}s di pausa fra uno e l'altro"
+
+    - name: "[TIMING] Segna l'orario di inizio della cancellazione a batch"
+      ansible.builtin.set_fact:
+        batch_delete_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    # =========================================================================
+    # CANCELLAZIONE A BATCH - stesso principio del failed_when robusto del
+    # create: rc==124 (kill da timeout) e' SEMPRE un fallimento vero, a
+    # prescindere dal contenuto dello stderr.
+    # =========================================================================
+
+    - name: "[APPLY] Applica ciascun batch di cancellazione (cronometrato, con retry se slapd non risponde)"
+      ansible.builtin.shell: >
+        time timeout {{ batch_timeout_seconds }} ldapmodify -c -H ldapi:/// -x
+        -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ batch_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+        pause: "{{ batch_pause_seconds }}"
+      register: batch_del_results
+      changed_when: true
+      # until: ritenta lo STESSO batch (non passa al successivo) se fallisce -
+      # se slapd e' andato giu' a meta', questo da' il tempo di riprendersi
+      # prima di insistere, invece di procedere alla cieca sul batch dopo.
+      # "-c" (continuous mode) rende il retry sicuro: le entry gia' cancellate
+      # nel tentativo precedente daranno "No such object" (tollerato), quelle
+      # rimaste verranno cancellate per davvero al retry.
+      until: >
+        not (
+          batch_del_results.rc == 124 or
+          (batch_del_results.rc != 0 and
+            (batch_del_results.stderr_lines
+              | select('match', '^ldap_delete:')
+              | reject('search', 'No such object')
+              | list
+              | length > 0))
+        )
+      retries: "{{ batch_retries }}"
+      delay: "{{ batch_retry_delay }}"
+      failed_when: >
+        batch_del_results.rc == 124 or
+        (batch_del_results.rc != 0 and
+          (batch_del_results.stderr_lines
+            | select('match', '^ldap_delete:')
+            | reject('search', 'No such object')
+            | list
+            | length > 0))
+
+    - name: "[TIMING] Segna l'orario di fine della cancellazione a batch"
+      ansible.builtin.set_fact:
+        batch_delete_end_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: "[REPORT] Tempo totale di cancellazione (costo memberof in pulizia)"
+      ansible.builtin.debug:
+        msg: >-
+          {{ (((batch_delete_end_epoch | int) - (batch_delete_start_epoch | int)) / 60) | round(1) }}
+          minuti totali su {{ batch_files | length }} batch ({{ batch_size }} entry/batch,
+          {{ batch_pause_seconds }}s di pausa fra un batch e l'altro)
+
+    - name: "[CLEANUP] Rimuovi script e batch LDIF temporanei"
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
       loop:
-        - "/tmp/generate_custom_scale_delete.py"
-        - "{{ ldif_path }}"
+        - "/tmp/generate_custom_scale_delete_batched.py"
+        - "{{ ldif_dir }}"
+
+    # =========================================================================
+    # VERIFICA FINALE - FIX DEL CRASH: prima falliva a freddo al primo
+    # tentativo se slapd era ancora impegnato/non responsivo subito dopo il
+    # burst di cancellazioni ("Can't contact LDAP server"). Ora aspetta,
+    # con retry, che risponda di nuovo prima di valutare l'esito.
+    # =========================================================================
+
+    - name: "[VERIFICA] Attendi che slapd sia di nuovo responsivo prima di verificare"
+      ansible.builtin.command: timeout 10 ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=config -s base dn
+      register: slapd_ready_check
+      until: slapd_ready_check.rc == 0
+      retries: "{{ post_cleanup_wait_retries }}"
+      delay: "{{ post_cleanup_wait_delay }}"
+      changed_when: false
+
+    - name: "[VERIFICA] Conferma che il dataset sia stato rimosso completamente"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ suffix }}" -s sub
+        "(|(cn=custom-scale-*)(uid=custom-scale-*))" dn
+      register: leftover_check
+      changed_when: false
+
+    - name: "[VERIFICA] Nessuna entry residua del dataset custom-scale"
+      ansible.builtin.assert:
+        that:
+          - "'numEntries' not in leftover_check.stdout or 'numEntries: 0' in leftover_check.stdout"
+        fail_msg: >-
+          ATTENZIONE: risultano ancora entry custom-scale-* dopo la pulizia.
+          Controlla manualmente: potrebbero essere entry create con un run
+          precedente a parametri diversi (total_users/total_groups differenti).
+        success_msg: "OK: nessuna entry residua del dataset custom-scale."
