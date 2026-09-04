@@ -241,7 +241,7 @@
         mode: "0644"
         content: |
           [Service]
-          TimeoutStopSec=4
+          TimeoutStopSec=15
           KillMode=mixed
       notify: Ricarica systemd e riavvia slapd
 
@@ -898,7 +898,7 @@
     #
     # olcDbNoSync: FALSE (il default OpenLDAP) - era TRUE (fsync disattivato,
     # scelto per prestazioni). Cambiato per due motivi legati insieme:
-    #   1) TimeoutStopSec=4 (vedi override systemd piu' sopra) rende il
+    #   1) TimeoutStopSec=15 (vedi override systemd piu' sopra) rende il
     #      SIGKILL forzato l'esito NORMALE di uno stop quando slapd ha
     #      sessioni syncrepl attive che non si chiudono da sole in tempo
     #      (limite noto di OpenLDAP, non risolvibile lato nostro - vedi
