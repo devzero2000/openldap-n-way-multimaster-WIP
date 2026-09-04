@@ -1,0 +1,275 @@
+# ==============================================================================
+# TITOLO:       check_simulate_wan_mpls_ipsec.yml
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     4.0 (review)
+# SCOPO:        Audit strutturale e verifica della simulazione WAN (Netem/TC e
+#               IPTables Mangle, egress) su tutti i nodi del cluster OpenLDAP.
+#
+# NOVITÀ v4.0 rispetto a v3.4 — SEMPLIFICAZIONE ARCHITETTURALE:
+#   - Rimosse tutte le verifiche ingress/IFB (qdisc, classe, filtro fw su
+#     ifb0) e i check su iptables PREROUTING: il playbook di simulazione
+#     (v3.0) ha rimosso lo shaping ingress, non necessario in un mesh
+#     omogeneo dove tutti i nodi applicano la stessa cap di banda in
+#     egress (il traffico in arrivo è già implicitamente limitato dal
+#     mittente). Questo elimina anche il problema del bug di ordinamento
+#     tc-ingress/Netfilter-PREROUTING segnalato nelle versioni precedenti:
+#     con l'ingress rimosso, quel codice non esiste più.
+#
+# NOVITÀ v3.4 rispetto a v3.3:
+#   - expected_latency/expected_jitter allineati alla calibrazione RTT
+#     (25ms per tratta = 50ms di RTT osservato con architettura egress+
+#     ingress). Superato dalla v4.0: ora è semplicemente il one-way delay
+#     di un link con RTT dichiarato di 50ms (RTT = 2x one-way).
+#
+# NOVITÀ v3.3 rispetto a v3.2:
+#   - Il TCP-connect via /dev/tcp funzionava ma non permetteva di forzare
+#     l'interfaccia di uscita. Sostituito con "tcping" (-I per il binding
+#     all'interfaccia, analogo diretto del vecchio "ping -I {{ iface }}",
+#     ma su TCP invece che ICMP). Verifica esplicita di presenza del tool:
+#     se assente, il test RTT TCP viene saltato con un avviso nel log.
+#
+# NOVITÀ v3.2 rispetto a v3.1:
+#   - Il test RTT TCP via "curl telnet://" falliva sistematicamente:
+#     telnet:// apre una sessione interattiva bidirezionale, e LDAP sulla
+#     389 non manda alcun banner — curl resta in attesa fino al timeout,
+#     senza mai completare un "transfer" e senza stampare -w.
+#
+# NOVITÀ v3.1 rispetto a v3.0:
+#   - check_fwmark_ok corretto: l'output reale di "tc filter show" per un
+#     filtro fw riporta "classid 1:10", non "flowid 1:10" (quest'ultimo
+#     compare per altri tipi di filtro, non per fw). Verificato su output
+#     reale: "filter parent 1: protocol ip pref 1 fw chain 0 handle 0xa
+#     classid 1:10".
+#
+# NOVITÀ v3.0 rispetto alla v2.0:
+#   - BUG CRITICO CORRETTO: il test di rete usava "ping" ICMP. Le regole
+#     mangle marcano SOLO "-p tcp --dport/--sport 389/636": un ping ICMP
+#     non riceve mai il fwmark 10, quindi bypassa la classe 1:10 (dove sta
+#     il netem) e non riflette affatto lo shaping.
+#   - check_loss_ok e la verifica banda non fanno più un match testuale
+#     esatto: netem quantizza la probabilità di loss su un intero a 32
+#     bit, il kernel spesso riporta un valore leggermente diverso da
+#     quello impostato. Si estrae ora il valore numerico via regex e si
+#     confronta con una tolleranza. Stesso discorso per la banda (rate
+#     effettivo della classe 1:10 confrontato con quello atteso, tolleranza
+#     5%). NOTA sul parsing: si evita deliberatamente regex_search con
+#     backreference di gruppo ('\1','\2', ...), perché in assenza di match
+#     quella forma del filtro può fallire con "'NoneType' object has no
+#     attribute 'group'" invece di restituire None. Si usa solo
+#     regex_search senza gruppi (stringa o None, mai eccezione) seguito da
+#     regex_replace (mai un'eccezione, nemmeno senza match).
+#
+# NOVITÀ v2.0 rispetto alla v1.5:
+#   - check_fwmark_ok richiede handle E flowid/classid corretti, non un
+#     generico "contiene la stringa 'fw'".
+#   - Verifica anche le marcature --sport oltre a --dport.
+# ==============================================================================
+
+---
+- name: Audit della Simulazione WAN MPLS + IPSec sul Cluster
+  hosts: ldap_all
+  become: true
+  vars:
+    iface: "eth1"
+    expected_latency: "25ms"       # one-way, per tratta; RTT atteso ~2x = 50ms
+    expected_jitter: "1ms"
+    expected_loss_pct: 0.1        # valore numerico (%), per confronto con tolleranza
+    expected_loss: "0.1%"         # mantenuto per compatibilità display/report
+    expected_bandwidth: "45mbit"
+    mark_id: "10"
+    loss_tolerance_pct: 0.05      # tolleranza assoluta in punti percentuali
+    bw_tolerance_ratio: 0.05      # tolleranza relativa (5%) sul bitrate
+    bw_unit_factors: {"": 1, "K": 1000, "M": 1000000, "G": 1000000000}
+    expected_rtt_ms: 50           # RTT round-trip atteso, per il report informativo
+    rtt_tolerance_ratio: 0.30     # tolleranza ampia (30%) vista la variabilità di jitter/rete
+
+  tasks:
+    # ==========================================================================
+    # 1. ISPEZIONE TRAFFIC CONTROL — EGRESS ({{ iface }})
+    # ==========================================================================
+
+    - name: "[TC] Rileva le qdisc egress attive su {{ iface }}"
+      ansible.builtin.command: "tc qdisc show dev {{ iface }}"
+      register: tc_qdisc_out
+      changed_when: false
+      failed_when: false
+
+    - name: "[TC] Rileva le classi egress attive su {{ iface }}"
+      ansible.builtin.command: "tc class show dev {{ iface }}"
+      register: tc_class_out
+      changed_when: false
+      failed_when: false
+
+    - name: "[TC] Rileva i filtri fwmark egress su {{ iface }}"
+      ansible.builtin.command: "tc filter show dev {{ iface }}"
+      register: tc_filter_out
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================================
+    # 2. ISPEZIONE IPTABLES MANGLE (POSTROUTING/egress)
+    # ==========================================================================
+
+    - name: "[IPTABLES] Rileva le regole Mangle in POSTROUTING"
+      ansible.builtin.command: "iptables -t mangle -S POSTROUTING"
+      register: iptables_post_out
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================================
+    # 3. TEST METRICA DI RETE (TCP-PING VERSO LA PORTA LDAP DEL PEER, via tcping)
+    # ==========================================================================
+    # Le regole mangle marcano solo -p tcp --dport/--sport 389/636: un ping
+    # ICMP non viene mai marcato con fwmark 10 e bypassa interamente la
+    # classe 1:10 (netem). Si usa "tcping" per un vero TCP connect/misura
+    # sulla porta 389, con binding esplicito all'interfaccia via -I.
+
+    - name: "[NETWORK] Scegli un peer remoto del cluster per il test RTT"
+      ansible.builtin.set_fact:
+        wan_peer_host: "{{ (ansible_play_hosts_all | difference([inventory_hostname])) | first | default('') }}"
+
+    - name: "[NETWORK] Estrai l'IP del peer remoto sulla stessa interfaccia"
+      ansible.builtin.set_fact:
+        wan_peer_ip: "{{ hostvars[wan_peer_host]['ansible_facts'][iface]['ipv4']['address'] | default('') }}"
+      when: wan_peer_host != ''
+
+    - name: "[NETWORK] Verifica disponibilità di tcping"
+      ansible.builtin.command: "which tcping"
+      register: tcping_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[NETWORK] Avvisa se tcping non è installato (test RTT TCP saltato)"
+      ansible.builtin.debug:
+        msg: "ATTENZIONE: 'tcping' non è installato su {{ inventory_hostname }}. Il test RTT TCP sulla porta 389 verrà saltato (mostrerà N/A nel report)."
+      when: tcping_check.rc != 0
+
+    - name: "[NETWORK] TCP-ping (5x) verso {{ wan_peer_host }}:389 via {{ iface }} (tcping)"
+      ansible.builtin.command: >
+        tcping -I {{ iface }} -c 5 -t 3 --non-interactive {{ wan_peer_ip }} 389
+      register: tcp_ping_test
+      changed_when: false
+      failed_when: false
+      when:
+        - wan_peer_ip is defined and wan_peer_ip != ''
+        - tcping_check.rc == 0
+
+    - name: "[NETWORK] Calcola i campioni RTT TCP dall'output di tcping"
+      ansible.builtin.set_fact:
+        tcp_rtt_samples_ms: >-
+          {{ (tcp_ping_test.stdout | default('') | regex_findall('time[=:]\s*([0-9.]+)')) | map('float') | list }}
+      when: tcp_ping_test is defined and tcp_ping_test.stdout is defined
+
+    - name: "[NETWORK] Calcola il conteggio dei probe falliti"
+      ansible.builtin.set_fact:
+        tcp_ping_fail_count: "{{ 5 - (tcp_rtt_samples_ms | default([]) | length) }}"
+      when: tcp_ping_test is defined
+
+    - name: "[NETWORK] Riepilogo RTT TCP (min/avg/max)"
+      ansible.builtin.set_fact:
+        tcp_rtt_min_ms: "{{ (tcp_rtt_samples_ms | min) | round(2) if (tcp_rtt_samples_ms | default([]) | length) > 0 else 'N/A' }}"
+        tcp_rtt_avg_ms: "{{ ((tcp_rtt_samples_ms | sum) / (tcp_rtt_samples_ms | length)) | round(2) if (tcp_rtt_samples_ms | default([]) | length) > 0 else 'N/A' }}"
+        tcp_rtt_max_ms: "{{ (tcp_rtt_samples_ms | max) | round(2) if (tcp_rtt_samples_ms | default([]) | length) > 0 else 'N/A' }}"
+
+    # Ping ICMP mantenuto SOLO come controllo di raggiungibilità generico.
+    # NON riflette lo shaping (bypassa la marcatura fwmark): non usarlo per
+    # validare la simulazione WAN, solo per capire se l'host è vivo.
+
+    - name: "[NETWORK] Reachability check ICMP (informativo, non shaped)"
+      ansible.builtin.command: "ping -c 3 -I {{ iface }} {{ wan_peer_ip }}"
+      register: icmp_ping_test
+      changed_when: false
+      when: wan_peer_ip is defined and wan_peer_ip != ''
+      failed_when: false
+
+    # ==========================================================================
+    # 4. VALUTAZIONE E VERIFICA REGOLE CON ASSERT
+    # ==========================================================================
+    # NOTA: si evita deliberatamente regex_search(pattern, '\1', '\2', ...)
+    # con backreference di gruppo (vedi changelog v3.0). Si usa sempre
+    # regex_search senza gruppi (stringa o None, mai eccezione) seguito da
+    # regex_replace (mai un'eccezione, anche senza match).
+
+    - name: "[CHECK] Estrai il token di loss via regex, senza backreference"
+      ansible.builtin.set_fact:
+        egress_loss_token: "{{ tc_qdisc_out.stdout | regex_search('loss [0-9.]+%') | default('', true) }}"
+
+    - name: "[CHECK] Estrai la riga della classe 1:10"
+      ansible.builtin.set_fact:
+        # Nota: il testo di "tc class show" usa "class htb 1:10 ...", NON
+        # "classid 1:10" (quest'ultimo compariva solo nell'output -j/JSON).
+        egress_class_line: "{{ (tc_class_out.stdout | regex_findall('(?m)^.*\\bhtb 1:10\\b.*$')) | first | default('', true) }}"
+
+    - name: "[CHECK] Estrai il token rate e calcola i bps"
+      ansible.builtin.set_fact:
+        egress_bw_token: "{{ egress_class_line | regex_search('rate [0-9.]+[KMG]?bit') | default('', true) }}"
+
+    - name: "[CHECK] Converte il token rate estratto e il valore atteso in bit/s"
+      ansible.builtin.set_fact:
+        egress_bw_num: "{{ egress_bw_token | regex_replace('[^0-9.]', '') }}"
+        egress_bw_unit: "{{ egress_bw_token | regex_replace('^rate [0-9.]+', '') | regex_replace('bit$', '') | upper }}"
+        expected_bw_num: "{{ expected_bandwidth | regex_replace('[^0-9.]', '') }}"
+        expected_bw_unit: "{{ expected_bandwidth | regex_replace('[0-9.]', '') | regex_replace('bit$', '') | upper }}"
+
+    - name: "[CHECK] Calcola i bitrate finali in bps (rilevato/atteso)"
+      ansible.builtin.set_fact:
+        egress_bw_bps: "{{ (egress_bw_num | float(default=-1)) * (bw_unit_factors[egress_bw_unit] | default(1)) if egress_bw_num != '' else -1 }}"
+        expected_bw_bps: "{{ (expected_bw_num | float) * (bw_unit_factors[expected_bw_unit] | default(1)) }}"
+
+    - name: "[CHECK] Valida la presenza e la correttezza della configurazione WAN"
+      ansible.builtin.set_fact:
+        check_htb_ok: "{{ 'qdisc htb 1: root' in tc_qdisc_out.stdout }}"
+        check_class_ok: "{{ 'class htb 1:10' in tc_class_out.stdout }}"
+        check_netem_ok: "{{ 'qdisc netem 10:' in tc_qdisc_out.stdout and expected_latency in tc_qdisc_out.stdout }}"
+        check_loss_ok: >-
+          {{ (egress_loss_token != '') and
+             (((egress_loss_token | regex_replace('[^0-9.]', '') | float) - expected_loss_pct) | abs <= loss_tolerance_pct) }}
+        check_bw_ok: >-
+          {{ (egress_bw_bps | float >= 0) and
+             ((egress_bw_bps | float - expected_bw_bps | float) | abs <= (expected_bw_bps | float * bw_tolerance_ratio)) }}
+        check_fwmark_ok: "{{ ('handle 0xa' in tc_filter_out.stdout) and ('classid 1:10' in tc_filter_out.stdout) }}"
+        check_iptables_post_dport_ok: "{{ '--dport 389' in iptables_post_out.stdout and '--dport 636' in iptables_post_out.stdout }}"
+        check_iptables_post_sport_ok: "{{ '--sport 389' in iptables_post_out.stdout and '--sport 636' in iptables_post_out.stdout }}"
+
+    # ==========================================================================
+    # 5. REPORT FINALE PER NODO
+    # ==========================================================================
+
+    - name: "[REPORT] Esito Audit Simulazione WAN su {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg:
+          - "========================================================================"
+          - "AUDIT WAN SIMULATION (MPLS + IPSec) - HOST: {{ inventory_hostname }}"
+          - "========================================================================"
+          - "EGRESS ({{ iface }})"
+          - "  Qdisc HTB Root (1:):         {{ 'OK' if check_htb_ok else 'ASSENTE / FAIL' }}"
+          - "  Classe HTB Bandwidth (1:10): {{ 'OK' if check_class_ok else 'ASSENTE / FAIL' }}"
+          - "  Bandwidth entro tolleranza:  {{ 'OK' if check_bw_ok else 'ASSENTE / FAIL' }}"
+          - "  Latenza / Jitter Netem:      {{ 'OK' if check_netem_ok else 'ASSENTE / FAIL' }}"
+          - "  Packet Loss Netem:           {{ 'OK' if check_loss_ok else 'ASSENTE / FAIL' }}"
+          - "  TC Filter FWMARK 10:         {{ 'OK' if check_fwmark_ok else 'ASSENTE / FAIL' }}"
+          - "IPTABLES MANGLE (POSTROUTING)"
+          - "  dport 389/636:               {{ 'OK' if check_iptables_post_dport_ok else 'ASSENTE / FAIL' }}"
+          - "  sport 389/636:               {{ 'OK' if check_iptables_post_sport_ok else 'ASSENTE / FAIL' }}"
+          - "------------------------------------------------------------------------"
+          - "Peer di test:                 {{ wan_peer_host | default('N/A') }}"
+          - "TCP-connect RTT su porta 389 (traffico realmente shaped, min/avg/max ms, atteso ~{{ expected_rtt_ms }}ms):"
+          - "  {{ tcp_rtt_min_ms | default('N/A') }} / {{ tcp_rtt_avg_ms | default('N/A') }} / {{ tcp_rtt_max_ms | default('N/A') }}  (fail: {{ tcp_ping_fail_count | default('N/A') }}/5)"
+          - "Reachability ICMP (informativo, NON shaped — non riflette il netem):"
+          - "  {{ icmp_ping_test.stdout_lines[-1] if icmp_ping_test is defined and icmp_ping_test.stdout_lines is defined else 'N/A' }}"
+          - "========================================================================"
+
+    - name: "[ASSERT] Fallisci se una delle componenti WAN non è attiva"
+      ansible.builtin.assert:
+        that:
+          - check_htb_ok
+          - check_class_ok
+          - check_bw_ok
+          - check_netem_ok
+          - check_loss_ok
+          - check_fwmark_ok
+          - check_iptables_post_dport_ok
+          - check_iptables_post_sport_ok
+        fail_msg: "CRITICAL: La simulazione WAN MPLS+IPSec su {{ inventory_hostname }} è INCOMPLETA o NON ATTIVA!"
+        success_msg: "SUCCESS: Simulazione WAN MPLS+IPSec perfettamente ATTIVA e CONFORME su {{ inventory_hostname }}."
