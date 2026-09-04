@@ -7,7 +7,7 @@
   vars:
     # Definiamo i livelli di log: 
     # 'stats' per connessioni/operazioni e 'sync' per il dettaglio del motore Syncrepl
-    ldap_log_level: "stats sync"
+    ldap_log_level: "stats sync acl"
 
   tasks:
     - name: Generazione del file LDIF temporaneo per olcLogLevel
