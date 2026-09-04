@@ -2,10 +2,25 @@
 # TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.6 (review - SPERIMENTALE, in fase di test)
+# VERSIONE:     1.7 (review - CONFERMATO con test reale)
 # SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
 #
-# NOVITÀ v1.6 rispetto a v1.5 (SPERIMENTALE - valori aggressivi per
+# NOVITÀ v1.7 rispetto a v1.6:
+#   - TimeoutStopSec 4 -> 15. Lo stop pulito osservato dopo il fix ai
+#     timeout del syncrepl richiede circa 5s: un tetto a 4s era troppo
+#     stretto e rischiava un SIGKILL "di sicurezza" anche su uno shutdown
+#     che sarebbe comunque completato da solo - in tensione diretta con
+#     olcDbNoSync=FALSE (voluto apposta per ridurre il rischio di
+#     corruzione da kill forzati). 15s lascia margine a uno stop normale
+#     anche un po' piu' lento, restando comunque un tetto netto rispetto
+#     ai minuti/ore di prima del fix.
+#
+# CONFERMATO (redeploy pulito + test reale): sia lo stop di slapd a mesh
+# vivo sia una modifica a caldo di cn=config (es. cambio olcLogLevel) ora
+# completano rapidamente, senza piu' lo stallo osservato nelle versioni
+# precedenti. Non piu' sperimentale.
+#
+# NOVITÀ v1.6 rispetto a v1.5 (valori aggressivi per isolare/testare la
 # isolare/testare la causa dello stallo, ispirati all'assenza di timeout=
 # negli esempi della guida ufficiale Ubuntu per la replica OpenLDAP:
 # https://ubuntu.com/server/docs/how-to/openldap/replication/):
@@ -233,6 +248,17 @@
     # cosi' OGNI stop/restart (compresi quelli lanciati da questo stesso
     # playbook durante il deploy) e' garantito a completarsi entro un
     # tempo limitato, invece di poter restare appeso indefinitamente.
+    #
+    # Valore 15s (non piu' 4s come nel primo tentativo): con il fix a monte
+    # sui timeout del syncrepl (piu' sotto in questo file), uno stop pulito
+    # normale e' stato osservato richiedere circa 5s - un tetto a 4s
+    # rischiava di far scattare un SIGKILL "di sicurezza" anche su uno
+    # shutdown che sarebbe comunque arrivato in fondo da solo, proprio
+    # mentre olcDbNoSync e' stato riportato a FALSE per ridurre il rischio
+    # di corruzione da kill forzati - le due misure erano in tensione tra
+    # loro a 4s. 15s lascia margine a uno stop normale anche un po' piu'
+    # lento (es. sotto carico), restando comunque un tetto netto rispetto
+    # ai minuti/ore osservati prima del fix.
     # ---------------------------------------------------------------------
 
     - name: "OS Tuning - Limita il tempo di stop di slapd (SIGKILL automatico se lo shutdown si blocca)"
@@ -898,7 +924,7 @@
     #
     # olcDbNoSync: FALSE (il default OpenLDAP) - era TRUE (fsync disattivato,
     # scelto per prestazioni). Cambiato per due motivi legati insieme:
-    #   1) TimeoutStopSec=15 (vedi override systemd piu' sopra) rende il
+    #   1) TimeoutStopSec=4 (vedi override systemd piu' sopra) rende il
     #      SIGKILL forzato l'esito NORMALE di uno stop quando slapd ha
     #      sessioni syncrepl attive che non si chiudono da sole in tempo
     #      (limite noto di OpenLDAP, non risolvibile lato nostro - vedi

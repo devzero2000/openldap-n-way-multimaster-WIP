@@ -2,13 +2,21 @@
 # TITOLO:       Configurazione Replica Read-Only OpenLDAP (Hardened SASL/mTLS)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.1.5 (review - SPERIMENTALE, in fase di test)
+# VERSIONE:     1.1.6 (review - CONFERMATO con test reale)
 # SCOPO:        Deploy corazzato per nodi di sola lettura sincronizzati via Syncrepl,
 #               iterando sugli host del gruppo readonlyreplica e configurando l'HA.
 #
-# NOVITÀ v1.1.5 rispetto a v1.1.4 (SPERIMENTALE - stessi valori aggressivi
-# applicati al play multimaster, vedi commento esteso li' per il
-# riferimento alla guida ufficiale Ubuntu):
+# NOVITÀ v1.1.6 rispetto a v1.1.5:
+#   - TimeoutStopSec 4 -> 15, stesso motivo del play multimaster (vedi
+#     commento esteso li').
+#
+# CONFERMATO (redeploy pulito + test reale, come per il play multimaster):
+# stop e modifiche a caldo di cn=config ora completano rapidamente. Non
+# piu' sperimentale.
+#
+# NOVITÀ v1.1.5 rispetto a v1.1.4 (stessi valori aggressivi applicati al
+# play multimaster, vedi commento esteso li' per il riferimento alla guida
+# ufficiale Ubuntu):
 #   - timeout=120 -> timeout=5
 #   - network-timeout=30 -> network-timeout=5
 #   - keepalive=240:4:15 -> keepalive=10:5:2
@@ -285,6 +293,14 @@
     # (vedi commento esteso nel play multimaster). Qui deleghiamo a
     # systemd: se lo stop non completa entro TimeoutStopSec, forza un
     # SIGKILL sui processi residui del cgroup.
+    #
+    # Valore 15s (non piu' 4s): con il fix a monte sui timeout del
+    # syncrepl, uno stop pulito normale e' stato osservato richiedere circa
+    # 5s - un tetto troppo stretto rischiava un SIGKILL "di sicurezza" su
+    # uno shutdown che sarebbe comunque arrivato in fondo da solo, in
+    # tensione con olcDbNoSync=FALSE (voluto per ridurre il rischio di
+    # corruzione da kill forzati). Vedi commento esteso nel play
+    # multimaster.
     # ---------------------------------------------------------------------
 
     - name: "OS Tuning - Limita il tempo di stop di slapd (SIGKILL automatico se lo shutdown si blocca)"
@@ -293,7 +309,7 @@
         mode: "0644"
         content: |
           [Service]
-          TimeoutStopSec=4
+          TimeoutStopSec=15
           KillMode=mixed
       notify: Ricarica systemd e riavvia slapd
 
