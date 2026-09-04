@@ -1,0 +1,186 @@
+# ==============================================================================
+# TITOLO:       Simulazione di Rete WAN MPLS + IPSec via Ansible
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     3.0 (review)
+# SCOPO:        Configurare a livello di Kernel Linux (Traffic Control + Iptables)
+#               una simulazione di latenza, jitter e cap di banda per emulare
+#               un link geografico MPLS protetto da IPSec sulle porte LDAP.
+#
+# NOVITÀ v3.0 rispetto a v2.3 — SEMPLIFICAZIONE ARCHITETTURALE:
+#   - RIMOSSO completamente lo shaping ingress (IFB, redirect, htb/netem/
+#     filtro fw su ifb0) e le relative regole mangle PREROUTING. Motivo: in
+#     questo cluster tutti i nodi applicano la STESSA cap di banda in egress
+#     (45mbit) verso tutti i peer. Se A limita quanto può INVIARE a 45mbit e
+#     B fa lo stesso, il traffico che arriva a ciascuno dei due è già
+#     implicitamente limitato — non può arrivare più veloce di quanto il
+#     mittente l'abbia spedito. Lo shaping ingress via IFB serve solo per
+#     cap asimmetrici o traffico da sorgenti esterne non controllate: non è
+#     questo il caso di un mesh omogeneo con configurazione identica su
+#     tutti i nodi. Bonus: elimina anche il bug noto per cui l'hook
+#     "tc ingress" gira PRIMA della catena Netfilter PREROUTING nel kernel,
+#     quindi il fwmark impostato in PREROUTING non era ancora presente
+#     quando il filtro fw su ifb0 tentava di classificare il pacchetto —
+#     rendendo lo shaping ingress silenziosamente inattivo. Con l'ingress
+#     rimosso, quel problema non esiste più.
+#   - "latency" resta 25ms per tratta: con l'egress-only, un round trip
+#     attraversa la netem egress due volte (uscita del client + uscita
+#     della risposta dal server) = 2x25ms = 50ms di RTT osservato. Questo
+#     è ora semplicemente il one-way delay di un link con RTT dichiarato
+#     di 50ms (RTT = 2x one-way, per definizione), non più una calibrazione
+#     ad hoc per aggirare un bug.
+#   - mangle_rules ridotte alle sole 4 combinazioni POSTROUTING (dport/sport
+#     389/636): le 4 PREROUTING sono state rimosse insieme all'ingress.
+#
+# NOVITÀ v2.3 rispetto a v2.2:
+#   - Calibrazione RTT (latency 50ms -> 25ms, jitter 2ms -> 1ms), superata
+#     dalla v3.0 con la rimozione dell'ingress: vedi sopra.
+#
+# NOVITÀ v2.2 rispetto a v2.1:
+#   - RIMOSSI i tag "cleanup"/"enable". Motivo: erano un secondo meccanismo
+#     di controllo indipendente da {{ stato }}, che permetteva di invocare
+#     selettivamente --tags enable SENZA il cleanup preliminare, causando
+#     "RTNETLINK answers: File exists" sulla qdisc/classe preesistente. Il
+#     cleanup è idempotente e a costo trascurabile: deve girare sempre,
+#     prima di qualunque enable. Un solo interruttore = {{ stato }}.
+#
+# NOVITÀ v2.1 rispetto a v2.0:
+#   - Le regole mangle MARK non usano più il modulo ansible.builtin.iptables
+#     (il parametro set_mark non è supportato dalla versione del modulo
+#     disponibile in questo ambiente). Sostituito con comandi iptables raw,
+#     resi idempotenti a mano tramite "iptables -C" prima di "-D"/"-A".
+#
+# NOVITÀ v2.0 rispetto a v1.5:
+#   - Marcatura iptables sia su --dport che --sport 389/636 in mangle
+#     POSTROUTING: un nodo MMR è sia client che server verso i suoi pari,
+#     quindi le risposte (sorgente 389/636) vanno shaped tanto quanto le
+#     richieste.
+#
+# NOTA PERSISTENZA: la configurazione (tc, iptables) è volatile e non
+# sopravvive al reboot. Scelta intenzionale per questo ambiente di test.
+#
+# COMPATIBILITÀ: Testato su Ubuntu 24.04 LTS (N-Way Multi-Master Cluster)
+# ==============================================================================
+
+---
+- name: "Configurazione WAN Emulation sul Cluster OpenLDAP"
+  hosts: ldap_all
+  become: true
+  vars:
+    stato: "enabled"    # unico interruttore: 'enabled'/'enable' oppure 'disabled'/'disable'
+
+    iface: "eth1"
+    latency: "25ms"     # one-way delay: RTT osservato = 2x questo valore
+                         # (un round trip attraversa l'egress due volte:
+                         # andata dal client + ritorno dal server)
+    jitter: "1ms"
+    loss: "0.1%"
+    bandwidth: "45mbit"
+    mark_id: "10"          # decimale 10 == 0xa in esadecimale (usato da tc filter fw)
+
+    # Le 4 combinazioni direzione/porta da marcare in mangle POSTROUTING
+    # (egress, uso -o {{ iface }}). dport = traffico verso le porte LDAP
+    # (richieste), sport = risposte dal server LDAP: un nodo MMR è sia
+    # client che server verso i suoi pari, quindi entrambe vanno marcate.
+    mangle_rules:
+      - { chain: "POSTROUTING", iface_flag: "-o", port_flag: "--dport", port: "389" }
+      - { chain: "POSTROUTING", iface_flag: "-o", port_flag: "--dport", port: "636" }
+      - { chain: "POSTROUTING", iface_flag: "-o", port_flag: "--sport", port: "389" }
+      - { chain: "POSTROUTING", iface_flag: "-o", port_flag: "--sport", port: "636" }
+
+  tasks:
+
+    # ==========================================================================
+    # BLOCCO 1: CLEANUP COMPLETO E IDEMPOTENTE — SEMPRE ESEGUITO, SENZA TAG.
+    # Precondizione obbligatoria per il blocco 2: non deve essere saltabile
+    # indipendentemente, altrimenti "tc qdisc add"/"tc class add" falliscono
+    # su una configurazione preesistente ("RTNETLINK answers: File exists").
+    # ==========================================================================
+
+    - name: "[CLEANUP] Verifica quali regole mangle MARK sono già presenti"
+      ansible.builtin.command: >
+        iptables -t mangle -C {{ item.chain }} {{ item.iface_flag }} {{ iface }}
+        -p tcp {{ item.port_flag }} {{ item.port }} -j MARK --set-mark {{ mark_id }}
+      loop: "{{ mangle_rules }}"
+      loop_control:
+        label: "{{ item.chain }} {{ item.iface_flag }} {{ item.port_flag }} {{ item.port }}"
+      register: mangle_check
+      changed_when: false
+      failed_when: false    # rc != 0 significa solo "regola non presente", non un errore
+
+    - name: "[CLEANUP] Rimuovi le regole mangle MARK esistenti (389/636)"
+      ansible.builtin.command: >
+        iptables -t mangle -D {{ item.item.chain }} {{ item.item.iface_flag }} {{ iface }}
+        -p tcp {{ item.item.port_flag }} {{ item.item.port }} -j MARK --set-mark {{ mark_id }}
+      loop: "{{ mangle_check.results }}"
+      loop_control:
+        label: "{{ item.item.chain }} {{ item.item.iface_flag }} {{ item.item.port_flag }} {{ item.item.port }}"
+      when: item.rc == 0    # la regola esisteva (verificata sopra con -C)
+      changed_when: true
+
+    - name: "[CLEANUP] Controlla lo stato delle discipline tc attive su {{ iface }}"
+      ansible.builtin.command: "tc qdisc show dev {{ iface }}"
+      register: tc_status
+      changed_when: false
+
+    - name: "[CLEANUP] Resetta la root qdisc egress di {{ iface }}"
+      ansible.builtin.command: "tc qdisc del dev {{ iface }} root"
+      when: "'htb' in tc_status.stdout or 'netem' in tc_status.stdout"
+      changed_when: true    # eseguito solo se esiste già una qdisc da rimuovere
+      failed_when: false
+
+    # ==========================================================================
+    # BLOCCO 2: ATTIVAZIONE WAN SIMULATION (Se lo stato è abilitato)
+    # Solo EGRESS su {{ iface }}: in un mesh omogeneo con egress shaping
+    # simmetrico su tutti i nodi, non serve shaping ingress separato (vedi
+    # nota in testa al file).
+    # ==========================================================================
+
+    - name: "[ENABLE] Coda radice HTB in egress su {{ iface }}"
+      ansible.builtin.command: "tc qdisc add dev {{ iface }} root handle 1: htb default 1"
+      when: stato in ['enable', 'enabled']
+      changed_when: true    # Blocco 1 ha già ripulito la root qdisc: qui si crea sempre stato nuovo
+
+    - name: "[ENABLE] Classe di default esplicita (traffico non-LDAP, non modellato)"
+      ansible.builtin.command: "tc class add dev {{ iface }} parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit"
+      when: stato in ['enable', 'enabled']
+      changed_when: true
+
+    - name: "[ENABLE] Allocazione banda MPLS in egress (Classe 1:10)"
+      ansible.builtin.command: "tc class add dev {{ iface }} parent 1: classid 1:10 htb rate {{ bandwidth }} ceil {{ bandwidth }}"
+      when: stato in ['enable', 'enabled']
+      changed_when: true
+
+    - name: "[ENABLE] Latenza/jitter/loss in egress (Netem su 1:10)"
+      ansible.builtin.command: "tc qdisc add dev {{ iface }} parent 1:10 handle 10: netem delay {{ latency }} {{ jitter }} loss {{ loss }}"
+      when: stato in ['enable', 'enabled']
+      changed_when: true
+
+    - name: "[ENABLE] Filtro fwmark egress -> classe 1:10"
+      ansible.builtin.command: "tc filter add dev {{ iface }} protocol ip parent 1:0 prio 1 handle {{ mark_id }} fw flowid 1:10"
+      when: stato in ['enable', 'enabled']
+      changed_when: true
+
+    - name: "[ENABLE] Applica le regole mangle MARK (389/636)"
+      ansible.builtin.command: >
+        iptables -t mangle -A {{ item.chain }} {{ item.iface_flag }} {{ iface }}
+        -p tcp {{ item.port_flag }} {{ item.port }} -j MARK --set-mark {{ mark_id }}
+      loop: "{{ mangle_rules }}"
+      loop_control:
+        label: "{{ item.chain }} {{ item.iface_flag }} {{ item.port_flag }} {{ item.port }}"
+      when: stato in ['enable', 'enabled']
+      changed_when: true    # Blocco 1 ha già rimosso ogni regola preesistente
+
+    # ==========================================================================
+    # BLOCCO 3: VERIFICA FINALE DELLO STATO
+    # ==========================================================================
+
+    - name: "[STATUS] Conferma attivazione simulazione"
+      ansible.builtin.debug:
+        msg: "Simulazione WAN MPLS+IPSec CONFIGURATA su {{ iface }} (egress). One-way delay: {{ latency }} (RTT atteso ~{{ latency }}x2)."
+      when: stato in ['enable', 'enabled']
+
+    - name: "[STATUS] Conferma disattivazione e ripristino LAN"
+      ansible.builtin.debug:
+        msg: "Simulazione WAN RIMOSSA. La rete del cluster è tornata a piena velocità LAN nativa."
+      when: stato in ['disable', 'disabled']
