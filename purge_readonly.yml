@@ -87,22 +87,6 @@
     # FASE DI RE-INIZIALIZZAZIONE PULITA
     # =========================================================================
 
-    - name: "[RECREATE] Ricrea la directory di configurazione vuota con permessi restrittivi"
-      ansible.builtin.file:
-        path: /etc/ldap/slapd.d
-        state: directory
-        owner: openldap
-        group: openldap
-        mode: '0700'
-
-    - name: "[RECREATE] Ricrea la directory del database vuota con permessi restrittivi"
-      ansible.builtin.file:
-        path: /var/lib/ldap
-        state: directory
-        owner: openldap
-        group: openldap
-        mode: '0700'
-
     - name: "[HARDEN] Assicura che la directory sasl2 esista per mTLS"
       ansible.builtin.file:
         path: /etc/ldap/sasl2
