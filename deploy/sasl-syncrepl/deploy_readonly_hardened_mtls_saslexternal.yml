@@ -2,8 +2,128 @@
 # TITOLO:       Configurazione Replica Read-Only OpenLDAP (Hardened SASL/mTLS)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
+# VERSIONE:     1.1.6 (review - CONFERMATO con test reale)
 # SCOPO:        Deploy corazzato per nodi di sola lettura sincronizzati via Syncrepl,
 #               iterando sugli host del gruppo readonlyreplica e configurando l'HA.
+#
+# NOVITÀ v1.1.6 rispetto a v1.1.5:
+#   - TimeoutStopSec 4 -> 15, stesso motivo del play multimaster (vedi
+#     commento esteso li').
+#
+# CONFERMATO (redeploy pulito + test reale, come per il play multimaster):
+# stop e modifiche a caldo di cn=config ora completano rapidamente. Non
+# piu' sperimentale.
+#
+# NOVITÀ v1.1.5 rispetto a v1.1.4 (stessi valori aggressivi applicati al
+# play multimaster, vedi commento esteso li' per il riferimento alla guida
+# ufficiale Ubuntu):
+#   - timeout=120 -> timeout=5
+#   - network-timeout=30 -> network-timeout=5
+#   - keepalive=240:4:15 -> keepalive=10:5:2
+#
+# NOVITÀ v1.1.4 rispetto a v1.1.3 (stessa coppia di correzioni fatta sul
+# play multimaster):
+#   - TimeoutStopSec 20 -> 4.
+#   - olcDbNoSync: TRUE -> FALSE (il default OpenLDAP) - conseguenza
+#     diretta: con TimeoutStopSec=4 il SIGKILL forzato diventa l'esito
+#     normale di uno stop con syncrepl attivo, non un caso raro; con fsync
+#     disattivato il rischio di perdere scritture non ancora su disco al
+#     momento del kill sale concretamente - vedi commento esteso nel play
+#     multimaster (include il precedente episodio di corruzione MDB dopo
+#     un kill -9 manuale). Le importazioni massive passano da slapadd
+#     offline, non da scritture online: il vantaggio prestazionale di
+#     NoSync=TRUE non serve al caso d'uso reale.
+#
+# NOVITÀ v1.1.3 rispetto a v1.1.2 (timeout=120 confermato NON sufficiente
+# da solo sul play multimaster - stesso fix applicato qui per coerenza):
+#   - Aggiunto un secondo drop-in systemd (stop-timeout.conf) con
+#     TimeoutStopSec=4 e KillMode=mixed: se lo stop grazioso non completa
+#     entro 4s, systemd forza un SIGKILL sui processi residui - vedi
+#     commento esteso nel play multimaster per il dettaglio completo
+#     (backtrace gdb, riscontri su mailing list OpenLDAP ufficiali).
+#
+# NOVITÀ v1.1.2 rispetto a v1.1.1 (causa dello stallo allo stop CONFERMATA
+# sul play multimaster con un backtrace dei thread - stesso parametro
+# presente anche qui, corretto per coerenza anche se non ancora testato
+# specificamente su una read-only):
+#   - timeout=3600 -> timeout=120 nel syncrepl verso i master. Un
+#     backtrace di slapd bloccato in stop (gdb -p $PID -batch -ex "thread
+#     apply all bt", sul play multimaster) ha mostrato i thread worker
+#     delle sessioni syncrepl refreshAndPersist fermi in poll()/
+#     ldap_result() con un timeout di 3600000 millisecondi - identico al
+#     parametro timeout=3600 configurato. In refreshAndPersist, a regime,
+#     il consumer resta fermo in questa attesa fino al timeout
+#     configurato, e lo shutdown di slapd non sembra interromperla
+#     attivamente: nel caso peggiore, un'ora di attesa prima che lo stop
+#     possa completarsi. keepalive=240:4:15 (gia' presente, invariato)
+#     resta la protezione dedicata contro una WAN lenta/instabile - non
+#     serve che timeout= sia altrettanto generoso.
+#
+# NOVITÀ v1.1.1 rispetto a v1.1 - SOLO fix minimo, NESSUN overlay chain:
+#   - BUG: il blocco ACL C/D falliva con "unknown attr 'pwdReset' in to
+#     clause". Causa: quell'ACL referenzia l'attributo pwdReset, definito
+#     dallo schema ppolicy - schema che si registra solo quando il MODULO
+#     ppolicy viene caricato. In questo file il modulo veniva caricato
+#     molto piu' avanti (nel blocco [PPOLICY] dedicato, appena prima di
+#     creare l'overlay) - troppo tardi per l'ACL, che veniva applicata
+#     prima.
+#   - FIX: aggiunto un caricamento anticipato del modulo ppolicy subito
+#     prima del blocco ACL (mirror di quanto fa gia' il play multimaster,
+#     dove "Enable ppolicy module" precede il proprio blocco ACL
+#     identico). Il caricamento tardivo nel blocco [PPOLICY] resta al suo
+#     posto (idempotente, innocuo) ma e' ora ridondante nella pratica.
+#   - Questa versione NON risolve il problema di fondo per cui un bind
+#     fallito sulla read-only non fa scattare pwdMaxFailure (confermato
+#     empiricamente con un test diretto, non solo sospettato): quel fix
+#     richiede l'overlay chain + modulo back_ldap + un'ACL master piu'
+#     ampia, deliberatamente NON inclusi qui su richiesta esplicita - solo
+#     il bug di questo run va corretto, non altro. Se in futuro serve
+#     riprendere quel lavoro, e' gia' pronto e verificato in una versione
+#     precedente di questo file (quella con i blocchi [CHAIN] espliciti).
+#
+# NOVITÀ v1.1 rispetto a v1.0:
+#   - Rinominato il file: rimosso "noppolicy" dal nome (PPolicy e' configurato
+#     per intero fin dalla v1.0, il nome era un residuo obsoleto - stesso
+#     problema del play multimaster).
+#   - BUG CRITICO CORRETTO: mancava del tutto il blocco ACL (olcAccess) sul
+#     database principale {1}mdb. Le repliche giravano quindi con l'ACL di
+#     default di slapd quando olcAccess non e' impostato (sostanzialmente
+#     permissiva: "to * by * read"), esponendo l'hash di userPassword e gli
+#     attributi di lockout ppolicy (pwdFailureTime, pwdAccountLockedTime,
+#     pwdHistory...) a qualunque identita' autenticata - vanificando
+#     l'hardening fatto sui master. Aggiunta l'ACL, IDENTICA a quella dei
+#     master (stesso contenuto, non "adattata" per sola lettura): e'
+#     necessario che sia identica perche' un client che tenta una scrittura
+#     permessa deve superare l'ACL locale prima che la replica lo possa
+#     REFERIRE correttamente al master (referral pulito). Un'ACL piu'
+#     restrittiva sulla replica produrrebbe un banale "insufficient access"
+#     al posto del referral utile, anche per client autorizzati.
+#   - ACL di cn=Monitor allineata a quella dei master: mancava il grant di
+#     lettura a group.exact="{{ ldap_admin_group }}", presente sui master.
+#   - Aggiunto attrs="*,+" esplicito al syncrepl verso i master (era assente,
+#     a differenza del play multimaster che lo specifica esplicitamente):
+#     rimuove ogni ambiguita' sulla replica corretta degli attributi
+#     operazionali di ppolicy, che governano lo stato di lockout.
+#   - keepalive allineato a quello dei master (240:4:15, tolleranza totale
+#     ~300s, era 180:4:15/~240s): stessa WAN simulata da entrambi i lati,
+#     non c'era motivo per una tolleranza diversa tra le due direzioni.
+#   - Indici degli overlay resi contigui (0,1,2 invece di 0,2,3): non serve
+#     che combacino con quelli del master (cn=config e' locale a ciascun
+#     nodo, indipendente), ma un gap non necessario invitava a chiedersi se
+#     mancasse qualcosa.
+#
+# VERSIONE v1.0 (baseline):
+#   Deploy read-only iniziale: PKI firmata dal coordinatore del cluster
+#   multimaster (CA riusata, non rigenerata), ACL globali PARZIALI (solo
+#   blocco bind anonimo, nessuna ACL sul database {1}mdb - vedi bug
+#   corretto sopra), overlay memberof + nestgroup (no refint: la pulizia
+#   dei riferimenti resta di competenza dei master, propagata via replica
+#   ordinaria) + ppolicy, tuning MDB, backend cn=Monitor, syncrepl HA
+#   multi-provider verso tutti e 3 i master + olcUpdateRef applicati in un
+#   unico ldapmodify atomico, con retry/until per tollerare un master non
+#   ancora pronto. Nome file conteneva ancora "noppolicy", nonostante
+#   ppolicy fosse già configurato per intero: refuso mai corretto dalla
+#   versione originale.
 # ==============================================================================
 
 ---
@@ -164,6 +284,35 @@
           LimitNPROC=65536
       notify: Ricarica systemd e riavvia slapd
 
+    # ---------------------------------------------------------------------
+    # TimeoutStopSec - stesso fix applicato al play multimaster, dove il
+    # blocco e' stato confermato con backtrace gdb (thread apply all bt):
+    # lo shutdown "grazioso" puo' restare in attesa indefinita di thread
+    # consumer syncrepl fermi in poll()/ldap_result() su una connessione al
+    # peer - un limite noto di OpenLDAP, non una nostra misconfigurazione
+    # (vedi commento esteso nel play multimaster). Qui deleghiamo a
+    # systemd: se lo stop non completa entro TimeoutStopSec, forza un
+    # SIGKILL sui processi residui del cgroup.
+    #
+    # Valore 15s (non piu' 4s): con il fix a monte sui timeout del
+    # syncrepl, uno stop pulito normale e' stato osservato richiedere circa
+    # 5s - un tetto troppo stretto rischiava un SIGKILL "di sicurezza" su
+    # uno shutdown che sarebbe comunque arrivato in fondo da solo, in
+    # tensione con olcDbNoSync=FALSE (voluto per ridurre il rischio di
+    # corruzione da kill forzati). Vedi commento esteso nel play
+    # multimaster.
+    # ---------------------------------------------------------------------
+
+    - name: "OS Tuning - Limita il tempo di stop di slapd (SIGKILL automatico se lo shutdown si blocca)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slapd.service.d/stop-timeout.conf
+        mode: "0644"
+        content: |
+          [Service]
+          TimeoutStopSec=15
+          KillMode=mixed
+      notify: Ricarica systemd e riavvia slapd
+
 
     - name: Certificati - Assicura che la directory sasl2 esista sulla replica (post-installazione slapd)
       ansible.builtin.file:
@@ -264,6 +413,75 @@
           olcRequires: "authc"
           olcDisallows: "bind_anon"
         state: present
+
+    # =========================================================================
+    # ACL GLOBALI - IDENTICHE a quelle del play multimaster (stesso contenuto,
+    # NON "adattate" per sola lettura). Un client che tenta una scrittura
+    # permessa deve superare l'ACL locale prima che questa replica lo possa
+    # REFERIRE correttamente al master via olcUpdateRef (referral pulito,
+    # configurato piu' sotto): un'ACL piu' restrittiva qui produrrebbe un
+    # banale "insufficient access" al posto del referral utile, anche per
+    # client autorizzati a scrivere.
+    #
+    # PREREQUISITO: la clausola {3} referenzia l'attributo "pwdReset", che
+    # esiste solo dopo che lo schema ppolicy e' stato registrato (caricato
+    # insieme al modulo). Il blocco [PPOLICY] piu' sotto in questo file
+    # carica il modulo, ma solo molto piu' avanti (subito prima di creare
+    # l'overlay) - troppo tardi per questa ACL, che veniva applicata prima
+    # e falliva con "unknown attr 'pwdReset' in to clause". Va quindi
+    # anticipato qui (esattamente come fa il play multimaster, dove
+    # "Enable ppolicy module" precede il proprio blocco ACL identico). Il
+    # caricamento e' idempotente: il modulo verra' semplicemente ritrovato
+    # gia' presente quando il blocco [PPOLICY] lo richiedera' di nuovo piu'
+    # avanti, senza errori ne' effetti collaterali.
+    # =========================================================================
+
+    - name: "[PPOLICY - anticipato] Carica il modulo ppolicy (serve lo schema per l'ACL qui sotto)"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "ppolicy"
+        state: present
+
+    - name: C/D. ACL Globali (SASL External a livello zero + protezione password/lockout)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={1}mdb,cn=config"
+        attributes:
+          olcAccess:
+            - >-
+              {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" manage by * break
+            - >-
+              {1}to dn.base="" by anonymous read by * read
+            - >-
+              {2}to dn.base="cn=Subschema" by anonymous read by * read
+            - >-
+              {3}to attrs=userPassword,pwdReset
+              by self write
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by * auth
+            - >-
+              {4}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
+              by self read
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by * none
+            - >-
+              {5}to dn.subtree="{{ ldap_basedn }}"
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by self write
+              by users read
+              by * none
+        state: exact
+        ordered: true
 
     # =========================================================================
     # CONFIGURAZIONE TLS E AUTHZREGEXP
@@ -395,12 +613,12 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={2}nestgroup,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={1}nestgroup,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcNestGroupConfig
         attributes:
-          olcOverlay: "{2}nestgroup"
+          olcOverlay: "{1}nestgroup"
           olcNestGroupBase: "ou=groups,{{ ldap_basedn }}"
           olcNestGroupMember: "member"
           olcNestGroupMemberOf: "memberOf"
@@ -413,21 +631,33 @@
 
     # --------------------------------------------------------------------
     # PPOLICY - creato QUI (prima che il syncrepl verso i master, piu' sotto,
-    # renda il nodo "vivo"), stesso indice {3} usato nel play multimaster
-    # per coerenza. olcPPolicyDefault punta alla entry cn=default: creata
-    # dal play multimaster e replicata qui via syncrepl come dato ordinario,
-    # NON viene ricreata in questo play.
+    # renda il nodo "vivo"). Indice {2}, contiguo con memberof={0} e
+    # nestgroup={1} sopra: non serve che combaci con l'indice usato nel play
+    # multimaster (qui non c'e' refint, quindi la sequenza e' piu' corta -
+    # cn=config e' comunque locale a ciascun nodo, indipendente dagli altri).
+    # olcPPolicyDefault punta alla entry cn=default: creata dal play
+    # multimaster e replicata qui via syncrepl come dato ordinario, NON
+    # viene ricreata in questo play.
     #
     # IMPORTANTE: cn=module{0},cn=config (la lista dei moduli caricati) e'
     # LOCALE a ciascun nodo - caricare ppolicy sui 3 master (deploy
     # multimaster) NON lo carica su questa replica, che e' un processo
-    # slapd completamente separato con la propria cn=config. Va ricaricato
-    # qui esplicitamente, altrimenti lo schema di olcPPolicyConfig
-    # (olcPPolicyDefault ecc.) non e' definito e la creazione dell'overlay
-    # fallisce con "attribute type undefined".
+    # slapd completamente separato con la propria cn=config. Serve quindi
+    # comunque essere caricato su questo nodo prima che l'overlay venga
+    # creato, altrimenti lo schema di olcPPolicyConfig (olcPPolicyDefault
+    # ecc.) non e' definito e la creazione dell'overlay fallisce con
+    # "attribute type undefined".
+    #
+    # NOTA: il modulo viene gia' caricato PRIMA, insieme al blocco ACL
+    # (serve li' lo schema dell'attributo pwdReset - vedi commento sopra
+    # quel blocco). Il task sotto e' quindi ridondante in pratica (il
+    # modulo risultera' gia' presente) ma resta qui: e' idempotente,
+    # innocuo, e mantiene questo blocco leggibile e autosufficiente senza
+    # dover risalire a un altro punto del file per capire da dove arriva
+    # la dipendenza.
     # --------------------------------------------------------------------
 
-    - name: "[PPOLICY] Carica il modulo globale ppolicy"
+    - name: "[PPOLICY] Carica il modulo globale ppolicy (idempotente: probabilmente gia' presente, vedi nota sopra)"
       community.general.ldap_attrs:
         server_uri: "ldapi:///"
         sasl_class: "external"
@@ -440,12 +670,12 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={3}ppolicy,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={2}ppolicy,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcPPolicyConfig
         attributes:
-          olcOverlay: "{3}ppolicy"
+          olcOverlay: "{2}ppolicy"
           olcPPolicyDefault: "cn=default,ou=policies,{{ ldap_basedn }}"
           olcPPolicyForwardUpdates: "TRUE"
           olcPPolicyHashCleartext: "TRUE"
@@ -465,6 +695,16 @@
     # database {1}mdb che ha gia' una sessione syncrepl "refreshAndPersist"
     # attiva verso i master puo' bloccare slapd in attesa di un lock
     # esclusivo che la connessione di replica non rilascia.
+    #
+    # olcDbNoSync: FALSE (il default OpenLDAP) - era TRUE. Stesso motivo del
+    # play multimaster: TimeoutStopSec=4 (drop-in systemd piu' sopra) rende
+    # il SIGKILL forzato l'esito normale di uno stop con syncrepl attivo
+    # (limite noto di OpenLDAP), e con fsync disattivato un kill in un
+    # momento sfortunato rischia di perdere scritture non ancora forzate su
+    # disco - gia' osservato una volta in questo progetto. Le importazioni
+    # massive passano da slapadd (offline), non da scritture online, quindi
+    # il vantaggio di prestazioni di NoSync=TRUE non serve al caso d'uso
+    # reale e non vale il rischio.
     # =========================================================================
 
     - name: Generazione LDIF per Indici e Tuning MDB
@@ -478,7 +718,7 @@
           olcDbMaxSize: 32212254720
           -
           replace: olcDbNoSync
-          olcDbNoSync: TRUE
+          olcDbNoSync: FALSE
           -
           replace: olcDbIndex
           olcDbIndex: objectClass eq
@@ -516,7 +756,7 @@
           changetype: add
           objectClass: olcDatabaseConfig
           olcDatabase: {2}monitor
-          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by * none
+          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
 
     - name: Applicazione configurazione backend cn=Monitor
       ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
@@ -563,24 +803,22 @@
     # finestra in cui syncrepl e' gia' vivo (connessione persistente aperta)
     # ma updateRef non ancora applicato.
     #
-    # keepalive=180:4:15 (~240s totali prima che slapd rilevi una connessione
-    # morta): un valore precedente piu' aggressivo (60:3:10, ~90s) era stato
-    # introdotto per un problema di connessioni che cadevano ogni pochi
-    # minuti a carico normale - ma si e' rivelato controproducente durante
-    # import di scala: sotto carico pesante (CPU satura) o su una WAN con
-    # jitter/perdita di pacchetti, un keepalive troppo stretto puo' scambiare
-    # "il peer e' vivo ma lento" per "la connessione e' morta", forzando
-    # riconnessioni non necessarie che su dataset di grandi dimensioni
-    # costano un refresh completo - innescando un circolo vizioso (piu'
-    # carico, piu' lentezza, piu' falsi allarmi). Un keepalive piu' permissivo
-    # tollera meglio sia la latenza/jitter di una WAN reale sia i picchi di
-    # carico di un import massivo, restando comunque in grado di rilevare
-    # una connessione genuinamente morta in tempi ragionevoli.
+    # keepalive=10:5:2, network-timeout=5, timeout=5 (dalla v1.1.5 - vedi
+    # changelog in testa al file): valori precedenti molto piu' permissivi
+    # (keepalive=240:4:15, network-timeout=30, timeout=120/3600) erano
+    # pensati per tollerare la WAN simulata di questo progetto senza falsi
+    # allarmi di connessione morta - ma un backtrace gdb ha mostrato che
+    # proprio quella generosita' e' la causa di uno stallo confermato allo
+    # stop di slapd (thread consumer syncrepl fermi in poll() per l'intera
+    # durata del timeout configurato, mai interrotti attivamente dallo
+    # shutdown - limite noto di OpenLDAP, non una nostra misconfigurazione).
+    # La guida ufficiale Ubuntu per la replica OpenLDAP non imposta affatto
+    # "timeout=" nei suoi esempi (solo retry=) - un'indicazione che valori
+    # bassi/assenti sono la prassi comune, non un azzardo. Ambiente di
+    # test: si privilegia la reattività allo stop rispetto alla tolleranza
+    # a una WAN particolarmente lenta - da rivedere se questi valori si
+    # rivelano troppo aggressivi nei test (falsi allarmi di disconnessione).
     #
-    # network-timeout=30 (era 15): margine aggiuntivo per lo stabilimento
-    # della connessione TCP/TLS su una WAN con latenza/jitter reali, oltre
-    # a quanto modellato dalla sola simulazione (istradamento aggiuntivo,
-    # overhead IPSec, ecc.).
     # =========================================================================
 
     - name: Generazione LDIF combinato per Syncrepl (multi-provider) + olcUpdateRef
@@ -592,7 +830,7 @@
           changetype: modify
           replace: olcSyncRepl
           {% for node in cluster_nodes %}
-          olcSyncRepl: rid={{ 100 + loop.index }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=3600 network-timeout=30 keepalive=180:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand exattrs="memberOf"
+          olcSyncRepl: rid={{ 100 + loop.index }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=5 network-timeout=5 keepalive=10:5:2 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand attrs="*,+" exattrs="memberOf"
           {% endfor %}
           -
           replace: olcUpdateRef

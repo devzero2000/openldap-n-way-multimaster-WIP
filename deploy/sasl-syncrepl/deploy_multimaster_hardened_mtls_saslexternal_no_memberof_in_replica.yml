@@ -2,7 +2,168 @@
 # TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
+# VERSIONE:     1.7 (review - CONFERMATO con test reale)
 # SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
+#
+# NOVITÀ v1.7 rispetto a v1.6:
+#   - TimeoutStopSec 4 -> 15. Lo stop pulito osservato dopo il fix ai
+#     timeout del syncrepl richiede circa 5s: un tetto a 4s era troppo
+#     stretto e rischiava un SIGKILL "di sicurezza" anche su uno shutdown
+#     che sarebbe comunque completato da solo - in tensione diretta con
+#     olcDbNoSync=FALSE (voluto apposta per ridurre il rischio di
+#     corruzione da kill forzati). 15s lascia margine a uno stop normale
+#     anche un po' piu' lento, restando comunque un tetto netto rispetto
+#     ai minuti/ore di prima del fix.
+#
+# CONFERMATO (redeploy pulito + test reale): sia lo stop di slapd a mesh
+# vivo sia una modifica a caldo di cn=config (es. cambio olcLogLevel) ora
+# completano rapidamente, senza piu' lo stallo osservato nelle versioni
+# precedenti. Non piu' sperimentale.
+#
+# NOVITÀ v1.6 rispetto a v1.5 (valori aggressivi per isolare/testare la
+# isolare/testare la causa dello stallo, ispirati all'assenza di timeout=
+# negli esempi della guida ufficiale Ubuntu per la replica OpenLDAP:
+# https://ubuntu.com/server/docs/how-to/openldap/replication/):
+#   - timeout=120 -> timeout=5
+#   - network-timeout=30 -> network-timeout=5
+#   - keepalive=240:4:15 -> keepalive=10:5:2
+#   Valori deliberatamente stretti, per un ambiente di test dove la
+#   priorita' e' verificare se ridurre drasticamente questi tre parametri
+#   elimina lo stallo confermato allo stop/durante modifiche a caldo di
+#   cn=config. Non sono valori pensati per tollerare una WAN lenta/instabile
+#   in modo permissivo come le versioni precedenti - attesi possibili falsi
+#   allarmi di disconnessione/refresh piu' frequenti durante i test, da
+#   valutare insieme al risultato principale (lo stallo sparisce o no).
+#
+# NOVITÀ v1.5 rispetto a v1.4 (TimeoutStopSec abbassato, olcDbNoSync
+# riportato al default per coerenza con quella scelta):
+#   - TimeoutStopSec 20 -> 4. Chiarito che con un valore cosi' basso il
+#     SIGKILL forzato diventa l'esito ATTESO/normale di uno stop quando
+#     slapd ha sessioni syncrepl attive (il blocco osservato dura piu' dei
+#     ~10s che l'init script concede di suo, quindi 4s scattera' sempre in
+#     quel caso, non solo occasionalmente) - non piu' una rete di sicurezza
+#     per un caso raro.
+#   - olcDbNoSync: TRUE -> FALSE (il default OpenLDAP). Diretta conseguenza
+#     della scelta sopra: se il SIGKILL forzato e' ora l'esito NORMALE (non
+#     eccezionale) di uno stop con replica attiva, tenere fsync disattivato
+#     alza concretamente il rischio di perdere scritture non ancora
+#     forzate su disco al momento del kill - rischio gia' concretizzato una
+#     volta in questo stesso progetto (corruzione del database MDB dopo un
+#     kill -9 manuale). Le importazioni massive di questo progetto passano
+#     da slapadd (bulk load offline, a slapd fermo), non da scritture LDAP
+#     online: il vantaggio prestazionale di NoSync=TRUE sulle scritture a
+#     caldo non serve al caso d'uso reale, quindi non vale piu' il rischio
+#     ora che i kill forzati sono la norma.
+#
+# NOVITÀ v1.4 rispetto a v1.3 (timeout=120 confermato NON sufficiente da
+# solo - un secondo backtrace mostra lo stesso identico blocco, stavolta
+# con poll(timeout=120000) invece di 3600000: riduce il caso peggiore, non
+# elimina il blocco strutturale):
+#   - Il pattern "shutdown in attesa indefinita di un thread consumer
+#     syncrepl fermo in poll()/ldap_result() su una connessione al peer,
+#     mai interrotto attivamente" risulta un limite noto e ricorrente di
+#     OpenLDAP, non una nostra misconfigurazione: trovate piu' segnalazioni
+#     indipendenti sulle mailing list ufficiali nel corso degli anni (es.
+#     "slapd shutdown: waiting for N operations/tasks to finish"), con
+#     risposte di sviluppatori Symas/OpenLDAP che trattano il caso come
+#     "serve un backtrace gdb", non come errore di configurazione - mai
+#     un fix definitivo nel codice.
+#   - FIX (a livello di systemd, non piu' di OpenLDAP): aggiunto un
+#     secondo drop-in (stop-timeout.conf) con TimeoutStopSec=4 e
+#     KillMode=mixed. Se lo stop grazioso non completa entro 4s, systemd
+#     forza un SIGKILL sui processi residui del cgroup - converte "puo'
+#     restare appeso per un tempo imprevedibile" in "si ferma sempre entro
+#     un tempo limitato", che e' l'unica garanzia realisticamente
+#     ottenibile senza intervenire sul codice sorgente di OpenLDAP. Rileva
+#     anche i riavvii lanciati da QUESTO STESSO playbook durante il
+#     deploy: senza, un blocco durante uno di quei riavvii bloccherebbe
+#     l'intero run Ansible, non solo un test manuale.
+#
+# NOVITÀ v1.3 rispetto a v1.2 (causa dello stallo allo stop CONFERMATA con
+# un backtrace dei thread, non più solo un sospetto):
+#   - Backtrace di slapd bloccato in stop (gdb -p $PID -batch -ex "thread
+#     apply all bt"): il thread principale e' in pthread_join, in attesa
+#     del thread che esegue ldap_pvt_thread_pool_close(), che a sua volta
+#     aspetta che TUTTI i worker del pool escano. Due worker (esattamente
+#     le 2 sessioni syncrepl refreshAndPersist verso gli altri 2 master, in
+#     un mesh a 3 vie - combacia con "waiting for 2 operations/tasks to
+#     finish" nel log di systemd) risultano fermi in poll()/ldap_result()
+#     con un timeout di 3600000 millisecondi = 3600 secondi. Numero
+#     identico, non casuale, al parametro timeout=3600 impostato nella
+#     stringa olcSyncRepl. WAN simulata e iptables esclusi come causa
+#     (verificato: tc mostra solo fq_codel, il default Ubuntu; iptables
+#     mangle vuoto).
+#   - FIX: timeout=3600 -> timeout=120. In modalita' refreshAndPersist, a
+#     regime (nessun aggiornamento da replicare), il consumer resta fermo
+#     in questa attesa fino al timeout configurato; lo shutdown di slapd
+#     non sembra interromperla attivamente, quindi nel caso peggiore
+#     un'ora intera di attesa prima che lo stop possa completarsi. La
+#     tolleranza a una WAN lenta/instabile resta comunque garantita da
+#     keepalive=240:4:15 (gia' presente, invariato), pensato apposta per
+#     quello scopo - non serve che timeout= sia altrettanto generoso.
+#   - Non ancora verificato con un nuovo test di stop dopo il redeploy:
+#     la correlazione numerica (3600000ms nel backtrace = 3600s nel
+#     parametro) e' una prova diretta forte, ma la conferma finale resta
+#     un redeploy pulito seguito da uno stop.
+#
+# NOVITÀ v1.2 rispetto a v1.1 (sospetto: stallo di slapd allo stop, causa
+# possibile trovata nell'indice di syncprov):
+#   - syncprov spostato dall'indice {4} all'indice {0}. Fonte: Quanah
+#     Gibson-Mount (sviluppatore Symas/OpenLDAP), mailing list
+#     openldap-technical: "For any replicated database, the SYNCPROV
+#     overlay should always be in the {0} index slot". L'indice {0} in
+#     cn=config e' l'overlay piu' ESTERNO nello stack (primo in entrata,
+#     ultimo sul percorso di ritorno/commit) - la posizione giusta per
+#     "catturare le modifiche derivate di memberof/refint/ppolicy", che
+#     era gia' l'intento dichiarato (vedi NOTA IMPORTANTE 2 storica), ma
+#     tradotto nell'indice sbagliato. Gli altri overlay rinumerati di
+#     conseguenza: memberof={1}, refint={2}, nestgroup={3}, ppolicy={4}.
+#   - Aggiunto un riavvio esplicito subito dopo la creazione di syncprov,
+#     prima che il syncrepl attivi il mesh: senza, syncprov verrebbe
+#     inserito a caldo (senza riavvio) in una posizione PIU' ESTERNA di
+#     uno stack overlay gia' attivo da un riavvio precedente - non c'e'
+#     certezza che l'aggancio dinamico a runtime in quella direzione
+#     risistemi correttamente lo stack in memoria, e non era il caso di
+#     fare affidamento su questo proprio con l'overlay sospettato.
+#   - NON ANCORA CONFERMATO che questo risolva lo stallo di slapd al momento
+#     dello stop osservato su un nodo dopo test intensivi (bind falliti,
+#     cambi password ripetuti): l'indice sbagliato di syncprov e' una
+#     violazione reale e documentata delle linee guida OpenLDAP, trovata
+#     verificando esplicitamente il sospetto sollevato dall'operatore che
+#     la causa fosse negli indici tra parentesi graffe - ma il meccanismo
+#     esatto che collegherebbe un ordine overlay sbagliato a un blocco
+#     specifico allo shutdown non e' stato dimostrato, solo ritenuto
+#     plausibile. Verificare con un redeploy completo da zero.
+#
+# NOVITÀ v1.1 rispetto a v1.0:
+#   - Rinominato il file: rimosso "noppolicy" dal nome. Il file configura
+#     PPolicy per intero (modulo + overlay {3}ppolicy) fin dalla v1.0: il
+#     vecchio nome era un residuo di una versione precedente senza PPolicy,
+#     mai aggiornato dopo l'aggiunta dell'overlay — rischio concreto di
+#     confusione su quale file abbia davvero cosa.
+#   - syncprov ora ha un indice esplicito {4} nella DN (invece di lasciarlo
+#     auto-numerato da OpenLDAP). Motivo: garantire idempotenza certa tra
+#     un run e l'altro — con indice esplicito, il modulo ldap_entry
+#     confronta sempre la stessa DN letterale con quella effettivamente
+#     memorizzata, senza dipendere dalla risoluzione "tollerante" di
+#     OpenLDAP per DN di cn=config senza ordinale.
+#   - Corretto il commento sull'indice di syncprov (vedi sotto, sezione
+#     MEMBEROF/REFINT/NESTGROUP/PPOLICY): affermava "istanza {3} nel
+#     playbook successivo", ma syncprov viene creato nello STESSO file,
+#     DOPO ppolicy che occupa già l'indice {3} — quindi l'indice corretto
+#     è {4}, non {3}, e non c'è alcun "playbook successivo" separato.
+#
+# VERSIONE v1.0 (baseline):
+#   Deploy multimaster N-way iniziale: PKI/CA locale generata e distribuita
+#   ai nodi del cluster, ACL globali (peercred manage, protezione
+#   userPassword/attributi lockout, subtree con self-write), DIT di base
+#   (ou=system/groups/people, gruppo amministratori, ou=policies + Password
+#   Policy "default"), overlay memberof/refint/nestgroup + ppolicy, tuning
+#   MDB (indici, maxsize, nosync), backend cn=Monitor, ServerID dinamico e
+#   syncrepl multi-provider via LDAPS/SASL-EXTERNAL con memberOf escluso
+#   dalla replica (exattrs). Nome file conteneva ancora "noppolicy",
+#   nonostante ppolicy fosse già configurato per intero: refuso mai
+#   corretto dalla versione originale.
 # ==============================================================================
 
 ---
@@ -65,6 +226,49 @@
           [Service]
           LimitNOFILE=65536
           LimitNPROC=65536
+      notify: Ricarica systemd e riavvia slapd
+
+    # ---------------------------------------------------------------------
+    # TimeoutStopSec - confermato con backtrace gdb (thread apply all bt) su
+    # slapd bloccato in stop: lo shutdown "grazioso" puo' restare in attesa
+    # indefinita di thread consumer syncrepl fermi in poll()/ldap_result()
+    # su una connessione al peer - non interrotti attivamente dallo
+    # shutdown, qualunque sia il timeout configurato lato syncrepl
+    # (verificato: capita identico sia con timeout=3600 sia con
+    # timeout=120, cambia solo il tetto massimo dell'attesa, non se il
+    # blocco si presenta). E' un pattern segnalato piu' volte nel tempo
+    # sulle mailing list ufficiali OpenLDAP (es. "slapd shutdown: waiting
+    # for N operations/tasks to finish", con risposta di uno sviluppatore
+    # Symas/OpenLDAP che suggerisce di allegare un backtrace come gia'
+    # fatto qui), mai risolto in modo definitivo nel codice - non e' un
+    # errore nostro di configurazione da eliminare, e' un limite noto da
+    # arginare dall'esterno.
+    # Qui deleghiamo a systemd: se lo stop non completa entro
+    # TimeoutStopSec, forza un SIGKILL sui processi residui del cgroup -
+    # cosi' OGNI stop/restart (compresi quelli lanciati da questo stesso
+    # playbook durante il deploy) e' garantito a completarsi entro un
+    # tempo limitato, invece di poter restare appeso indefinitamente.
+    #
+    # Valore 15s (non piu' 4s come nel primo tentativo): con il fix a monte
+    # sui timeout del syncrepl (piu' sotto in questo file), uno stop pulito
+    # normale e' stato osservato richiedere circa 5s - un tetto a 4s
+    # rischiava di far scattare un SIGKILL "di sicurezza" anche su uno
+    # shutdown che sarebbe comunque arrivato in fondo da solo, proprio
+    # mentre olcDbNoSync e' stato riportato a FALSE per ridurre il rischio
+    # di corruzione da kill forzati - le due misure erano in tensione tra
+    # loro a 4s. 15s lascia margine a uno stop normale anche un po' piu'
+    # lento (es. sotto carico), restando comunque un tetto netto rispetto
+    # ai minuti/ore osservati prima del fix.
+    # ---------------------------------------------------------------------
+
+    - name: "OS Tuning - Limita il tempo di stop di slapd (SIGKILL automatico se lo shutdown si blocca)"
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/slapd.service.d/stop-timeout.conf
+        mode: "0644"
+        content: |
+          [Service]
+          TimeoutStopSec=15
+          KillMode=mixed
       notify: Ricarica systemd e riavvia slapd
 
 
@@ -480,7 +684,7 @@
           replace: olcLimits
           {% set all_nodes = cluster_nodes + readonly_nodes %}
           {% for node in all_nodes %}
-          olcLimits: {% raw %}{{% endraw %}{{ loop.index0 }}{% raw %}{% endraw %}}dn.exact="cn={{ node }},ou=system,{{ ldap_basedn }}" time.soft=unlimited time.hard=unlimited size.soft=unlimited size.hard=unlimited size.pr=unlimited size.prtotal=unlimited
+          olcLimits: {% raw %}{{% endraw %}{{ loop.index0 }}}dn.exact="cn={{ node }},ou=system,{{ ldap_basedn }}" time.soft=unlimited time.hard=unlimited size.soft=unlimited size.hard=unlimited size.pr=unlimited size.prtotal=unlimited
           {% endfor %}
 
     - name: F4. Applicazione Limiti Replica
@@ -546,9 +750,16 @@
     #   memberof entrano in conflitto con i valori replicati dagli altri master.
     #
     # NOTA IMPORTANTE 2:
-    #   syncprov va aggiunto per ultimo (istanza {3}) nel playbook successivo,
-    #   cosi' da catturare correttamente anche le modifiche derivate generate
-    #   internamente da memberof/refint.
+    #   syncprov e' istanza {0} (overlay piu' esterno nello stack - vedi
+    #   commento dettagliato piu' sotto, sul task che lo crea), creato PIU'
+    #   AVANTI in QUESTO STESSO playbook (sezione "CONFIGURAZIONE
+    #   REPLICA..."), DOPO memberof={1}, refint={2}, nestgroup={3},
+    #   ppolicy={4} creati qui sotto. L'ordine di CREAZIONE (chi viene
+    #   aggiunto prima nel play) non determina l'ordine dello STACK
+    #   overlay (quello lo determina solo l'indice numerico nella DN): far
+    #   girare il task di syncprov per ultimo, ma con indice {0}, e'
+    #   corretto e intenzionale - garantisce comunque che catturi le
+    #   modifiche derivate generate internamente da memberof/refint/ppolicy.
     #
     # NOTA IMPORTANTE 3 (deprecazione):
     #   La man page ufficiale di slapo-memberof(5) dichiara l'overlay deprecato
@@ -576,12 +787,12 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={0}memberof,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={1}memberof,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcMemberOf
         attributes:
-          olcOverlay: "{0}memberof"
+          olcOverlay: "{1}memberof"
           olcMemberOfGroupOC: "groupOfNames"
           olcMemberOfMemberAD: "member"
           olcMemberOfMemberOfAD: "memberOf"
@@ -613,12 +824,12 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={1}refint,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={2}refint,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcRefintConfig
         attributes:
-          olcOverlay: "{1}refint"
+          olcOverlay: "{2}refint"
           # Volutamente NON includere memberOf qui: e' gestito solo da
           # memberof (overlay {0} sopra).
           olcRefintAttribute:
@@ -647,12 +858,12 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={2}nestgroup,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={3}nestgroup,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcNestGroupConfig
         attributes:
-          olcOverlay: "{2}nestgroup"
+          olcOverlay: "{3}nestgroup"
           # Sottoalbero che contiene le entry di tipo gruppo
           olcNestGroupBase: "ou=groups,{{ ldap_basedn }}"
           # Attributi coerenti con quelli usati da memberof sopra
@@ -672,22 +883,23 @@
     # PPOLICY - creato QUI (prima che ServerID/syncprov/syncrepl rendano il
     # mesh "vivo" piu' sotto), non in un play separato su un mesh gia' in
     # replica: e' esattamente questa la differenza che evita la contesa
-    # vista aggiungendo l'overlay a caldo. L'indice {3} e' deterministico
-    # in questo punto del play (memberof=0, refint=1, nestgroup=2 sono gia'
+    # vista aggiungendo l'overlay a caldo. L'indice {4} e' deterministico
+    # in questo punto del play (memberof=1, refint=2, nestgroup=3 sono gia'
     # stati creati poco sopra, in questo stesso play, senza alcun altro
-    # overlay che possa essersi inserito nel frattempo).
+    # overlay che possa essersi inserito nel frattempo). syncprov occupera'
+    # {0} piu' avanti nel play - vedi commento sul task che lo crea.
     # --------------------------------------------------------------------
 
     - name: "[PPOLICY] Inizializza e configura l'overlay"
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay={3}ppolicy,olcDatabase={1}mdb,cn=config"
+        dn: "olcOverlay={4}ppolicy,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcPPolicyConfig
         attributes:
-          olcOverlay: "{3}ppolicy"
+          olcOverlay: "{4}ppolicy"
           olcPPolicyDefault: "cn=default,ou=policies,{{ ldap_basedn }}"
           olcPPolicyForwardUpdates: "TRUE"
           olcPPolicyHashCleartext: "TRUE"
@@ -709,6 +921,23 @@
     # connessioni di replica non rilasciano (mesh multi-master gia' "vivo").
     # Tenendo il tuning qui, il database e' ancora "locale" e isolato quando
     # viene modificato.
+    #
+    # olcDbNoSync: FALSE (il default OpenLDAP) - era TRUE (fsync disattivato,
+    # scelto per prestazioni). Cambiato per due motivi legati insieme:
+    #   1) TimeoutStopSec=4 (vedi override systemd piu' sopra) rende il
+    #      SIGKILL forzato l'esito NORMALE di uno stop quando slapd ha
+    #      sessioni syncrepl attive che non si chiudono da sole in tempo
+    #      (limite noto di OpenLDAP, non risolvibile lato nostro - vedi
+    #      commento sul drop-in stop-timeout.conf). Con fsync disattivato,
+    #      un SIGKILL in un momento sfortunato puo' perdere scritture che
+    #      il sistema operativo non aveva ancora fisicamente forzato su
+    #      disco - rischio concreto gia' osservato una volta in questo
+    #      progetto (corruzione MDB dopo un kill -9 manuale).
+    #   2) Le importazioni massive di questo progetto passano da slapadd
+    #      (bulk load offline, a slapd fermo), non da scritture LDAP a
+    #      caldo - quindi il vantaggio di prestazioni di NoSync=TRUE sulle
+    #      scritture online non serve per il caso d'uso reale, e non vale
+    #      il rischio sopra.
     # =========================================================================
 
     - name: G. Generazione LDIF per Indici, MaxSize e Tuning MDB (DB SYNC ATTIVO)
@@ -722,7 +951,7 @@
           olcDbMaxSize: 32212254720
           -
           replace: olcDbNoSync
-          olcDbNoSync: TRUE
+          olcDbNoSync: FALSE
           -
           replace: olcDbIndex
           olcDbIndex: objectClass eq
@@ -818,12 +1047,25 @@
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         sasl_class: "external"
-        dn: "olcOverlay=syncprov,olcDatabase={1}mdb,cn=config"
+        # Indice esplicito {0}: dalla documentazione ufficiale OpenLDAP
+        # (Quanah Gibson-Mount, sviluppatore Symas/OpenLDAP, mailing list
+        # openldap-technical): "For any replicated database, the SYNCPROV
+        # overlay should always be in the {0} index slot". L'indice {0} in
+        # cn=config e' l'overlay piu' ESTERNO nello stack: il primo a
+        # vedere l'operazione in entrata, e l'ultimo sul percorso di
+        # ritorno/commit - quindi quello che vede l'entry con TUTTE le
+        # modifiche derivate di memberof/refint/ppolicy gia' applicate.
+        # Era esattamente il comportamento voluto (vedi NOTA IMPORTANTE 2
+        # piu' sopra), ma tradotto nell'indice sbagliato ({4}, l'ultimo,
+        # che invece e' l'overlay piu' INTERNO - il primo committed, non
+        # l'ultimo). Gli altri overlay sono stati rinumerati di
+        # conseguenza: memberof={1}, refint={2}, nestgroup={3}, ppolicy={4}.
+        dn: "olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config"
         objectClass:
           - olcOverlayConfig
           - olcSyncProvConfig
         attributes:
-          olcOverlay: "syncprov"
+          olcOverlay: "{0}syncprov"
           # 2.000.000 (era 100.000): con dataset di scala (es. custom-scale,
           # ~1.13M operazioni di appartenenza) il vecchio limite veniva
           # superato durante un singolo import, costringendo i consumer che
@@ -835,6 +1077,22 @@
           olcSpCheckpoint: "1000 10"
         state: present
 
+    # RIAVVIO OBBLIGATORIO qui: syncprov e' stato inserito a caldo
+    # nell'indice {0} (il piu' esterno) di uno stack overlay che a questo
+    # punto e' gia' attivo da un riavvio precedente (memberof/refint/
+    # nestgroup/ppolicy). Un inserimento dinamico via ldapmodify in una
+    # posizione PIU' ESTERNA di overlay gia' incatenati a runtime non da'
+    # la certezza di ri-agganciare correttamente lo stack in memoria senza
+    # un riavvio - meglio non fare affidamento su questo con l'overlay
+    # proprio sospettato di un blocco. Il riavvio va PRIMA che il syncrepl
+    # (task 10/11 sotto) renda il mesh live: cosi' quando le sessioni di
+    # replica partono, lo stack overlay e' gia' definitivamente stabile
+    # nell'ordine corretto.
+    - name: "[RESTART] Riavvia slapd per stabilizzare lo stack overlay con syncprov a {0}"
+      ansible.builtin.systemd:
+        name: slapd
+        state: restarted
+
     - name: 10. Generazione LDIF per Syncrepl e MultiProvider via LDAPS (SASL EXTERNAL) - Completamente Dinamico
       ansible.builtin.copy:
         dest: /tmp/04_multimaster.ldif
@@ -845,7 +1103,7 @@
           replace: olcSyncRepl
           {% for node in cluster_nodes %}
           {% if node != inventory_hostname %}
-          olcSyncRepl: rid={{ "%03d" | format(loop.index) }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=3600 network-timeout=30 keepalive=240:4:15 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand attrs="*,+" exattrs="memberOf"
+          olcSyncRepl: rid={{ "%03d" | format(loop.index) }} provider=ldaps://{{ node }}:636 bindmethod=sasl saslmech=EXTERNAL searchbase="{{ ldap_basedn }}" type=refreshAndPersist retry="5 10 10 30 60 120 300 +" timeout=5 network-timeout=5 keepalive=10:5:2 tls_cacert={{ ssl_ca_path }} tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_reqcert=demand attrs="*,+" exattrs="memberOf"
           {% endif %}
           {% endfor %}
           -
