@@ -197,7 +197,7 @@
           #    schema (groupOfNames richiede almeno un "member"): con questa
           #    densita' non capita mai per caso, ma teniamo un fallback.
           for i in range(1, total_groups + 1):
-              lines = f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=custom-scale-group-{i}\ndescription: Gruppo custom {i}\n"
+              lines = f"dn: cn=custom-scale-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-group-{i}\ndescription: Gruppo custom {i}\n"
               members = group_members[i]
               if not members:
                   members = [f"cn=admin,{suffix}"]
@@ -209,7 +209,7 @@
           architect_dn = f"uid=custom-scale-user-{test_user_architect_index},ou=People,{suffix}"
           for i in range(1, deep_nesting_root_groups + 1):
               anchor_group = i * deep_nesting_anchor_step
-              lines = f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=custom-scale-root-deep-{i}\ndescription: Radice profonda {i}\n"
+              lines = f"dn: cn=custom-scale-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: custom-scale-root-deep-{i}\ndescription: Radice profonda {i}\n"
               lines += f"member: cn=custom-scale-deep-tier-1,ou=groups,{suffix}\n"
               lines += f"member: cn=custom-scale-group-{anchor_group},ou=groups,{suffix}\n"
               if i == 1:
