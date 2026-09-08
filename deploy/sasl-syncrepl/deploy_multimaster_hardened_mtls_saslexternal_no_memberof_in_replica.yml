@@ -541,22 +541,22 @@
             - >-
               {3}to attrs=userPassword,pwdReset
               by self write
-              by dn.exact="{{ ldap_rootdn }}" write
-              by group.exact="{{ ldap_admin_group }}" write
-              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by dn.exact="{{ ldap_rootdn }}" manage
+              by group.exact="{{ ldap_admin_group }}" manage
+              by dn.subtree="ou=system,{{ ldap_basedn }}" manage
               by * auth
             - >-
               {4}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
               by self read
-              by dn.exact="{{ ldap_rootdn }}" write
-              by group.exact="{{ ldap_admin_group }}" write
-              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by dn.exact="{{ ldap_rootdn }}" manage
+              by group.exact="{{ ldap_admin_group }}" manage
+              by dn.subtree="ou=system,{{ ldap_basedn }}" manage
               by * none
             - >-
               {5}to dn.subtree="{{ ldap_basedn }}"
-              by dn.exact="{{ ldap_rootdn }}" write
-              by group.exact="{{ ldap_admin_group }}" write
-              by dn.subtree="ou=system,{{ ldap_basedn }}" read
+              by dn.exact="{{ ldap_rootdn }}" manage
+              by group.exact="{{ ldap_admin_group }}" manage
+              by dn.subtree="ou=system,{{ ldap_basedn }}" manage
               by self write
               by users read
               by * none
