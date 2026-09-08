@@ -1,6 +1,6 @@
 ---
 - name: Configurazione Livello Log OpenLDAP su Tutto il Cluster
-  hosts: cluster
+  hosts: ldap_all
   become: true
   gather_facts: false
 
