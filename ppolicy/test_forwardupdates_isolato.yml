@@ -1,0 +1,111 @@
+# ==============================================================================
+# TITOLO:       Test Isolato - Verifica olcPPolicyForwardUpdates sulla Read-Only
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.1
+# SCOPO:        Il piu' semplice possibile: crea un utente pulito, genera UN
+#               SOLO fallimento di bind mirato ESCLUSIVAMENTE alla replica
+#               read-only, poi legge pwdFailureTime in locale su ciascuno dei
+#               4 nodi per vedere se (e dove) l'inoltro e' avvenuto.
+#
+# NOVITÀ v1.1 rispetto a v1.0:
+#   - test_user_dn spostato da ou=users a ou=people: il play di deploy crea
+#     "system", "groups", "people" come OU di base (task "E2/F2a. Crea le
+#     Organizational Unit di base") - "ou=users" non fa parte della
+#     struttura reale del DIT, era un container ad-hoc creato solo da
+#     questo test. Standardizzato su cio' che il deploy crea davvero.
+#   - Rimossa la creazione ad-hoc dell'OU (non serve piu': ou=people esiste
+#     gia' dal deploy).
+#   - CONFERMATO FUNZIONANTE: questo test (nella sua forma precedente, con
+#     ou=users) e' stato lo strumento decisivo per isolare e confermare che
+#     olcPPolicyForwardUpdates + overlay chain ora inoltrano correttamente
+#     pwdFailureTime dalla read-only al master (vedi changelog dei play di
+#     deploy per la cronologia completa: chain overlay, mode=none, ACL
+#     "manage" per il Relax Control).
+# ==============================================================================
+
+---
+- name: Test Isolato ForwardUpdates
+  hosts: cluster
+  gather_facts: false
+  vars:
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+    test_user_dn: "cn=testuser,ou=people,{{ suffix }}"
+    test_user_pw: "TestForwardUpdates123!"
+
+    node1: "{{ groups['cluster'][0] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    all_nodes: "{{ groups['cluster'] + readonly_nodes }}"
+
+  tasks:
+    - name: "[SETUP] Rimuovi l'utente di test se gia' presente (reset pulito)"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true
+
+    - name: "[SETUP] Crea l'utente di test con password pulita"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        objectClass: [top, person, organizationalPerson, inetOrgPerson]
+        attributes:
+          cn: testuser
+          sn: Test
+          userPassword: "{{ test_user_pw }}"
+        state: present
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
+
+    - name: "[TEST] Genera UN SOLO fallimento di bind, mirato ESCLUSIVAMENTE alla replica read-only"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ readonly_nodes[0] }}/
+        -D "{{ test_user_dn }}"
+        -w "PasswordSbagliataErrata!"
+        -b "{{ suffix }}" "(objectClass=*)"
+      failed_when: false
+      changed_when: false
+      run_once: true
+
+    - name: "[PAUSA] Attesa breve per l'eventuale inoltro (ForwardUpdates) e la replica"
+      ansible.builtin.pause:
+        seconds: 3
+      run_once: true
+
+    - name: "[VERIFICA] Legge pwdFailureTime IN LOCALE su ciascun nodo (readonly + ogni master)"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "{{ test_user_dn }}" -s base pwdFailureTime
+      register: check
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[RISULTATO] Mostra dove (se dove) e' comparso il fallimento generato sulla read-only"
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ 'PRESENTE' if 'pwdFailureTime' in item.stdout else 'assente' }}"
+      loop: "{{ check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[CLEANUP] Rimuovi l'utente di test"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        bind_dn: "{{ bind_dn }}"
+        bind_pw: "{{ bind_pw }}"
+        dn: "{{ test_user_dn }}"
+        state: absent
+      delegate_to: "{{ node1 }}"
+      run_once: true

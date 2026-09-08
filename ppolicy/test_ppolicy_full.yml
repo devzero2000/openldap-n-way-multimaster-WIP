@@ -1,10 +1,240 @@
 # ==============================================================================
 # TITOLO:       Test Completo Password Policy e Replicazione Multi-Master
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.9 (review)
 # SCOPO:        1. Cleanup e creazione utente su Node1.
-#               2. Test vincolo Lunghezza Minima (pwdMinLength).
-#               3. Test Cronologia Password (pwdInHistory) verificata su Node2/3.
-#               4. Test Lockout Distribuito (pwdMaxFailure) su nodi incrociati.
+#               2. Test del confine ESATTO di pwdMinLength (rifiuto a
+#                  min-1, accettazione a esattamente min).
+#               3. Test del confine ESATTO di pwdInHistory (rifiuto della
+#                  password piu' vecchia finche' e' dentro la finestra,
+#                  accettazione appena esce), verificato su master +
+#                  repliche read-only.
+#               4. Test del confine ESATTO di pwdMaxFailure (account ancora
+#                  utilizzabile a soglia-1, bloccato esattamente a soglia),
+#                  generando fallimenti anche dalle repliche read-only per
+#                  validare l'inoltro (olcPPolicyForwardUpdates) verso i
+#                  master, e verificando il blocco su tutti i nodi secondari.
 #               5. Cleanup finale.
+#
+# FILOSOFIA DI DESIGN (v1.2): questo test NON deve conoscere a priori i
+# valori di pwdMinLength/pwdMaxFailure/pwdInHistory configurati nel play di
+# deploy - li legge dal vivo dall'entry cn=default,ou=policies,... prima di
+# ogni verifica, e costruisce dinamicamente password/soglie/liste di nodi di
+# conseguenza. Cosi' il test resta corretto anche se la password policy
+# viene ritoccata in futuro, senza bisogno di aggiornare due file in
+# parallelo (rischio di disallineamento gia' visto altrove in questo stesso
+# progetto - vedi changelog del play di deploy).
+#
+# NOVITÀ v1.7 rispetto a v1.6 (causa individuata: non era la mesh, era il test):
+#   - La diagnostica per-nodo introdotta in v1.6 ha mostrato lo stesso "3"
+#     (invece di 4) IDENTICO su tutti e 4 i nodi SUBITO dopo TEST 3a, prima
+#     di qualunque pausa - e il valore restava "3" anche dopo 5s di attesa
+#     su node1. Un valore identico ovunque, immutato nel tempo, esclude una
+#     replica lenta (che darebbe numeri diversi per nodo e in crescita nel
+#     tempo): il quarto fallimento non era mai stato scritto da nessuna
+#     parte, non doveva ancora "arrivare".
+#   - Causa individuata: pwdFailureTime e' un GeneralizedTime, granularita'
+#     di UN SECONDO. TEST 3a lanciava i 4 tentativi falliti in un loop
+#     stretto senza pause, rendendo probabile che due di essi cadessero
+#     nello stesso secondo di orologio - stesso timestamp, stesso valore.
+#     Un attributo LDAP multi-valore non ammette duplicati: il secondo
+#     tentativo di aggiungere lo stesso valore viene scartato in silenzio.
+#     Risultato: fallimenti REALI 4, valori DISTINTI registrati 3 - e se lo
+#     stesso fenomeno capitava anche tra il 4° e il 5° fallimento
+#     complessivo, l'account non raggiungeva mai 5 valori distinti, quindi
+#     il lockout (basato sul conteggio dei valori in pwdFailureTime) non
+#     scattava mai - non per un problema della mesh, ma perche' i
+#     fallimenti reali non diventavano abbastanza voci distinte.
+#   - TEST 3a riscritto: non piu' un loop Ansible senza pause tra un
+#     tentativo e l'altro, ma uno script bash con 1.1s di attesa dopo
+#     ciascun tentativo - garantisce che ogni fallimento cada in un secondo
+#     di orologio diverso dal precedente.
+#
+# NOVITÀ v1.6 rispetto a v1.5 (terzo run reale: i dati raccolti scartano
+# l'ipotesi B, pwdFailureCountInterval - tra le due letture in Fase 3 sono
+# passati solo ~10s, ben sotto i 30s configurati):
+#   - Il conteggio pwdFailureTime su node1 e' passato da 3/4 (a soglia-1,
+#     dopo 5s di pausa) a 4/5 dopo l'ultimo fallimento e altri 5s di pausa -
+#     ma il "4" e' il nuovo fallimento generato DIRETTAMENTE su node1
+#     (visibile all'istante, zero replica necessaria): quello mancante dal
+#     batch di TEST 3a non e' MAI arrivato, nemmeno dopo ~10s complessivi.
+#     Non ha il profilo di una replica lenta (con la WAN simulata a questo
+#     punto del progetto, 10s per un salto tra master sarebbe spropositato),
+#     ha piu' il profilo di una scrittura che non e' mai avvenuta da
+#     qualche parte.
+#   - Aggiunta una diagnostica ancora piu' mirata: subito dopo TEST 3a,
+#     PRIMA di qualunque pausa, si legge pwdFailureTime IN LOCALE su
+#     ciascuno dei 4 nodi (una lettura locale non richiede alcuna replica
+#     per essere visibile). Se un nodo non vede nemmeno il PROPRIO
+#     fallimento appena generato, il problema e' isolato alla scrittura su
+#     quel nodo specifico (es. ForwardUpdates che non funziona su una
+#     read-only) - non alla velocita' con cui si propaga verso node1.
+#
+# NOVITÀ v1.5 rispetto a v1.4 (secondo run reale: il fix precedente non è bastato):
+#   - Con il bug della v1.3 risolto (VERIFICA 3b non azzera piu' il contatore),
+#     un run reale ha comunque mostrato pwdAccountLockedTime assente dopo
+#     l'ultimo fallimento. Due cause plausibili, non ancora distinte con
+#     certezza: (1) i (pwdMaxFailure-1) fallimenti di TEST 3a sono generati
+#     ciclicamente su TUTTI i nodi disponibili - con 4 nodi e soglia=5, ogni
+#     fallimento parte da un server DIVERSO, quindi il nodo su cui si legge
+#     il conteggio finale (node1) deve aver ricevuto via syncrepl gli
+#     aggiornamenti da tutti gli altri 3 server prima di vedere il totale
+#     corretto: la pausa potrebbe non bastare per quella convergenza a piu'
+#     vie; (2) pwdFailureCountInterval (ora letto dinamicamente, non piu'
+#     assunto) fa scadere i fallimenti piu' vecchi di N secondi dalla
+#     finestra di conteggio - se l'overhead complessivo dei task Ansible in
+#     questa sequenza supera quel valore, alcuni fallimenti potrebbero
+#     risultare gia' scaduti prima che arrivi l'ultimo.
+#   - Aggiunta diagnostica esplicita: ogni lettura ADMIN ora recupera anche
+#     pwdFailureTime (non solo pwdAccountLockedTime) e un task dedicato ne
+#     conta e mostra il numero di valori visibili - cosi', se l'assert
+#     finale fallisce di nuovo, il log stesso indica quale delle due ipotesi
+#     e' quella giusta (conteggio parziale => convergenza; conteggio
+#     azzerato senza essere mai arrivato alla soglia => interval) invece di
+#     dover chiedere un altro giro di log.
+#   - Le due pause di sincronizzazione in Fase 3 portate da 2 a 5 secondi
+#     (margine di convergenza maggiore, restando ampiamente sotto un
+#     pwdFailureCountInterval tipico).
+#   - pwdFailureCountInterval ora fa parte dei parametri letti dinamicamente
+#     a inizio play (prima non veniva estratto affatto).
+#
+# NOVITÀ v1.4 rispetto a v1.3 (corretta a seguito di un secondo run reale fallito):
+#   - FASE 3 (lockout), BUG NEL TEST (non nella mesh OpenLDAP): il vecchio
+#     TEST 3b verificava "l'account e' ancora utilizzabile a soglia-1"
+#     eseguendo un BIND VERO con la password corretta. Per semantica
+#     standard di ppolicy, un bind RIUSCITO azzera il contatore
+#     pwdFailureTime (e' la logica normale di un lockout: un'autenticazione
+#     corretta interrompe la sequenza di fallimenti consecutivi) - quindi
+#     quella stessa verifica cancellava i (pwdMaxFailure-1) fallimenti
+#     appena accumulati da TEST 3a, e il fallimento di TEST 3c restava
+#     l'unico della sequenza, mai vicino alla soglia. Il lockout non aveva
+#     alcuna possibilita' di scattare, su NESSUN nodo (non solo sulle
+#     read-only: un run reale ha mostrato il bind riuscire anche su un
+#     master, prova decisiva che il problema non era di replica ma del
+#     test stesso). Confermato da uno slapcat: nessun pwdFailureTime ne'
+#     pwdAccountLockedTime presente sull'entry a fine sequenza.
+#   - TEST 3b ora legge l'attributo pwdAccountLockedTime direttamente come
+#     ADMIN (ldapsearch in sola lettura sulla entry di testuser), non piu'
+#     con un bind vero come testuser: una lettura come admin non tocca in
+#     alcun modo il contatore di fallimenti dell'utente target.
+#   - Aggiunta una nuova VERIFICA 3c(-bis) che conferma, sempre via lettura
+#     ADMIN, la comparsa di pwdAccountLockedTime sul nodo di origine (node1)
+#     subito dopo l'ultimo fallimento - un secondo punto di conferma
+#     indipendente dal check bind-based di TEST 3d/VERIFICA 3d, che resta
+#     la prova "comportamentale" finale (un client reale con la password
+#     giusta viene davvero respinto) distribuita su tutti i nodi secondari.
+#
+# NOVITÀ v1.3 rispetto a v1.2 (corretta a seguito di un run reale fallito):
+#   - FASE 2 (cronologia), TEST 2b: l'assunzione che una replica read-only
+#     rifiuti localmente il riuso di una password in violazione di
+#     pwdInHistory (con "Constraint violation", come sui master) era
+#     SBAGLIATA. Un run reale ha mostrato che la replica risponde invece con
+#     un Referral (result=10) verso un master, senza mai passare dallo
+#     stack degli overlay: il FRONTEND di slapd intercetta le scritture
+#     esplicite del client su un database "shadow" con olcUpdateRef
+#     configurato e le referisce PRIMA che raggiungano ppolicy - che quindi
+#     non vede mai la richiesta e non puo' valutare la cronologia in nessun
+#     caso, indipendentemente dal fatto che la password sarebbe stata
+#     accettata o rifiutata. Il meccanismo di olcPPolicyForwardUpdates
+#     (Fase 3, lockout) resta diverso e non contraddetto da questa scoperta:
+#     inoltra solo l'aggiornamento interno che ppolicy genera come effetto
+#     collaterale di un BIND fallito (operazione di lettura, servita in
+#     locale dalla replica), non le scritture esplicite del client.
+#   - TEST 2b ora si aspetta "Constraint violation" SOLO sugli altri master
+#     (other_nodes); un nuovo TEST 2b-RO, separato, si aspetta un Referral
+#     verso un host del cluster sulle repliche read-only (readonly_nodes) -
+#     confermando che rifiutano correttamente ogni scrittura locale,
+#     qualunque sia il suo contenuto.
+#
+# NOVITÀ v1.9 rispetto a v1.8 (run reale: il chain ora inoltra in modo
+# trasparente ANCHE le scritture esplicite del client, non solo la
+# contabilita' interna di ppolicy - scoperta positiva, il test v1.3
+# aveva un'assunzione ormai superata):
+#   - VERIFICA 2b-RO falliva: le repliche read-only, invece del Referral
+#     atteso (comportamento "vecchio", pre-chain), rispondevano con lo
+#     stesso "Constraint violation" dei master. Causa: il chain overlay,
+#     configurato a livello di FRONTEND per inoltrare gli aggiornamenti
+#     interni di ppolicy (Fase 3, lockout), inoltra in modo trasparente
+#     ANCHE le scritture esplicite del client come questo cambio password -
+#     non e' piu' vero che "l'esito atteso per qualsiasi scrittura
+#     esplicita su una read-only e' sempre un Referral" (affermazione della
+#     v1.3, ora superata dal fix del bug ForwardUpdates). La read-only
+#     incanala la richiesta al master, il master la valuta con il proprio
+#     ppolicy, e il verdetto REALE torna al client - risultato piu'
+#     completo e corretto di un semplice referral.
+#   - TEST 2b-RO e VERIFICA 2b-RO rimossi come blocchi separati: unificati
+#     in TEST 2b/VERIFICA 2b, che ora ciclano su verify_nodes (altri master
+#     + read-only) aspettandosi "Constraint violation" ovunque, esattamente
+#     come gia' funzionava per i soli master.
+#
+# NOVITÀ v1.8 rispetto a v1.7 (aggiornamento a valle della RISOLUZIONE del
+# bug ForwardUpdates, confermata con test diretto - vedi changelog dei play
+# di deploy: chain overlay + modulo back_ldap, mode=none invece di
+# mode=self, ACL {4} "manage" invece di "write" per il Relax Control):
+#   - test_user_dn: ou=users -> ou=people, e rimossa la creazione ad-hoc
+#     dell'OU. Il play di deploy crea "system", "groups", "people" come OU
+#     di base (task "E2/F2a. Crea le Organizational Unit di base") -
+#     "ou=users" non fa parte della struttura reale del DIT, era un
+#     container creato ad-hoc solo da questo test (e da
+#     test_forwardupdates_isolato.yml, corretto allo stesso modo).
+#     Standardizzato su cio' che il deploy crea davvero, coerente anche con
+#     test_ppolicy_simple.yml (che gia' usava un container equivalente).
+#   - La Fase 3 (lockout, incluse le read-only) di questo file era gia'
+#     progettata correttamente per validare ForwardUpdates end-to-end (vedi
+#     changelog v1.2) - nessuna modifica di logica necessaria: ora che il
+#     bug di fondo e' risolto, ci si aspetta che TEST 3d/VERIFICA 3d passi
+#     anche per le repliche read-only, cosa che nelle versioni precedenti
+#     falliva sistematicamente per una causa esterna al test stesso.
+#
+# NOVITÀ v1.2 rispetto a v1.1:
+#   - RIPROGETTATO INTERAMENTE per non dipendere piu' da valori hardcoded
+#     copiati dal play di deploy (pwdMinLength=12, pwdMaxFailure=5): la
+#     Password Policy attiva viene letta dal vivo a inizio play.
+#   - FASE 1 (lunghezza): non piu' un tentativo generico con una stringa
+#     corta fissa, ma due test sul confine esatto: password di
+#     (pwdMinLength-1) caratteri (deve fallire) E di esattamente
+#     pwdMinLength caratteri (deve riuscire).
+#   - FASE 2 (cronologia): non piu' un singolo cambio password + verifica
+#     di rifiuto, ma la sequenza completa che prova il confine esatto di
+#     pwdInHistory: N cambi consecutivi (N=pwdInHistory) per riempire
+#     esattamente la finestra, verifica che la password piu' vecchia (P0)
+#     sia ANCORA rifiutata (e' l'N-esima posizione, ancora dentro), UN
+#     ulteriore cambio che fa scadere P0 dalla finestra, verifica che P0
+#     sia ORA accettata - confermando che la finestra tiene esattamente N
+#     voci, ne' una in piu' ne' una in meno. Tutti i rifiuti vengono
+#     testati anche sulle repliche read-only (operazione non mutante, sicura
+#     da ripetere su piu' nodi); l'accettazione finale viene invece eseguita
+#     UNA SOLA VOLTA su node1 (e' un'operazione mutante: eseguirla in loop
+#     su piu' nodi romperebbe lo stato dopo il primo successo) e poi
+#     verificata via BIND di sola lettura sui nodi secondari.
+#   - FASE 3 (lockout): non piu' "genera fallimenti su tutti i nodi + 2
+#     extra su node1" (un numero arbitrario, scollegato da pwdMaxFailure),
+#     ma il confine esatto: (pwdMaxFailure-1) fallimenti distribuiti
+#     ciclicamente su TUTTI i nodi disponibili (cluster + read-only, quanti
+#     siano) + verifica che l'account sia ANCORA utilizzabile, poi
+#     l'ultimo fallimento (il numero pwdMaxFailure esatto) + verifica del
+#     blocco su tutti i nodi secondari. La lista di nodi bersaglio dei
+#     fallimenti e' generata ciclicamente per funzionare a prescindere da
+#     quanti nodi esistono rispetto a pwdMaxFailure (es. pwdMaxFailure=20
+#     con soli 3 nodi: ciclo 3 volte sugli stessi nodi finche' non si
+#     raggiungono 19 tentativi).
+#   - Le password di test non sono piu' stringhe fisse ("Corta1!",
+#     "NuovaPasswordValida456!" ecc.): sono generate con un padding
+#     calcolato dinamicamente per restare sempre valide (o esattamente al
+#     confine) qualunque sia pwdMinLength configurato.
+#
+# VERSIONE v1.1:
+#   Aggiunta la copertura delle repliche read-only (groups['readonlyreplica'])
+#   nei test di cronologia e lockout, prima limitati ai soli altri master.
+#
+# VERSIONE v1.0 (baseline):
+#   Test completo su 3 fasi con valori hardcoded (corrispondenti alla
+#   config del play di deploy al momento, ma non derivati da essa): rifiuto
+#   di una password fissa troppo corta; cambio password + verifica rifiuto
+#   del riuso su un nodo secondario; fallimenti di login distribuiti su
+#   tutti i nodi del cluster + 2 extra su node1 fino al lockout, verificato
+#   su un solo nodo secondario. Nessuna copertura delle repliche read-only.
 # ==============================================================================
 
 ---
@@ -16,14 +246,21 @@
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
 
-    test_user_dn: "cn=testuser,ou=users,{{ suffix }}"
+    test_user_dn: "cn=testuser,ou=people,{{ suffix }}"
+    ppolicy_dn: "cn=default,ou=policies,{{ suffix }}"
 
     node1: "{{ groups['cluster'][0] }}"
     other_nodes: "{{ groups['cluster'][1:] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    all_nodes: "{{ groups['cluster'] + readonly_nodes }}"
+    # Tutti i nodi secondari su cui verificare che password/lockout si
+    # siano propagati: gli altri master del cluster + tutte le repliche
+    # read-only.
+    verify_nodes: "{{ other_nodes + readonly_nodes }}"
 
   tasks:
     # ==========================================================================
-    # FASE 0: CLEANUP PREVENTIVO E CREAZIONE UTENTE
+    # FASE 0: CLEANUP PREVENTIVO, CREAZIONE UTENTE, LETTURA PPOLICY ATTIVA
     # ==========================================================================
 
     - name: "[SETUP] Cleanup utente residuo da esecuzioni precedenti su node1"
@@ -36,26 +273,66 @@
       delegate_to: "{{ node1 }}"
       run_once: true
 
-    - name: "[SETUP] Crea la OU users se non presente"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "ou=users,{{ suffix }}"
-        objectClass: [top, organizationalUnit]
-        attributes: { ou: users }
-        state: present
+    - name: "[SETUP] Interroga la Password Policy attiva ({{ ppolicy_dn }}) per i parametri correnti"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "{{ ppolicy_dn }}" pwdMinLength pwdMaxFailure pwdInHistory pwdFailureCountInterval
+      register: _ppolicy_raw
       delegate_to: "{{ node1 }}"
       run_once: true
+      changed_when: false
+      no_log: true
 
-    - name: "[SETUP] Genera hash SSHA per la password iniziale"
-      ansible.builtin.command: "slappasswd -s PasswordIniziale123!"
+    - name: "[SETUP] Deriva i valori numerici della Password Policy attiva"
+      # NOTA: regex_search SENZA backreference di gruppo (mai '\1','\2'):
+      # in assenza di match, quella forma puo' fallire con "'NoneType'
+      # object has no attribute 'group'" invece di restituire None -
+      # problema gia' incontrato e risolto altrove in questo stesso
+      # progetto. Qui si usa solo regex_search a match intero (stringa o
+      # None, mai eccezione) + regex_replace per isolare le cifre (mai
+      # un'eccezione, nemmeno senza match) + default come fallback.
+      ansible.builtin.set_fact:
+        ppolicy_min_length: "{{ (_ppolicy_raw.stdout | regex_search('pwdMinLength: [0-9]+') | default('pwdMinLength: 12', true) | regex_replace('[^0-9]', '')) | int }}"
+        ppolicy_max_failure: "{{ (_ppolicy_raw.stdout | regex_search('pwdMaxFailure: [0-9]+') | default('pwdMaxFailure: 5', true) | regex_replace('[^0-9]', '')) | int }}"
+        ppolicy_in_history: "{{ (_ppolicy_raw.stdout | regex_search('pwdInHistory: [0-9]+') | default('pwdInHistory: 5', true) | regex_replace('[^0-9]', '')) | int }}"
+        ppolicy_failure_count_interval: "{{ (_ppolicy_raw.stdout | regex_search('pwdFailureCountInterval: [0-9]+') | default('pwdFailureCountInterval: 0', true) | regex_replace('[^0-9]', '')) | int }}"
+      run_once: true
+
+    - name: "[SETUP] Mostra i parametri PPolicy rilevati (informativo)"
+      ansible.builtin.debug:
+        msg:
+          - "pwdMinLength={{ ppolicy_min_length }}  pwdMaxFailure={{ ppolicy_max_failure }}  pwdInHistory={{ ppolicy_in_history }}  pwdFailureCountInterval={{ ppolicy_failure_count_interval }}"
+          - "Nodi cluster: {{ groups['cluster'] | length }}  Nodi read-only: {{ readonly_nodes | length }}  Totale: {{ all_nodes | length }}"
+      run_once: true
+
+    - name: "[SETUP] Costruisci le password di test (padding dinamico per restare valide/al confine qualunque sia pwdMinLength)"
+      ansible.builtin.set_fact:
+        # Pad comune: la base fissa "TestHistNNNAa1!" e' lunga 15 caratteri;
+        # se pwdMinLength e' maggiore, si allunga con 'X' per restare
+        # sempre sopra soglia quando serve.
+        ppolicy_pad: "{{ 'X' * ([(ppolicy_min_length | int) - 15, 0] | max) }}"
+      run_once: true
+
+    - name: "[SETUP] Deriva le password di confine per la Fase 1 e la password di bootstrap"
+      ansible.builtin.set_fact:
+        pw_too_short: "{{ 'A' * ([(ppolicy_min_length | int) - 1, 1] | max) }}"
+        pw_exact_length: "{{ 'A' * (ppolicy_min_length | int) }}"
+        # Password di bootstrap per la creazione dell'utente: comodamente
+        # sopra la soglia (margine +10), cosi' il TEST 1b (cambio a
+        # esattamente pwdMinLength) sia una transizione genuina, non gia'
+        # lo stato di partenza.
+        pw_initial: "{{ 'InitialBootstrapPW1!' ~ ('X' * ([(ppolicy_min_length | int) - 11, 0] | max)) }}"
+      run_once: true
+
+    - name: "[SETUP] Genera hash SSHA per la password di bootstrap"
+      ansible.builtin.command: "slappasswd -s {{ pw_initial }}"
       register: initial_pw_hash
       delegate_to: "{{ node1 }}"
       run_once: true
       changed_when: false
+      no_log: true
 
-    - name: "[SETUP] Crea l'utente di test con password hashata su node1"
+    - name: "[SETUP] Crea l'utente di test con la password di bootstrap hashata su node1"
       community.general.ldap_entry:
         server_uri: "ldapi:///"
         bind_dn: "{{ bind_dn }}"
@@ -69,125 +346,316 @@
         state: present
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
     # ==========================================================================
-    # FASE 1: TEST LUNGHEZZA MINIMA (pwdMinLength = 12)
+    # FASE 1: CONFINE ESATTO DI pwdMinLength
     # ==========================================================================
-    - name: "[TEST 1 - LUNGHEZZA] Tenta di impostare una password troppo corta (< 12 car.) su node1"
+
+    - name: "[TEST 1a - LUNGHEZZA] Tenta una password di {{ ppolicy_min_length | int - 1 }} caratteri (1 SOTTO pwdMinLength={{ ppolicy_min_length }})"
       community.general.ldap_passwd:
         server_uri: "ldap://127.0.0.1/"
         bind_dn: "{{ test_user_dn }}"
-        bind_pw: "PasswordIniziale123!"
+        bind_pw: "{{ pw_initial }}"
         dn: "{{ test_user_dn }}"
-        passwd: "Corta1!"
+        passwd: "{{ pw_too_short }}"
       register: short_pw_test
       ignore_errors: true
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
-    - name: "[VERIFICA 1] Valida che PPolicy blocchi la password troppo corta"
+    - name: "[VERIFICA 1a] Valida che PPolicy rifiuti la password 1 carattere sotto il minimo"
       ansible.builtin.assert:
         that:
           - short_pw_test is failed
-        fail_msg: "ERRORE: La password troppo corta (< 12 car.) e' stata accettata da PPolicy!"
-        success_msg: "OK: PPolicy ha rifiutato correttamente la password troppo corta."
+        fail_msg: "ERRORE: Una password di {{ ppolicy_min_length | int - 1 }} caratteri (1 sotto pwdMinLength={{ ppolicy_min_length }}) e' stata accettata!"
+        success_msg: "OK: PPolicy ha rifiutato correttamente una password 1 carattere sotto il minimo ({{ ppolicy_min_length }})."
       run_once: true
 
-    # ==========================================================================
-    # FASE 2: CAMBIO PASSWORD REGOLARE E TEST CRONOLOGIA (pwdInHistory = 5)
-    # ==========================================================================
-
-    - name: "[FASE 2] L'utente esegue un cambio password REGOLARE su node1"
+    - name: "[TEST 1b - LUNGHEZZA] Tenta una password di ESATTAMENTE {{ ppolicy_min_length }} caratteri (il minimo consentito)"
       community.general.ldap_passwd:
         server_uri: "ldap://127.0.0.1/"
         bind_dn: "{{ test_user_dn }}"
-        bind_pw: "PasswordIniziale123!"
+        bind_pw: "{{ pw_initial }}"
         dn: "{{ test_user_dn }}"
-        passwd: "NuovaPasswordValida456!"
+        passwd: "{{ pw_exact_length }}"
+      register: exact_pw_test
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
-    - name: "[PAUSA] Pausa per sincronizzazione syncrepl della nuova password e di pwdHistory"
+    - name: "[VERIFICA 1b] Valida che PPolicy accetti una password di ESATTAMENTE pwdMinLength caratteri"
+      ansible.builtin.assert:
+        that:
+          - exact_pw_test is succeeded
+        fail_msg: "ERRORE: Una password di esattamente {{ ppolicy_min_length }} caratteri (il minimo consentito) e' stata rifiutata!"
+        success_msg: "OK: PPolicy ha accettato correttamente una password di esattamente {{ ppolicy_min_length }} caratteri. Password utente ora: P0 (pw_exact_length)."
+      run_once: true
+
+    # ==========================================================================
+    # FASE 2: CONFINE ESATTO DI pwdInHistory
+    # Password attiva a inizio fase: P0 = pw_exact_length (dal TEST 1b).
+    # ==========================================================================
+
+    - name: >-
+        [TEST 2a - CRONOLOGIA] Esegue {{ ppolicy_in_history }} cambi sequenziali
+        (P0->P1->...->P{{ ppolicy_in_history }}) per riempire esattamente la finestra pwdInHistory
+      community.general.ldap_passwd:
+        server_uri: "ldap://127.0.0.1/"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "{{ pw_exact_length if item == 1 else (('TestHist%03dAa1!' | format(item - 1)) ~ ppolicy_pad) }}"
+        dn: "{{ test_user_dn }}"
+        passwd: "{{ ('TestHist%03dAa1!' | format(item)) ~ ppolicy_pad }}"
+      loop: "{{ range(1, (ppolicy_in_history | int) + 1) | list }}"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
+
+    - name: "[PAUSA] Pausa per sincronizzazione syncrepl della cronologia password"
       ansible.builtin.pause:
         seconds: 2
       run_once: true
 
-    - name: "[TEST 2 - CRONOLOGIA] Tenta di riutilizzare la password VECCHIA ('PasswordIniziale123!') su un NODO SECONDARIO"
+    - name: >-
+        [TEST 2b - CRONOLOGIA] Tenta di riutilizzare P0 su TUTTI i nodi secondari
+        (altri master + repliche read-only, ancora dentro la finestra: e' la
+        posizione {{ ppolicy_in_history }} su {{ ppolicy_in_history }})
       community.general.ldap_passwd:
         server_uri: "ldap://{{ item }}/"
         bind_dn: "{{ test_user_dn }}"
-        bind_pw: "NuovaPasswordValida456!"
+        bind_pw: "{{ ('TestHist%03dAa1!' | format(ppolicy_in_history | int)) ~ ppolicy_pad }}"
         dn: "{{ test_user_dn }}"
-        passwd: "PasswordIniziale123!"
-      loop: "{{ other_nodes }}"
-      register: history_pw_test
+        passwd: "{{ pw_exact_length }}"
+      loop: "{{ verify_nodes }}"
+      register: history_reject_test
       failed_when: false
       run_once: true
+      no_log: true
 
-    - name: >-
-        [VERIFICA 2] Valida che l'attributo pwdHistory sia stato replicato
-        e la vecchia password rifiutata sui nodi secondari
+    - name: "[VERIFICA 2b] Valida che TUTTI i nodi secondari rifiutino P0 per violazione di cronologia (dentro la finestra esatta)"
       ansible.builtin.assert:
         that:
           - item.details is defined
           - "'Constraint violation' in item.details or 'Password is in history' in item.details"
-        fail_msg: "ERRORE: Il nodo {{ item.item }} ha permesso il riutilizzo della vecchia password! pwdHistory non si e' replicato."
-        success_msg: "OK: Replicazione pwdHistory verificata! Il nodo {{ item.item }} ha bloccato il riutilizzo della vecchia password."
-      loop: "{{ history_pw_test.results }}"
+        fail_msg: "ERRORE: Il nodo {{ item.item }} ha riaccettato P0 troppo presto - pwdInHistory={{ ppolicy_in_history }} non sta trattenendo abbastanza voci, oppure pwdHistory non si e' replicato."
+        success_msg: "OK: Il nodo {{ item.item }} rifiuta correttamente P0 per violazione di cronologia - e' ancora dentro la finestra di pwdInHistory={{ ppolicy_in_history }}."
+      loop: "{{ history_reject_test.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: >-
+        [TEST 2c - CRONOLOGIA] Un ULTERIORE cambio (P{{ ppolicy_in_history }}->P{{ (ppolicy_in_history | int) + 1 }})
+        su node1: fa scadere P0 dalla finestra
+      community.general.ldap_passwd:
+        server_uri: "ldap://127.0.0.1/"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "{{ ('TestHist%03dAa1!' | format(ppolicy_in_history | int)) ~ ppolicy_pad }}"
+        dn: "{{ test_user_dn }}"
+        passwd: "{{ ('TestHist%03dAa1!' | format((ppolicy_in_history | int) + 1)) ~ ppolicy_pad }}"
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
+
+    - name: "[TEST 2d - CRONOLOGIA] Ritenta il cambio a P0 su node1: ora deve essere ACCETTATA (uscita dalla finestra)"
+      community.general.ldap_passwd:
+        server_uri: "ldap://127.0.0.1/"
+        bind_dn: "{{ test_user_dn }}"
+        bind_pw: "{{ ('TestHist%03dAa1!' | format((ppolicy_in_history | int) + 1)) ~ ppolicy_pad }}"
+        dn: "{{ test_user_dn }}"
+        passwd: "{{ pw_exact_length }}"
+      register: history_accept_test
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      no_log: true
+
+    - name: "[VERIFICA 2d] Valida che il cambio a P0 sia stato accettato su node1 (confine confermato: la finestra tiene esattamente {{ ppolicy_in_history }} voci)"
+      ansible.builtin.assert:
+        that:
+          - history_accept_test is succeeded
+        fail_msg: "ERRORE: P0 e' ancora rifiutata dopo essere uscita dalla finestra di pwdInHistory={{ ppolicy_in_history }} - la cronologia trattiene PIU' voci del previsto."
+        success_msg: "OK: P0 correttamente riaccettata su node1. Confine esatto di pwdInHistory={{ ppolicy_in_history }} confermato."
+      run_once: true
+
+    - name: "[PAUSA] Pausa per sincronizzazione syncrepl del cambio a P0"
+      ansible.builtin.pause:
+        seconds: 2
+      run_once: true
+
+    - name: "[TEST 2e - CRONOLOGIA] Verifica via BIND di sola lettura che P0 sia attiva anche sui nodi secondari"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ item }}/
+        -D "{{ test_user_dn }}"
+        -w "{{ pw_exact_length }}"
+        -b "{{ suffix }}" -s base "(objectClass=*)" dn
+      loop: "{{ verify_nodes }}"
+      register: history_replicate_check
+      failed_when: false
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA 2e] Valida che il cambio a P0 si sia replicato su tutti i nodi secondari"
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+        fail_msg: "ERRORE: Il nodo {{ item.item }} non accetta ancora P0 - il cambio password non si e' replicato."
+        success_msg: "OK: Il nodo {{ item.item }} accetta P0 - replica confermata."
+      loop: "{{ history_replicate_check.results }}"
       loop_control:
         label: "{{ item.item }}"
       run_once: true
 
     # ==========================================================================
-    # FASE 3: TEST LOCKOUT DISTRIBUITO (pwdMaxFailure = 5 e pwdLockout = TRUE)
+    # FASE 3: CONFINE ESATTO DI pwdMaxFailure
+    # Password attiva a inizio fase: P0 = pw_exact_length (confermata in Fase 2).
     # ==========================================================================
 
-    - name: "[TEST 3 - LOCKOUT] Genera fallimenti di login distribuiti su tutti i nodi del cluster"
-      ansible.builtin.command: >
-        ldapsearch -H ldap://{{ item }}/
-        -D "{{ test_user_dn }}"
-        -w "PasswordSbagliataErrata!"
-        -b "{{ suffix }}" "(objectClass=*)"
-      loop: "{{ groups['cluster'] }}"
-      register: failures_test
-      failed_when: false
+    - name: "[SETUP] Costruisci l'elenco ciclico di nodi per generare esattamente (pwdMaxFailure-1) fallimenti"
+      # Ripete all_nodes quante volte serve per coprire (N-1) elementi, poi
+      # taglia alla lunghezza esatta: funziona a prescindere dal rapporto
+      # tra numero di nodi e pwdMaxFailure (es. pwdMaxFailure=20 con soli 3
+      # nodi: cicla piu' volte sugli stessi 3).
+      ansible.builtin.set_fact:
+        failure_targets_below: "{{ (all_nodes * (((((ppolicy_max_failure | int) - 1)) // (all_nodes | length)) + 1))[:(ppolicy_max_failure | int) - 1] }}"
+      run_once: true
+
+    - name: >-
+        [TEST 3a - LOCKOUT] Genera esattamente {{ ppolicy_max_failure | int - 1 }} fallimenti
+        (1 SOTTO pwdMaxFailure={{ ppolicy_max_failure }}), distanziati di 1.1s per evitare collisioni
+        di timestamp (pwdFailureTime ha granularita' al secondo: due fallimenti nello stesso secondo
+        producono lo stesso valore, e LDAP scarta silenziosamente i duplicati in un attributo multi-valore)
+      ansible.builtin.shell: |
+        set -e
+        {% for node in failure_targets_below %}
+        ldapsearch -H ldap://{{ node }}/ -D "{{ test_user_dn }}" -w "PasswordSbagliataErrata!" -b "{{ suffix }}" "(objectClass=*)" >/dev/null 2>&1 || true
+        sleep 1.1
+        {% endfor %}
+      args:
+        executable: /bin/bash
       run_once: true
       changed_when: false
 
-    - name: "[TEST 3 - LOCKOUT] Completa i tentativi falliti per superare la soglia (pwdMaxFailure=5) su node1"
+    # NOTA DIAGNOSTICA: questo controllo gira SUBITO dopo TEST 3a, PRIMA di
+    # qualunque pausa - una lettura locale (127.0.0.1 dal nodo stesso) non
+    # richiede alcuna replica per essere visibile, quindi isola in modo
+    # netto due possibilita' diverse: se un nodo non vede nemmeno il PROPRIO
+    # fallimento appena generato, il problema e' nella scrittura (es. su una
+    # read-only, ForwardUpdates che non sta funzionando) - non nella
+    # velocita' di propagazione verso node1 controllata piu' sotto.
+    - name: "[DIAGNOSTICA] Legge pwdFailureTime IN LOCALE su ciascun nodo di origine (zero attesa, nessuna replica necessaria)"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "{{ test_user_dn }}" -s base pwdFailureTime
+      register: per_node_failure_check
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[DIAGNOSTICA] Mostra quanti pwdFailureTime vede ciascun nodo IN LOCALE, subito dopo aver generato il proprio fallimento"
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: {{ item.stdout | regex_findall('pwdFailureTime:') | length }} valori locali (atteso almeno 1: il proprio fallimento appena generato, zero replica necessaria)"
+      loop: "{{ per_node_failure_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[PAUSA] Pausa per propagazione syncrepl dei fallimenti (sotto soglia)"
+      ansible.builtin.pause:
+        seconds: 5
+      run_once: true
+
+    - name: >-
+        [TEST 3b - LOCKOUT] Legge (come ADMIN, lettura pura senza toccare il contatore di
+        testuser) se pwdAccountLockedTime e' assente a soglia-1
+      ansible.builtin.command: >
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "{{ test_user_dn }}" -s base pwdAccountLockedTime pwdFailureTime
+      register: below_threshold_check
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[DIAGNOSTICA] Conta quanti pwdFailureTime sono visibili su node1 a soglia-1 (atteso: {{ ppolicy_max_failure | int - 1 }})"
+      ansible.builtin.debug:
+        msg: "pwdFailureTime visibili su node1: {{ below_threshold_check.stdout | regex_findall('pwdFailureTime:') | length }} (attesi {{ ppolicy_max_failure | int - 1 }})"
+      run_once: true
+
+    - name: "[VERIFICA 3b] Valida che pwdAccountLockedTime NON sia ancora presente a {{ ppolicy_max_failure | int - 1 }} fallimenti"
+      ansible.builtin.assert:
+        that:
+          - "'pwdAccountLockedTime' not in below_threshold_check.stdout"
+        fail_msg: "ERRORE: pwdAccountLockedTime e' gia' presente a {{ ppolicy_max_failure | int - 1 }} fallimenti - pwdMaxFailure={{ ppolicy_max_failure }} sta scattando troppo presto."
+        success_msg: "OK: pwdAccountLockedTime ancora assente a {{ ppolicy_max_failure | int - 1 }} fallimenti, come atteso (soglia={{ ppolicy_max_failure }})."
+      run_once: true
+
+    - name: "[TEST 3c - LOCKOUT] Genera l'ULTIMO fallimento su node1 (il numero {{ ppolicy_max_failure }}: deve far scattare il blocco)"
       ansible.builtin.command: >
         ldapsearch -H ldap://{{ node1 }}/
         -D "{{ test_user_dn }}"
         -w "PasswordSbagliataErrata!"
         -b "{{ suffix }}" "(objectClass=*)"
-      loop: [1, 2]
       failed_when: false
       run_once: true
       changed_when: false
 
     - name: "[PAUSA] Pausa per propagazione syncrepl dell'attributo pwdAccountLockedTime"
       ansible.builtin.pause:
-        seconds: 2
+        seconds: 5
       run_once: true
 
-    - name: "[TEST 3 - LOCKOUT] Tenta il login con la password CORRETTA su un NODO SECONDARIO"
+    - name: >-
+        [VERIFICA 3c] Conferma via lettura ADMIN (non un bind come testuser: non altera
+        nulla) che pwdAccountLockedTime sia presente sul nodo di origine (node1)
       ansible.builtin.command: >
-        ldapsearch -H ldap://{{ other_nodes[0] }}/
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "{{ test_user_dn }}" -s base pwdAccountLockedTime pwdFailureTime
+      register: origin_lock_check
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[DIAGNOSTICA] Conta quanti pwdFailureTime sono visibili su node1 dopo l'ultimo fallimento (atteso: {{ ppolicy_max_failure }}, o 0 se gia' scattato il lockout e ppolicy li ha ripuliti)"
+      ansible.builtin.debug:
+        msg: "pwdFailureTime visibili su node1: {{ origin_lock_check.stdout | regex_findall('pwdFailureTime:') | length }} (attesi fino a {{ ppolicy_max_failure }}) - pwdAccountLockedTime presente: {{ 'pwdAccountLockedTime' in origin_lock_check.stdout }}"
+      run_once: true
+
+    - name: "[VERIFICA 3c-bis] Valida che pwdAccountLockedTime sia comparso esattamente a pwdMaxFailure={{ ppolicy_max_failure }} fallimenti"
+      ansible.builtin.assert:
+        that:
+          - "'pwdAccountLockedTime' in origin_lock_check.stdout"
+        fail_msg: "ERRORE: pwdAccountLockedTime ancora assente su node1 dopo {{ ppolicy_max_failure }} fallimenti - il lockout non e' scattato alla soglia attesa. Controlla il conteggio pwdFailureTime nel task DIAGNOSTICA appena sopra: se e' minore di {{ ppolicy_max_failure }}, e' un problema di convergenza della mesh (i fallimenti distribuiti sui nodi non sono ancora arrivati tutti); se sono spariti del tutto rispetto al conteggio di soglia-1, sospetta pwdFailureCountInterval={{ ppolicy_failure_count_interval }} (i piu' vecchi sono scaduti - a meno che sia 0, che significa 'nessuna scadenza')."
+        success_msg: "OK: pwdAccountLockedTime presente su node1 esattamente a {{ ppolicy_max_failure }} fallimenti - confine confermato alla fonte."
+      run_once: true
+
+    - name: "[TEST 3d - LOCKOUT] Tenta il login con la password CORRETTA su tutti i nodi secondari (altri master + repliche read-only)"
+      ansible.builtin.command: >
+        ldapsearch -H ldap://{{ item }}/
         -D "{{ test_user_dn }}"
-        -w "NuovaPasswordValida456!"
+        -w "{{ pw_exact_length }}"
         -b "{{ suffix }}" "(objectClass=*)"
+      loop: "{{ verify_nodes }}"
       register: lockout_check
       failed_when: false
       run_once: true
       changed_when: false
+      no_log: true
 
-    - name: "[VERIFICA 3] Valida che l'account risulti BLOCCATO sul nodo secondario"
+    - name: "[VERIFICA 3d] Valida che l'account risulti BLOCCATO su tutti i nodi secondari esattamente a pwdMaxFailure={{ ppolicy_max_failure }} fallimenti"
       ansible.builtin.assert:
         that:
-          - lockout_check.rc != 0
-          - "'Account locked' in lockout_check.stderr or 'Account locked' in lockout_check.stdout or lockout_check.rc == 49"
-        fail_msg: "ERRORE CRITICO: L'utente e' stato bloccato su node1 ma riesce ancora ad accedere su {{ other_nodes[0] }}!"
-        success_msg: "OK: Replicazione pwdAccountLockedTime verificata! L'account risulta BLOCCATO anche sul nodo {{ other_nodes[0] }}."
+          - item.rc != 0
+          - "'Account locked' in item.stderr or 'Account locked' in item.stdout or item.rc == 49"
+        fail_msg: "ERRORE CRITICO: L'utente e' stato bloccato su node1 ma riesce ancora ad accedere su {{ item.item }}!"
+        success_msg: "OK: Replicazione pwdAccountLockedTime verificata! L'account risulta BLOCCATO anche sul nodo {{ item.item }}."
+      loop: "{{ lockout_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
       run_once: true
 
     # ==========================================================================

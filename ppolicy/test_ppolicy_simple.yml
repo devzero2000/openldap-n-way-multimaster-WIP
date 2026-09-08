@@ -1,9 +1,38 @@
 # ==============================================================================
 # TITOLO:       Test Validazione Replicazione Password Multi-Master OpenLDAP
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.3 (review)
 # SCOPO:        1. Cleanup preventivo dell'utente di test su node1.
 #               2. Creazione utente e cambio password autonomo su node1.
-#               3. Validazione BIND con nuova password su node2 e node3.
+#               3. Validazione BIND con nuova password su node2, node3 e su
+#                  tutte le repliche read-only.
 #               4. Cleanup finale.
+#
+# NOVITÀ v1.3 rispetto a v1.2:
+#   - test_user_dn: ou=People -> ou=people (minuscolo), per coerenza con
+#     gli altri due file di test e con cio' che il play di deploy crea
+#     davvero (task "E2/F2a. Crea le Organizational Unit di base": system,
+#     groups, people). Nessun impatto funzionale (LDAP e' case-insensitive
+#     sul matching), solo consistenza tra i file.
+#
+# NOVITÀ v1.2 rispetto a v1.1:
+#   - Le password di test ("PasswordTemp123!", "NuovaPasswordSegreta456!")
+#     non sono piu' stringhe fisse: la lunghezza minima (pwdMinLength) viene
+#     letta dal vivo dall'entry cn=default,ou=policies,... e le password
+#     vengono allungate con un padding dinamico se necessario, cosi' il
+#     test resta valido anche se pwdMinLength viene alzato in futuro nel
+#     play di deploy (stesso principio applicato a test_ppolicy_full.yml).
+#
+# NOVITÀ v1.1:
+#   Aggiunta la copertura delle repliche read-only (groups['readonlyreplica'])
+#   nel test di BIND (STEP 3), prima limitato ai soli altri master.
+#
+# VERSIONE v1.0 (baseline):
+#   Test di validazione BIND: crea utente con password temporanea, cambio
+#   password via ldap_passwd su node1, verifica BIND con la nuova password
+#   sugli altri master del cluster (groups['cluster'][1:]). Nessuna copertura
+#   delle repliche read-only, password fisse indipendenti da pwdMinLength.
 # ==============================================================================
 
 ---
@@ -15,10 +44,14 @@
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
 
-    test_user_dn: "cn=testuser,ou=People,{{ suffix }}"
+    test_user_dn: "cn=testuser,ou=people,{{ suffix }}"
 
     node1: "{{ groups['cluster'][0] }}"
     other_nodes: "{{ groups['cluster'][1:] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    # Tutti i nodi su cui verificare che la password si sia propagata:
+    # gli altri master del cluster + tutte le repliche read-only.
+    verify_nodes: "{{ other_nodes + readonly_nodes }}"
 
   tasks:
     # --------------------------------------------------------------------------
@@ -35,6 +68,32 @@
       run_once: true
 
     # --------------------------------------------------------------------------
+    # 1b. LETTURA DINAMICA DI pwdMinLength (per generare password sempre valide)
+    # --------------------------------------------------------------------------
+    - name: "[SETUP] Interroga la Password Policy attiva per pwdMinLength"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "cn=default,ou=policies,{{ suffix }}" pwdMinLength
+      register: _ppolicy_raw
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[SETUP] Deriva pwdMinLength e costruisci le password di test con padding dinamico"
+      # regex_search SENZA backreference di gruppo (mai fallisce con
+      # "'NoneType' object has no attribute 'group'" in assenza di match,
+      # a differenza della forma con '\1' - vedi note in test_ppolicy_full.yml).
+      ansible.builtin.set_fact:
+        ppolicy_min_length: "{{ (_ppolicy_raw.stdout | regex_search('pwdMinLength: [0-9]+') | default('pwdMinLength: 12', true) | regex_replace('[^0-9]', '')) | int }}"
+
+    - name: "[SETUP] Costruisci le due password di test (base fissa + padding se pwdMinLength lo richiede)"
+      ansible.builtin.set_fact:
+        pw_temp: "{{ 'PasswordTemp123!' ~ ('X' * ([(ppolicy_min_length | int) - 16, 0] | max)) }}"
+        pw_new: "{{ 'NuovaPasswordSegreta456!' ~ ('X' * ([(ppolicy_min_length | int) - 24, 0] | max)) }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
     # 2. CREAZIONE UTENTE E CAMBIO PASSWORD AUTONOMO (NODO 1)
     # --------------------------------------------------------------------------
     - name: "[STEP 2a] Crea utente con password temporanea su node1"
@@ -47,20 +106,22 @@
         attributes:
           cn: testuser
           sn: Test
-          userPassword: "PasswordTemp123!"
+          userPassword: "{{ pw_temp }}"
         state: present
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
     - name: "[STEP 2b] L'utente modifica la propria password via ldap_passwd su node1"
       community.general.ldap_passwd:
         server_uri: "ldapi:///"
         bind_dn: "{{ test_user_dn }}"
-        bind_pw: "PasswordTemp123!"
+        bind_pw: "{{ pw_temp }}"
         dn: "{{ test_user_dn }}"
-        passwd: "NuovaPasswordSegreta456!"
+        passwd: "{{ pw_new }}"
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
     - name: "[PAUSA] Pausa di 2 secondi per sincronizzazione syncrepl"
       ansible.builtin.pause:
@@ -71,18 +132,19 @@
     # --------------------------------------------------------------------------
     # 3. VERIFICA BIND SUGLI ALTRI NODI DEL CLUSTER
     # --------------------------------------------------------------------------
-    - name: "[STEP 3] Tenta l'autenticazione (BIND) con la nuova password sugli altri nodi"
+    - name: "[STEP 3] Tenta l'autenticazione (BIND) con la nuova password sugli altri master e sulle repliche read-only"
       ansible.builtin.command: >
         ldapsearch -H ldap://{{ item }}/
         -D "{{ test_user_dn }}"
-        -w "NuovaPasswordSegreta456!"
+        -w "{{ pw_new }}"
         -b "{{ suffix }}"
         "(cn=testuser)" dn
-      loop: "{{ other_nodes }}"
+      loop: "{{ verify_nodes }}"
       register: bind_test
       ignore_errors: true
       run_once: true
       changed_when: false
+      no_log: true
 
     - name: "[VERIFICA] Valida il successo dell'autenticazione su tutti i nodi secondari"
       ansible.builtin.assert:

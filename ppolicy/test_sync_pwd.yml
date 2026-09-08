@@ -1,6 +1,32 @@
 # ==============================================================================
+# TITOLO:       Test Semplice Sincronizzazione Password OpenLDAP
+# AUTORE:       Elia Pinto
+# DATA:         Luglio 2026
+# VERSIONE:     1.2 (review)
 # SCOPO: Test essenziale di creazione, cambio e sincronizzazione password su
 #        cluster OpenLDAP Multi-Master con Password Policy globale attiva.
+#
+# NOVITÀ v1.2 rispetto a v1.1:
+#   - Le password di test ("PasswordTemp123!", "NuovaPasswordSegreta456!")
+#     non sono piu' stringhe fisse: la lunghezza minima (pwdMinLength) viene
+#     letta dal vivo dall'entry cn=default,ou=policies,... e le password
+#     vengono allungate con un padding dinamico se necessario, cosi' il
+#     test resta valido anche se pwdMinLength viene alzato in futuro nel
+#     play di deploy (stesso principio applicato a test_ppolicy_full.yml).
+#
+# NOVITÀ v1.1 rispetto a v1.0:
+#   - La verifica di sincronizzazione (STEP 3) ora include anche gli host del
+#     gruppo "readonlyreplica" (/etc/ansible/hosts), non solo gli altri
+#     master del cluster. Le repliche read-only ricevono la password via
+#     syncrepl esattamente come gli altri master: se non venisse verificata
+#     anche li', un'eventuale rottura della replica verso le sole read-only
+#     (es. filtro attrs mal configurato) passerebbe inosservata.
+#
+# VERSIONE v1.0 (baseline):
+#   Test minimale: crea utente con password temporanea, cambio password
+#   rispettando PPolicy su node1, verifica bind con la nuova password sugli
+#   altri master del cluster (groups['cluster'][1:]). Nessuna copertura delle
+#   repliche read-only.
 # ==============================================================================
 
 ---
@@ -16,6 +42,10 @@
 
     node1: "{{ groups['cluster'][0] }}"
     other_nodes: "{{ groups['cluster'][1:] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    # Tutti i nodi su cui verificare che la password si sia propagata:
+    # gli altri master del cluster + tutte le repliche read-only.
+    verify_nodes: "{{ other_nodes + readonly_nodes }}"
 
   tasks:
     # --------------------------------------------------------------------------
@@ -44,14 +74,41 @@
       run_once: true
 
     # --------------------------------------------------------------------------
+    # 1b. LETTURA DINAMICA DI pwdMinLength (per generare password sempre valide)
+    # --------------------------------------------------------------------------
+    - name: "[SETUP] Interroga la Password Policy attiva per pwdMinLength"
+      ansible.builtin.command: >
+        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+        -LLL -b "cn=default,ou=policies,{{ suffix }}" pwdMinLength
+      register: _ppolicy_raw
+      delegate_to: "{{ node1 }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[SETUP] Deriva pwdMinLength e costruisci le password di test con padding dinamico"
+      # regex_search SENZA backreference di gruppo (mai fallisce con
+      # "'NoneType' object has no attribute 'group'" in assenza di match -
+      # vedi note in test_ppolicy_full.yml).
+      ansible.builtin.set_fact:
+        ppolicy_min_length: "{{ (_ppolicy_raw.stdout | regex_search('pwdMinLength: [0-9]+') | default('pwdMinLength: 12', true) | regex_replace('[^0-9]', '')) | int }}"
+
+    - name: "[SETUP] Costruisci le due password di test (base fissa + padding se pwdMinLength lo richiede)"
+      ansible.builtin.set_fact:
+        pw_temp: "{{ 'PasswordTemp123!' ~ ('X' * ([(ppolicy_min_length | int) - 16, 0] | max)) }}"
+        pw_new: "{{ 'NuovaPasswordSegreta456!' ~ ('X' * ([(ppolicy_min_length | int) - 24, 0] | max)) }}"
+      run_once: true
+
+    # --------------------------------------------------------------------------
     # 2. CREAZIONE E CAMBIO PASSWORD (NODO 1)
     # --------------------------------------------------------------------------
     - name: "[STEP 2a] Genera hash SSHA per la password iniziale valida"
-      ansible.builtin.command: "slappasswd -s PasswordTemp123!"
+      ansible.builtin.command: "slappasswd -s {{ pw_temp }}"
       register: initial_pw_hash
       delegate_to: "{{ node1 }}"
       run_once: true
       changed_when: false
+      no_log: true
 
     - name: "[STEP 2b] Crea l'utente con password temporanea hashata su node1"
       community.general.ldap_entry:
@@ -67,16 +124,18 @@
         state: present
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
     - name: "[STEP 2c] L'utente si cambia la password rispettando PPolicy su node1"
       community.general.ldap_passwd:
         server_uri: "ldap://127.0.0.1/"
         bind_dn: "{{ test_user_dn }}"
-        bind_pw: "PasswordTemp123!"
+        bind_pw: "{{ pw_temp }}"
         dn: "{{ test_user_dn }}"
-        passwd: "NuovaPasswordSegreta456!"
+        passwd: "{{ pw_new }}"
       delegate_to: "{{ node1 }}"
       run_once: true
+      no_log: true
 
     # --------------------------------------------------------------------------
     # 3. PAUSA E VERIFICA SINCRONIZZAZIONE SUGLI ALTRI NODI
@@ -86,18 +145,19 @@
         seconds: 2
       run_once: true
 
-    - name: "[STEP 3] Verifica la nuova password effettuando il login mirato sugli altri nodi"
+    - name: "[STEP 3] Verifica la nuova password effettuando il login mirato sugli altri master e sulle repliche read-only"
       ansible.builtin.command: >
         ldapsearch -H ldap://{{ item }}/
         -D "{{ test_user_dn }}"
-        -w "NuovaPasswordSegreta456!"
+        -w "{{ pw_new }}"
         -b "{{ test_user_dn }}"
         -s base "dn"
-      loop: "{{ other_nodes }}"
+      loop: "{{ verify_nodes }}"
       register: sync_results
       ignore_errors: true
       run_once: true
       changed_when: false
+      no_log: true
 
     - name: "[VERIFICA] Esito della sincronizzazione"
       ansible.builtin.assert:
