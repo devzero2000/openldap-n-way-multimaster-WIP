@@ -1,70 +1,399 @@
+# ==============================================================================
+# TITOLO:       Ripristino Completo del Cluster via slapadd (tutti i nodi)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     3.0 (consolidamento: slapadd ovunque, non piu' solo sui master)
+# SCOPO:        Ferma TUTTI i nodi (master + read-only), backup di sicurezza
+#               su un solo nodo di riferimento, svuota /var/lib/ldap OVUNQUE,
+#               carica lo STESSO LDIF indipendentemente su OGNI nodo via
+#               slapadd (in parallelo), riavvia tutti, verifica.
+#
+# NOVITÀ v3.0 rispetto a v2.1 (cambio di disegno deliberato, non solo di
+# codice): le versioni precedenti caricavano solo i master via slapadd,
+# lasciando le read-only ricostruirsi da sole via syncrepl - con dataset di
+# scala reale (decine di migliaia di entry, centinaia di migliaia di valori
+# member: per via di memberof/nestgroup), quel rebuild "a freddo" si e'
+# rivelato MOLTO lento (minuti, dominato da contesa futex sulle transazioni
+# seriali di MDB innescate dalla cascata di scritture di memberof - vedi
+# analisi con strace -f -c fatta durante questa sessione di lavoro). Per un
+# ripristino di produzione, aspettare che una read-only rincorra un carico
+# del genere non e' accettabile: meglio caricarla anch'essa direttamente via
+# slapadd, come i master. La misura del tempo di replica "vero" (quanto ci
+# mette una read-only a inseguire un master in condizioni realistiche, non
+# da stress test) e' stata spostata in un playbook dedicato e separato:
+# test_slapadd_replication.yml.
+#
+# PREREQUISITI OBBLIGATORI:
+#   1. L'LDIF sorgente deve essere l'export COMPLETO (struttura di base +
+#      dati) - il wipe e' totale su ogni nodo, quindi la struttura di base
+#      (dc=..., ou=system/groups/people, cn=administrators, ou=policies+
+#      cn=default, le identita' applicationProcess dei nodi) deve rientrare
+#      nell'LDIF.
+#   2. cn=config (schema, overlay, ACL, syncrepl, TLS/mTLS) NON viene
+#      toccata - deve essere gia' a posto (deploy gia' eseguito con successo
+#      su tutti i nodi).
+#
+# USO:
+#   ansible-playbook restore_master_from_backup.yml \
+#     -e backup_file=/percorso/locale/al/tuo/export.ldif \
+#     -e confirm_wipe=SI-CONFERMO-IL-RIPRISTINO
+# ==============================================================================
+
 ---
-- name: Ripristino OpenLDAP su Master e piallatura delle Repliche
+- name: Ripristino Completo del Cluster via slapadd (tutti i nodi)
   hosts: cluster
   become: true
+  gather_facts: false
   vars:
+    ansible_python_interpreter: auto_silent
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
     ldap_data_dir: "/var/lib/ldap"
 
-  pre_tasks:
-    - name: Verifica che la variabile backup_file sia stata definita
-      ansible.builtin.fail:
-        msg: "ERRORE: Devi specificare il file di backup. Usa: --extra-vars 'backup_file=/percorso/file.ldif'"
-      when: backup_file is not defined
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    all_nodes: "{{ cluster_nodes + readonly_nodes }}"
+    reference_node: "{{ cluster_nodes[0] }}"
+
+    backup_file: ""
+    confirm_wipe: ""
+    confirm_wipe_expected: "SI-CONFERMO-IL-RIPRISTINO"
+
+    sample_size: 10
 
   tasks:
+    # ==========================================================================
+    # FASE 0: GUARDIE DI SICUREZZA
+    # ==========================================================================
 
-    # --- 1. STOP DI SLAPD SU TUTTI I NODI ---
-    - name: "Arresto del servizio OpenLDAP (slapd)"
+    - name: "[GUARDIA] Verifica che confirm_wipe sia stato impostato esplicitamente al valore atteso"
+      ansible.builtin.assert:
+        that:
+          - confirm_wipe == confirm_wipe_expected
+        fail_msg: >-
+          ERRORE: questo playbook svuota /var/lib/ldap su TUTTI i nodi ({{ all_nodes | join(', ') }}).
+          Per procedere, rilancialo con "-e confirm_wipe={{ confirm_wipe_expected }}".
+        success_msg: "OK: conferma esplicita ricevuta."
+      delegate_to: localhost
+      connection: local
+      run_once: true
+
+    - name: "[GUARDIA] Verifica che backup_file sia stato impostato e che il file esista localmente"
+      ansible.builtin.stat:
+        path: "{{ backup_file }}"
+      register: backup_file_stat
+      delegate_to: localhost
+      connection: local
+      run_once: true
+
+    - name: "[GUARDIA] Blocca se backup_file e' vuoto, il file non esiste, o e' vuoto/senza entry"
+      ansible.builtin.assert:
+        that:
+          - backup_file != ""
+          - backup_file_stat.stat.exists
+          - backup_file_stat.stat.size > 0
+        fail_msg: >-
+          ERRORE: backup_file non impostato, file non trovato, o vuoto ({{ backup_file }}).
+          Usa: -e backup_file=/percorso/file.ldif
+        success_msg: "OK: file di backup trovato ({{ backup_file }})."
+      delegate_to: localhost
+      connection: local
+      run_once: true
+
+    - name: "[GUARDIA] Conta le entry nell'LDIF di backup"
+      ansible.builtin.shell: "grep -c '^dn: ' {{ backup_file }}"
+      register: backup_entry_count_raw
+      delegate_to: localhost
+      connection: local
+      run_once: true
+      changed_when: false
+
+    - name: "[GUARDIA] Blocca se l'LDIF non contiene nemmeno una entry"
+      ansible.builtin.assert:
+        that:
+          - backup_entry_count_raw.stdout | int > 0
+        fail_msg: "ERRORE: {{ backup_file }} non contiene alcuna entry (nessuna riga 'dn: ')."
+        success_msg: "OK: {{ backup_entry_count_raw.stdout }} entry trovate nell'LDIF di backup."
+      delegate_to: localhost
+      connection: local
+      run_once: true
+
+    - name: "[GUARDIA] Deriva il conteggio atteso e un campione di DN per la verifica finale"
+      ansible.builtin.set_fact:
+        expected_entry_count: "{{ backup_entry_count_raw.stdout | int }}"
+
+    - name: "[GUARDIA] Estrae un campione di DN dall'LDIF di backup per la verifica puntuale"
+      ansible.builtin.shell: "grep '^dn: ' {{ backup_file }} | sed 's/^dn: //' | shuf -n {{ sample_size }} --random-source={{ backup_file }}"
+      register: sample_dns_raw
+      delegate_to: localhost
+      connection: local
+      run_once: true
+      changed_when: false
+
+    - name: "[GUARDIA] Deriva la lista del campione come fact riutilizzabile"
+      ansible.builtin.set_fact:
+        sample_dns: "{{ sample_dns_raw.stdout_lines }}"
+
+    - name: "[GUARDIA] Mostra il piano dell'operazione prima di procedere"
+      ansible.builtin.debug:
+        msg:
+          - "TUTTI questi nodi verranno fermati, svuotati e ricaricati via slapadd: {{ all_nodes }}"
+          - "LDIF di backup: {{ backup_file }} ({{ expected_entry_count }} entry attese)"
+          - "Backup di sicurezza pre-wipe (un solo nodo): {{ reference_node }}"
+          - "Campione DN per verifica puntuale: {{ sample_dns | length }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 1: FERMA E VERIFICA TUTTI I NODI - prima di toccare qualunque file
+    # ==========================================================================
+
+    - name: "[STOP] Ferma slapd su TUTTI i nodi"
       ansible.builtin.systemd:
         name: slapd
         state: stopped
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
 
-    # --- 2. OPERAZIONI SUI NODI MASTER ---
-    - name: Configurazione Nodi Master
-      when: inventory_hostname in groups['cluster']
-      block:
-        - name: "[Master] Rimozione del vecchio database LMDB"
-          ansible.builtin.file:
-            path: "{{ ldap_data_dir }}/data.mdb"
-            state: absent
+    - name: "[STOP] Verifica che il processo slapd sia DAVVERO terminato su ciascun nodo"
+      ansible.builtin.command: "pgrep -x slapd"
+      register: slapd_pgrep_check
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+      failed_when: false
+      changed_when: false
 
-        - name: "[Master] Copia del file LDIF pulito sui server target"
-          ansible.builtin.copy:
-            src: "{{ backup_file }}"
-            dest: "/tmp/restore.ldif"
-            owner: openldap
-            group: openldap
-            mode: '0640'
+    - name: "[STOP] Blocca se anche UN SOLO nodo ha ancora slapd in esecuzione"
+      ansible.builtin.assert:
+        that:
+          - item.rc != 0
+        fail_msg: >-
+          ERRORE CRITICO: slapd ancora in esecuzione su {{ item.item }} dopo lo stop.
+          NON si procede a svuotare nulla finche' ogni nodo non e' confermato fermo.
+        success_msg: "OK: slapd correttamente fermo su {{ item.item }}."
+      loop: "{{ slapd_pgrep_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
 
-        - name: "[Master] Importazione dei dati tramite slapadd"
-          ansible.builtin.command: >
-            slapadd -v -l /tmp/restore.ldif
-          register: slapadd_result
-          changed_when: slapadd_result.rc == 0
+    # ==========================================================================
+    # FASE 2: BACKUP DI SICUREZZA (un solo nodo di riferimento)
+    # ==========================================================================
 
-        - name: "[Master] Rimozione del file temporaneo LDIF"
-          ansible.builtin.file:
-            path: "/tmp/restore.ldif"
-            state: absent
+    - name: "[BACKUP] Determina un timestamp univoco per la cartella di backup"
+      ansible.builtin.set_fact:
+        backup_timestamp: "{{ lookup('pipe', 'date +%Y%m%d-%H%M%S') }}"
+      run_once: true
 
-    # --- 3. OPERAZIONI SUI NODI READ-ONLY (PIALLATURA) ---
-    - name: Configurazione Nodi Read-Only
-      when: inventory_hostname in groups['readonlyreplica']
-      block:
-        - name: "[Read-Only] Rimozione totale del database per forzare il bootstrap automatico"
-          ansible.builtin.file:
-            path: "{{ ldap_data_dir }}/data.mdb"
-            state: absent
+    - name: "[BACKUP] Copia {{ ldap_data_dir }} su {{ reference_node }} prima di toccarla"
+      ansible.builtin.command: >
+        cp -a {{ ldap_data_dir }} {{ ldap_data_dir }}.bak-{{ backup_timestamp }}
+      delegate_to: "{{ reference_node }}"
+      run_once: true
 
-    # --- 4. PERMESSI E AVVIO SU TUTTI I NODI ---
-    - name: "Ripristino dei permessi sulla directory LDAP"
+    # ==========================================================================
+    # FASE 3: WIPE - SOLO ORA, dopo le verifiche di sicurezza
+    # ==========================================================================
+
+    - name: "[WIPE] Svuota {{ ldap_data_dir }} su TUTTI i nodi"
+      # Svuota l'intera directory, non solo data.mdb: un lock.mdb orfano
+      # puo' restare agganciato a regioni di memoria mappata che non
+      # esistono piu' una volta ricreato il database.
+      ansible.builtin.shell: "rm -rf {{ ldap_data_dir }}/*"
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+
+    - name: "[WIPE] Ripristina i permessi corretti su {{ ldap_data_dir }} ovunque"
+      ansible.builtin.file:
+        path: "{{ ldap_data_dir }}"
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: "0700"
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 4: CARICAMENTO - lo STESSO LDIF, indipendentemente, su OGNI nodo
+    # (master e read-only), IN PARALLELO
+    # ==========================================================================
+
+    - name: "[CARICAMENTO] Copia l'LDIF di backup su ciascun nodo"
+      ansible.builtin.copy:
+        src: "{{ backup_file }}"
+        dest: /tmp/restore.ldif
+        mode: "0600"
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+
+    - name: "[CARICAMENTO] Lancia slapadd IN PARALLELO su ciascun nodo (async, non aspetta qui)"
+      # -F punta alla cn=config LOCALE di ciascun nodo: essenziale per il
+      # serverID corretto nell'entryCSN generato per quel nodo specifico.
+      # -b disambigua esplicitamente il database di destinazione.
+      #
+      # async/poll:0: il loop lancia gli slapadd uno dopo l'altro, ma
+      # poll:0 fa si' che ciascun lancio ritorni quasi subito (senza
+      # aspettare che slapadd finisca) - il tempo TOTALE di questo task e'
+      # quindi solo il tempo di avviare i processi in background
+      # (proporzionale al numero di nodi, ma trascurabile: ogni avvio
+      # costa solo l'apertura di una connessione), non la somma dei tempi
+      # di caricamento di ciascuno. Gli slapadd girano poi VERAMENTE in
+      # parallelo su tutti i nodi.
+      ansible.builtin.command: >
+        slapadd -v -F /etc/ldap/slapd.d -b "{{ suffix }}" -l /tmp/restore.ldif
+      async: 3600
+      poll: 0
+      register: slapadd_async_jobs
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      run_once: true
+      changed_when: true
+
+    - name: "[CARICAMENTO] Attende il completamento di slapadd su ciascun nodo (in parallelo)"
+      # async_status va delegato allo STESSO host su cui il job e' stato
+      # lanciato (il tracciamento del job e' locale a quell'host).
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      register: slapadd_poll_result
+      delegate_to: "{{ item.item }}"
+      until: slapadd_poll_result.finished
+      retries: 370
+      delay: 10
+      loop: "{{ slapadd_async_jobs.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[CARICAMENTO] Mostra l'esito di slapadd per ciascun nodo"
+      ansible.builtin.debug:
+        msg: "{{ item.item }}: rc={{ item.rc }}, {{ (item.stdout_lines + item.stderr_lines)[-3:] }}"
+      loop: "{{ slapadd_poll_result.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[CARICAMENTO] Blocca se slapadd e' fallito su uno o piu' nodi"
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+        fail_msg: "ERRORE: slapadd fallito su {{ item.item }} (rc={{ item.rc }}) - dettaglio: {{ (item.stdout_lines + item.stderr_lines)[-5:] }}"
+        success_msg: "OK: slapadd completato correttamente su {{ item.item }}."
+      loop: "{{ slapadd_poll_result.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[CARICAMENTO] Rimuove l'LDIF temporaneo da ciascun nodo"
+      ansible.builtin.file:
+        path: /tmp/restore.ldif
+        state: absent
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 5: PERMESSI E RIAVVIO
+    # ==========================================================================
+
+    - name: "[RESTART] Ripristina la proprieta' openldap:openldap ovunque"
       ansible.builtin.file:
         path: "{{ ldap_data_dir }}"
         owner: openldap
         group: openldap
         recurse: true
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
 
-    - name: "Avvio del servizio OpenLDAP (slapd)"
+    - name: "[RESTART] Avvia slapd sui master"
       ansible.builtin.systemd:
         name: slapd
         state: started
+      delegate_to: "{{ item }}"
+      loop: "{{ cluster_nodes }}"
+      run_once: true
+
+    - name: "[PAUSA] Breve attesa prima di avviare le read-only"
+      ansible.builtin.pause:
+        seconds: 5
+      run_once: true
+
+    - name: "[RESTART] Avvia slapd sulle read-only"
+      ansible.builtin.systemd:
+        name: slapd
+        state: started
+      delegate_to: "{{ item }}"
+      loop: "{{ readonly_nodes }}"
+      when: readonly_nodes | length > 0
+      run_once: true
+
+    - name: "[PAUSA] Breve attesa che tutti i servizi slapd siano pienamente inizializzati"
+      ansible.builtin.pause:
+        seconds: 10
+      run_once: true
+
+    # ==========================================================================
+    # FASE 6: VERIFICA - nessuna attesa di convergenza necessaria (ogni nodo
+    # ha gia' i dati completi, caricati direttamente): solo conferma diretta.
+    # ==========================================================================
+
+    - name: "[VERIFICA] Conta le entry totali su ciascun nodo"
+      ansible.builtin.command: >
+        ldapsearch -x -D "{{ bind_dn }}" -w "{{ bind_pw }}" -H ldaps://127.0.0.1/
+        -b "{{ suffix }}" -s sub "(objectClass=*)" dn
+      register: node_count_check
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+      changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA] Valida che ciascun nodo veda almeno {{ expected_entry_count }} entry"
+      ansible.builtin.assert:
+        that:
+          - "(item.stdout | regex_findall('^dn: ', multiline=True) | length | int) >= (expected_entry_count | int)"
+        fail_msg: "ERRORE: {{ item.item }} vede solo {{ item.stdout | regex_findall('^dn: ', multiline=True) | length }} entry (attese almeno {{ expected_entry_count }})."
+        success_msg: "OK: {{ item.item }} vede {{ item.stdout | regex_findall('^dn: ', multiline=True) | length }} entry."
+      loop: "{{ node_count_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      run_once: true
+
+    - name: "[VERIFICA] Legge il campione di DN su ciascun nodo"
+      ansible.builtin.command: >
+        ldapsearch -x -D "{{ bind_dn }}" -w "{{ bind_pw }}" -H ldaps://127.0.0.1/
+        -b "{{ item.1 }}" -s base "(objectClass=*)" dn
+      register: sample_check
+      delegate_to: "{{ item.0 }}"
+      loop: "{{ all_nodes | product(sample_dns) | list }}"
+      loop_control:
+        label: "{{ item.0 }} <- {{ item.1 }}"
+      run_once: true
+      failed_when: false
+      changed_when: false
+      no_log: true
+
+    - name: "[VERIFICA] Valida che ciascuna entry del campione sia presente su ciascun nodo"
+      ansible.builtin.assert:
+        that:
+          - item.rc == 0
+        fail_msg: "ERRORE: la entry '{{ item.item.1 }}' non risulta presente su {{ item.item.0 }}."
+        success_msg: "OK: '{{ item.item.1 }}' presente su {{ item.item.0 }}."
+      loop: "{{ sample_check.results }}"
+      loop_control:
+        label: "{{ item.item.0 }} <- {{ item.item.1 }}"
+      run_once: true
+
+    - name: "[RIEPILOGO] Ripristino completato e verificato su tutti i nodi"
+      ansible.builtin.debug:
+        msg:
+          - "Ripristino completato su {{ all_nodes | length }} nodi ({{ all_nodes }}). Entry attese: {{ expected_entry_count }}."
+          - "Backup pre-wipe conservato in {{ ldap_data_dir }}.bak-{{ backup_timestamp }} su {{ reference_node }} - rimuovilo manualmente una volta confermato che tutto e' a posto."
+          - "Per una misura del tempo REALE di replica sotto carico rappresentativo (non di stress), usa test_slapadd_replication.yml."
