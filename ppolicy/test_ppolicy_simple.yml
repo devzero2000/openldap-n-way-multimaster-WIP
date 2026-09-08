@@ -2,12 +2,32 @@
 # TITOLO:       Test Validazione Replicazione Password Multi-Master OpenLDAP
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.3 (review)
+# VERSIONE:     1.5 (review)
 # SCOPO:        1. Cleanup preventivo dell'utente di test su node1.
 #               2. Creazione utente e cambio password autonomo su node1.
 #               3. Validazione BIND con nuova password su node2, node3 e su
 #                  tutte le repliche read-only.
 #               4. Cleanup finale.
+#
+# NOVITÀ v1.5 rispetto a v1.4:
+#   - Corpo del test avvolto in block/always: il cleanup dell'utente di
+#     test (STEP 4) ora gira SEMPRE, anche se VERIFICA fallisce - prima,
+#     un fallimento lasciava l'utente residuo, richiedendo una pulizia
+#     manuale prima del run successivo.
+#
+# NOVITÀ v1.4 rispetto a v1.3 (migliorie generali applicate a tutti e 4 i
+# file di test dopo la chiusura del bug ForwardUpdates):
+#   - ansible_python_interpreter: auto_silent - elimina il warning ripetuto
+#     sull'interprete Python scoperto automaticamente, senza fissare un
+#     path che si romperebbe silenziosamente se cambiasse in futuro.
+#   - Aggiunto un task che garantisce python3-ldap installato su node1
+#     prima di qualunque uso dei moduli community.general.ldap_* - senza,
+#     quei moduli falliscono con un errore poco chiaro invece che con un
+#     messaggio esplicito sul pacchetto mancante.
+#   - ldap:// -> ldaps:// ovunque (mai ldapi:///, che resta invariato:
+#     e' un socket locale, non attraversa la rete). In vista di un deploy
+#     finale che potrebbe eliminare del tutto l'ascolto in chiaro su
+#     ldap://, i test devono gia' funzionare solo con ldaps://.
 #
 # NOVITÀ v1.3 rispetto a v1.2:
 #   - test_user_dn: ou=People -> ou=people (minuscolo), per coerenza con
@@ -40,6 +60,7 @@
   hosts: cluster
   gather_facts: false
   vars:
+    ansible_python_interpreter: auto_silent
     suffix: "dc=example,dc=com"
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
@@ -54,118 +75,129 @@
     verify_nodes: "{{ other_nodes + readonly_nodes }}"
 
   tasks:
-    # --------------------------------------------------------------------------
-    # 1. CLEANUP PREVENTIVO (NODO 1)
-    # --------------------------------------------------------------------------
-    - name: "[STEP 1] Cleanup utente residuo da esecuzioni precedenti su node1"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "{{ test_user_dn }}"
-        state: absent
-      delegate_to: "{{ node1 }}"
-      run_once: true
-
-    # --------------------------------------------------------------------------
-    # 1b. LETTURA DINAMICA DI pwdMinLength (per generare password sempre valide)
-    # --------------------------------------------------------------------------
-    - name: "[SETUP] Interroga la Password Policy attiva per pwdMinLength"
-      ansible.builtin.command: >
-        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
-        -LLL -b "cn=default,ou=policies,{{ suffix }}" pwdMinLength
-      register: _ppolicy_raw
-      delegate_to: "{{ node1 }}"
-      run_once: true
-      changed_when: false
-      no_log: true
-
-    - name: "[SETUP] Deriva pwdMinLength e costruisci le password di test con padding dinamico"
-      # regex_search SENZA backreference di gruppo (mai fallisce con
-      # "'NoneType' object has no attribute 'group'" in assenza di match,
-      # a differenza della forma con '\1' - vedi note in test_ppolicy_full.yml).
-      ansible.builtin.set_fact:
-        ppolicy_min_length: "{{ (_ppolicy_raw.stdout | regex_search('pwdMinLength: [0-9]+') | default('pwdMinLength: 12', true) | regex_replace('[^0-9]', '')) | int }}"
-
-    - name: "[SETUP] Costruisci le due password di test (base fissa + padding se pwdMinLength lo richiede)"
-      ansible.builtin.set_fact:
-        pw_temp: "{{ 'PasswordTemp123!' ~ ('X' * ([(ppolicy_min_length | int) - 16, 0] | max)) }}"
-        pw_new: "{{ 'NuovaPasswordSegreta456!' ~ ('X' * ([(ppolicy_min_length | int) - 24, 0] | max)) }}"
-      run_once: true
-
-    # --------------------------------------------------------------------------
-    # 2. CREAZIONE UTENTE E CAMBIO PASSWORD AUTONOMO (NODO 1)
-    # --------------------------------------------------------------------------
-    - name: "[STEP 2a] Crea utente con password temporanea su node1"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "{{ test_user_dn }}"
-        objectClass: [top, person, organizationalPerson, inetOrgPerson]
-        attributes:
-          cn: testuser
-          sn: Test
-          userPassword: "{{ pw_temp }}"
+    - name: "[SETUP] Assicura che python3-ldap sia installato (richiesto dai moduli community.general.ldap_*)"
+      ansible.builtin.apt:
+        name: python3-ldap
         state: present
+      become: true
       delegate_to: "{{ node1 }}"
       run_once: true
-      no_log: true
 
-    - name: "[STEP 2b] L'utente modifica la propria password via ldap_passwd su node1"
-      community.general.ldap_passwd:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ test_user_dn }}"
-        bind_pw: "{{ pw_temp }}"
-        dn: "{{ test_user_dn }}"
-        passwd: "{{ pw_new }}"
-      delegate_to: "{{ node1 }}"
-      run_once: true
-      no_log: true
+    - name: "[BLOCCO TEST] Corpo del test - cleanup garantito anche in caso di fallimento"
+      block:
+        # --------------------------------------------------------------------------
+        # 1. CLEANUP PREVENTIVO (NODO 1)
+        # --------------------------------------------------------------------------
+        - name: "[STEP 1] Cleanup utente residuo da esecuzioni precedenti su node1"
+          community.general.ldap_entry:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ bind_dn }}"
+            bind_pw: "{{ bind_pw }}"
+            dn: "{{ test_user_dn }}"
+            state: absent
+          delegate_to: "{{ node1 }}"
+          run_once: true
 
-    - name: "[PAUSA] Pausa di 2 secondi per sincronizzazione syncrepl"
-      ansible.builtin.pause:
-        seconds: 2
-      run_once: true
-      changed_when: false
+        # --------------------------------------------------------------------------
+        # 1b. LETTURA DINAMICA DI pwdMinLength (per generare password sempre valide)
+        # --------------------------------------------------------------------------
+        - name: "[SETUP] Interroga la Password Policy attiva per pwdMinLength"
+          ansible.builtin.command: >
+            ldapsearch -x -H ldaps://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+            -LLL -b "cn=default,ou=policies,{{ suffix }}" pwdMinLength
+          register: _ppolicy_raw
+          delegate_to: "{{ node1 }}"
+          run_once: true
+          changed_when: false
+          no_log: true
 
-    # --------------------------------------------------------------------------
-    # 3. VERIFICA BIND SUGLI ALTRI NODI DEL CLUSTER
-    # --------------------------------------------------------------------------
-    - name: "[STEP 3] Tenta l'autenticazione (BIND) con la nuova password sugli altri master e sulle repliche read-only"
-      ansible.builtin.command: >
-        ldapsearch -H ldap://{{ item }}/
-        -D "{{ test_user_dn }}"
-        -w "{{ pw_new }}"
-        -b "{{ suffix }}"
-        "(cn=testuser)" dn
-      loop: "{{ verify_nodes }}"
-      register: bind_test
-      ignore_errors: true
-      run_once: true
-      changed_when: false
-      no_log: true
+        - name: "[SETUP] Deriva pwdMinLength e costruisci le password di test con padding dinamico"
+          # regex_search SENZA backreference di gruppo (mai fallisce con
+          # "'NoneType' object has no attribute 'group'" in assenza di match,
+          # a differenza della forma con '\1' - vedi note in test_ppolicy_full.yml).
+          ansible.builtin.set_fact:
+            ppolicy_min_length: "{{ (_ppolicy_raw.stdout | regex_search('pwdMinLength: [0-9]+') | default('pwdMinLength: 12', true) | regex_replace('[^0-9]', '')) | int }}"
 
-    - name: "[VERIFICA] Valida il successo dell'autenticazione su tutti i nodi secondari"
-      ansible.builtin.assert:
-        that:
-          - item.rc == 0
-        fail_msg: "ERRORE: BIND fallito sul nodo {{ item.item }}. La password non e' sincronizzata!"
-        success_msg: "OK: BIND riuscito con successo sul nodo {{ item.item }}."
-      loop: "{{ bind_test.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-      run_once: true
+        - name: "[SETUP] Costruisci le due password di test (base fissa + padding se pwdMinLength lo richiede)"
+          ansible.builtin.set_fact:
+            pw_temp: "{{ 'PasswordTemp123!' ~ ('X' * ([(ppolicy_min_length | int) - 16, 0] | max)) }}"
+            pw_new: "{{ 'NuovaPasswordSegreta456!' ~ ('X' * ([(ppolicy_min_length | int) - 24, 0] | max)) }}"
+          run_once: true
 
-    # --------------------------------------------------------------------------
-    # 4. CLEANUP FINALE (NODO 1)
-    # --------------------------------------------------------------------------
-    - name: "[STEP 4] Cleanup utente di test a fine esecuzione"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "{{ test_user_dn }}"
-        state: absent
-      delegate_to: "{{ node1 }}"
-      run_once: true
+        # --------------------------------------------------------------------------
+        # 2. CREAZIONE UTENTE E CAMBIO PASSWORD AUTONOMO (NODO 1)
+        # --------------------------------------------------------------------------
+        - name: "[STEP 2a] Crea utente con password temporanea su node1"
+          community.general.ldap_entry:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ bind_dn }}"
+            bind_pw: "{{ bind_pw }}"
+            dn: "{{ test_user_dn }}"
+            objectClass: [top, person, organizationalPerson, inetOrgPerson]
+            attributes:
+              cn: testuser
+              sn: Test
+              userPassword: "{{ pw_temp }}"
+            state: present
+          delegate_to: "{{ node1 }}"
+          run_once: true
+          no_log: true
+
+        - name: "[STEP 2b] L'utente modifica la propria password via ldap_passwd su node1"
+          community.general.ldap_passwd:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ test_user_dn }}"
+            bind_pw: "{{ pw_temp }}"
+            dn: "{{ test_user_dn }}"
+            passwd: "{{ pw_new }}"
+          delegate_to: "{{ node1 }}"
+          run_once: true
+          no_log: true
+
+        - name: "[PAUSA] Pausa di 2 secondi per sincronizzazione syncrepl"
+          ansible.builtin.pause:
+            seconds: 2
+          run_once: true
+          changed_when: false
+
+        # --------------------------------------------------------------------------
+        # 3. VERIFICA BIND SUGLI ALTRI NODI DEL CLUSTER
+        # --------------------------------------------------------------------------
+        - name: "[STEP 3] Tenta l'autenticazione (BIND) con la nuova password sugli altri master e sulle repliche read-only"
+          ansible.builtin.command: >
+            ldapsearch -H ldaps://{{ item }}/
+            -D "{{ test_user_dn }}"
+            -w "{{ pw_new }}"
+            -b "{{ suffix }}"
+            "(cn=testuser)" dn
+          loop: "{{ verify_nodes }}"
+          register: bind_test
+          ignore_errors: true
+          run_once: true
+          changed_when: false
+          no_log: true
+
+        - name: "[VERIFICA] Valida il successo dell'autenticazione su tutti i nodi secondari"
+          ansible.builtin.assert:
+            that:
+              - item.rc == 0
+            fail_msg: "ERRORE: BIND fallito sul nodo {{ item.item }}. La password non e' sincronizzata!"
+            success_msg: "OK: BIND riuscito con successo sul nodo {{ item.item }}."
+          loop: "{{ bind_test.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          run_once: true
+
+      always:
+        # --------------------------------------------------------------------------
+        # 4. CLEANUP FINALE (NODO 1) - gira sempre, anche se il blocco sopra fallisce
+        # --------------------------------------------------------------------------
+        - name: "[STEP 4] Cleanup utente di test a fine esecuzione"
+          community.general.ldap_entry:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ bind_dn }}"
+            bind_pw: "{{ bind_pw }}"
+            dn: "{{ test_user_dn }}"
+            state: absent
+          delegate_to: "{{ node1 }}"
+          run_once: true

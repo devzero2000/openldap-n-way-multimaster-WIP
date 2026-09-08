@@ -2,11 +2,32 @@
 # TITOLO:       Test Isolato - Verifica olcPPolicyForwardUpdates sulla Read-Only
 # AUTORE:       Elia Pinto
 # DATA:         Settembre 2026
-# VERSIONE:     1.1
+# VERSIONE:     1.3
 # SCOPO:        Il piu' semplice possibile: crea un utente pulito, genera UN
 #               SOLO fallimento di bind mirato ESCLUSIVAMENTE alla replica
 #               read-only, poi legge pwdFailureTime in locale su ciascuno dei
 #               4 nodi per vedere se (e dove) l'inoltro e' avvenuto.
+#
+# NOVITÀ v1.3 rispetto a v1.2:
+#   - Corpo del test avvolto in block/always: il cleanup dell'utente di
+#     test ora gira SEMPRE, anche se un task del blocco fallisce - prima,
+#     un fallimento a meta' test lasciava l'utente residuo, richiedendo
+#     una pulizia manuale prima del run successivo (situazione incontrata
+#     piu' volte durante questa sessione di lavoro).
+#
+# NOVITÀ v1.2 rispetto a v1.1 (migliorie generali applicate a tutti e 4 i
+# file di test dopo la chiusura del bug ForwardUpdates):
+#   - ansible_python_interpreter: auto_silent - elimina il warning ripetuto
+#     sull'interprete Python scoperto automaticamente, senza fissare un
+#     path che si romperebbe silenziosamente se cambiasse in futuro.
+#   - Aggiunto un task che garantisce python3-ldap installato su node1
+#     prima di qualunque uso dei moduli community.general.ldap_* - senza,
+#     quei moduli falliscono con un errore poco chiaro invece che con un
+#     messaggio esplicito sul pacchetto mancante.
+#   - ldap:// -> ldaps:// ovunque (mai ldapi:///, che resta invariato:
+#     e' un socket locale, non attraversa la rete). In vista di un deploy
+#     finale che potrebbe eliminare del tutto l'ascolto in chiaro su
+#     ldap://, i test devono gia' funzionare solo con ldaps://.
 #
 # NOVITÀ v1.1 rispetto a v1.0:
 #   - test_user_dn spostato da ou=users a ou=people: il play di deploy crea
@@ -29,6 +50,12 @@
   hosts: cluster
   gather_facts: false
   vars:
+    # auto_silent: mantiene l'auto-discovery dell'interprete Python (si
+    # adatta automaticamente se cambia in futuro) ma sopprime il warning
+    # ripetuto ad ogni run - la soluzione idiomatica di Ansible per questo
+    # esatto warning, preferibile a un path fisso che si romperebbe
+    # silenziosamente proprio nello scenario che il warning stesso descrive.
+    ansible_python_interpreter: auto_silent
     suffix: "dc=example,dc=com"
     bind_dn: "cn=admin,dc=example,dc=com"
     bind_pw: "openldap"
@@ -40,72 +67,87 @@
     all_nodes: "{{ groups['cluster'] + readonly_nodes }}"
 
   tasks:
-    - name: "[SETUP] Rimuovi l'utente di test se gia' presente (reset pulito)"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "{{ test_user_dn }}"
-        state: absent
-      delegate_to: "{{ node1 }}"
-      run_once: true
-
-    - name: "[SETUP] Crea l'utente di test con password pulita"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "{{ test_user_dn }}"
-        objectClass: [top, person, organizationalPerson, inetOrgPerson]
-        attributes:
-          cn: testuser
-          sn: Test
-          userPassword: "{{ test_user_pw }}"
+    # python3-ldap e' richiesto dai moduli community.general.ldap_entry/
+    # ldap_attrs/ldap_passwd (girano sull'host target via delegate_to
+    # node1): senza, falliscono con un errore poco chiaro invece di un
+    # messaggio esplicito sul pacchetto mancante.
+    - name: "[SETUP] Assicura che python3-ldap sia installato (richiesto dai moduli community.general.ldap_*)"
+      ansible.builtin.apt:
+        name: python3-ldap
         state: present
+      become: true
       delegate_to: "{{ node1 }}"
       run_once: true
-      no_log: true
 
-    - name: "[TEST] Genera UN SOLO fallimento di bind, mirato ESCLUSIVAMENTE alla replica read-only"
-      ansible.builtin.command: >
-        ldapsearch -H ldap://{{ readonly_nodes[0] }}/
-        -D "{{ test_user_dn }}"
-        -w "PasswordSbagliataErrata!"
-        -b "{{ suffix }}" "(objectClass=*)"
-      failed_when: false
-      changed_when: false
-      run_once: true
+    - name: "[BLOCCO TEST] Corpo del test - cleanup garantito anche in caso di fallimento"
+      block:
+        - name: "[SETUP] Rimuovi l'utente di test se gia' presente (reset pulito)"
+          community.general.ldap_entry:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ bind_dn }}"
+            bind_pw: "{{ bind_pw }}"
+            dn: "{{ test_user_dn }}"
+            state: absent
+          delegate_to: "{{ node1 }}"
+          run_once: true
 
-    - name: "[PAUSA] Attesa breve per l'eventuale inoltro (ForwardUpdates) e la replica"
-      ansible.builtin.pause:
-        seconds: 3
-      run_once: true
+        - name: "[SETUP] Crea l'utente di test con password pulita"
+          community.general.ldap_entry:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ bind_dn }}"
+            bind_pw: "{{ bind_pw }}"
+            dn: "{{ test_user_dn }}"
+            objectClass: [top, person, organizationalPerson, inetOrgPerson]
+            attributes:
+              cn: testuser
+              sn: Test
+              userPassword: "{{ test_user_pw }}"
+            state: present
+          delegate_to: "{{ node1 }}"
+          run_once: true
+          no_log: true
 
-    - name: "[VERIFICA] Legge pwdFailureTime IN LOCALE su ciascun nodo (readonly + ogni master)"
-      ansible.builtin.command: >
-        ldapsearch -x -H ldap://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
-        -LLL -b "{{ test_user_dn }}" -s base pwdFailureTime
-      register: check
-      delegate_to: "{{ item }}"
-      loop: "{{ all_nodes }}"
-      run_once: true
-      changed_when: false
-      no_log: true
+        - name: "[TEST] Genera UN SOLO fallimento di bind, mirato ESCLUSIVAMENTE alla replica read-only"
+          ansible.builtin.command: >
+            ldapsearch -H ldaps://{{ readonly_nodes[0] }}/
+            -D "{{ test_user_dn }}"
+            -w "PasswordSbagliataErrata!"
+            -b "{{ suffix }}" "(objectClass=*)"
+          failed_when: false
+          changed_when: false
+          run_once: true
 
-    - name: "[RISULTATO] Mostra dove (se dove) e' comparso il fallimento generato sulla read-only"
-      ansible.builtin.debug:
-        msg: "{{ item.item }}: {{ 'PRESENTE' if 'pwdFailureTime' in item.stdout else 'assente' }}"
-      loop: "{{ check.results }}"
-      loop_control:
-        label: "{{ item.item }}"
-      run_once: true
+        - name: "[PAUSA] Attesa breve per l'eventuale inoltro (ForwardUpdates) e la replica"
+          ansible.builtin.pause:
+            seconds: 3
+          run_once: true
 
-    - name: "[CLEANUP] Rimuovi l'utente di test"
-      community.general.ldap_entry:
-        server_uri: "ldapi:///"
-        bind_dn: "{{ bind_dn }}"
-        bind_pw: "{{ bind_pw }}"
-        dn: "{{ test_user_dn }}"
-        state: absent
-      delegate_to: "{{ node1 }}"
-      run_once: true
+        - name: "[VERIFICA] Legge pwdFailureTime IN LOCALE su ciascun nodo (readonly + ogni master)"
+          ansible.builtin.command: >
+            ldapsearch -x -H ldaps://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+            -LLL -b "{{ test_user_dn }}" -s base pwdFailureTime
+          register: check
+          delegate_to: "{{ item }}"
+          loop: "{{ all_nodes }}"
+          run_once: true
+          changed_when: false
+          no_log: true
+
+        - name: "[RISULTATO] Mostra dove (se dove) e' comparso il fallimento generato sulla read-only"
+          ansible.builtin.debug:
+            msg: "{{ item.item }}: {{ 'PRESENTE' if 'pwdFailureTime' in item.stdout else 'assente' }}"
+          loop: "{{ check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          run_once: true
+
+      always:
+        - name: "[CLEANUP] Rimuovi l'utente di test (gira sempre, anche se il blocco sopra e' fallito)"
+          community.general.ldap_entry:
+            server_uri: "ldapi:///"
+            bind_dn: "{{ bind_dn }}"
+            bind_pw: "{{ bind_pw }}"
+            dn: "{{ test_user_dn }}"
+            state: absent
+          delegate_to: "{{ node1 }}"
+          run_once: true
