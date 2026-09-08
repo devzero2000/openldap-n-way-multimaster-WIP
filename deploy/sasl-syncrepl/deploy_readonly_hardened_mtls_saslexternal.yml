@@ -2,9 +2,48 @@
 # TITOLO:       Configurazione Replica Read-Only OpenLDAP (Hardened SASL/mTLS)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.1.6 (review - CONFERMATO con test reale)
+# VERSIONE:     1.2.1 (review)
 # SCOPO:        Deploy corazzato per nodi di sola lettura sincronizzati via Syncrepl,
 #               iterando sugli host del gruppo readonlyreplica e configurando l'HA.
+#
+# NOVITÀ v1.2.1 rispetto a v1.2 (correzione mode=self -> mode=none dopo un
+# suggerimento esterno verificato, non preso per buono a scatola chiusa):
+#   - mode=self -> mode=none sul chain. Avevo descritto male mode=self nel
+#     commento originale ("il chain si presenta con la propria identita'")
+#     - e' l'opposto: mode=self asserisce l'identita' DEL CLIENT ORIGINALE
+#     (l'utente il cui bind e' fallito), non quella del chain. Per
+#     un'operazione di contabilita' interna di ppolicy non ha senso
+#     impersonare l'utente - che tra l'altro non avrebbe comunque i
+#     permessi per scrivere un attributo NO-USER-MODIFICATION. mode=none
+#     fa si' che il chain scriva sempre con la propria identita' mTLS.
+#   - Rimosso olcDbRebindAsUser (pertinente solo con mode=self/proxy,
+#     vestigiale con mode=none).
+#   - Dipende dall'ACL {4} ora "manage" (non piu' "write") nel play
+#     multimaster v1.9 - necessario per il Relax Control, il meccanismo
+#     documentato con cui OpenLDAP permette di scrivere legittimamente
+#     attributi NO-USER-MODIFICATION.
+#
+# NOVITÀ v1.2 rispetto a v1.1.6 - REINSERITO IL CHAIN OVERLAY (era stato
+# rimandato per stabilizzare prima lo stallo di systemd, ora risolto):
+#   - Aggiunto di nuovo l'overlay chain (+ modulo back_ldap), stavolta con
+#     l'indice esplicito {0}chain fin dall'inizio (la volta precedente
+#     l'errore "No such object" per l'indice auto-numerato era stato
+#     scoperto e corretto solo dopo un run fallito - vedi commento esteso
+#     nel blocco [CHAIN] per i dettagli).
+#   - Confermato con test diretto (olcLogLevel=stats sync acl su node4)
+#     che SENZA questo overlay, un bind sbagliato sulla read-only produce
+#     "ppolicy_bind_response: ppolicy state change failed with rc=10"
+#     (Referral): ppolicy prova a registrare il fallimento ma il backend,
+#     riconoscendosi shadow senza alcun meccanismo di inoltro, risponde
+#     con un referral - pwdMaxFailure non scatta mai per bind falliti
+#     originati sulla read-only.
+#   - Dipende dall'ACL {4} write su ou=system nel play multimaster v1.8
+#     (il fix si era perso in precedenza ed e' stato appena riapplicato -
+#     vedi changelog di quel file).
+#   - Resta la stessa incertezza residua della volta precedente: non
+#     ancora confermato se la scrittura inoltrata dal chain superi la
+#     restrizione NO-USER-MODIFICATION sul master. Verificare dopo il
+#     deploy ripetendo il test con log level elevato su ENTRAMBI i lati.
 #
 # NOVITÀ v1.1.6 rispetto a v1.1.5:
 #   - TimeoutStopSec 4 -> 15, stesso motivo del play multimaster (vedi
@@ -461,22 +500,22 @@
             - >-
               {3}to attrs=userPassword,pwdReset
               by self write
-              by dn.exact="{{ ldap_rootdn }}" manage
-              by group.exact="{{ ldap_admin_group }}" manage
-              by dn.subtree="ou=system,{{ ldap_basedn }}" manage
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
               by * auth
             - >-
               {4}to attrs=shadowLastChange,pwdChangedTime,pwdFailureTime,pwdAccountLockedTime,pwdHistory
               by self read
-              by dn.exact="{{ ldap_rootdn }}" manage
-              by group.exact="{{ ldap_admin_group }}" manage
-              by dn.subtree="ou=system,{{ ldap_basedn }}" manage
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
               by * none
             - >-
               {5}to dn.subtree="{{ ldap_basedn }}"
-              by dn.exact="{{ ldap_rootdn }}" manage
-              by group.exact="{{ ldap_admin_group }}" manage
-              by dn.subtree="ou=system,{{ ldap_basedn }}" manage
+              by dn.exact="{{ ldap_rootdn }}" write
+              by group.exact="{{ ldap_admin_group }}" write
+              by dn.subtree="ou=system,{{ ldap_basedn }}" read
               by self write
               by users read
               by * none
@@ -679,6 +718,138 @@
           olcPPolicyDefault: "cn=default,ou=policies,{{ ldap_basedn }}"
           olcPPolicyForwardUpdates: "TRUE"
           olcPPolicyHashCleartext: "TRUE"
+        state: present
+
+    # --------------------------------------------------------------------
+    # CHAIN OVERLAY - prerequisito perche' olcPPolicyForwardUpdates funzioni
+    # davvero.
+    #
+    # PROBLEMA (confermato empiricamente): olcPPolicyForwardUpdates=TRUE da
+    #   solo non ha alcun modo di consegnare l'aggiornamento al master.
+    #   Senza questo overlay, un bind sbagliato sulla read-only produce nel
+    #   log "ppolicy_bind_response: ppolicy state change failed with
+    #   rc=10" (rc=10 = Referral): ppolicy prova a registrare il
+    #   fallimento, ma il backend - riconoscendo di essere uno shadow
+    #   database senza alcun meccanismo di inoltro - risponde con un
+    #   referral, esattamente come farebbe con una scrittura client
+    #   ordinaria. Un attaccante puo' quindi bombardare la read-only di
+    #   tentativi di bind senza mai far scattare pwdMaxFailure.
+    #
+    # PERCHE': la documentazione OpenLDAP e piu' segnalazioni indipendenti
+    #   sulla mailing list ufficiale confermano che olcPPolicyForwardUpdates
+    #   richiede ESPLICITAMENTE l'overlay chain in aggiunta a olcUpdateRef.
+    #
+    # DOVE: va sul database FRONTEND (olcDatabase={-1}frontend,cn=config),
+    #   non su {1}mdb - e' un database a se stante nella gerarchia di
+    #   cn=config, quindi non tocca la numerazione degli overlay
+    #   memberof/nestgroup/ppolicy gia' presenti su {1}mdb.
+    #
+    # INDICE ESPLICITO {0}chain (non solo "chain"): lezione gia' imparata
+    #   una volta su questo stesso overlay - senza indice esplicito,
+    #   OpenLDAP auto-numera e la entry memorizzata diventa "{0}chain",
+    #   diversa dalla DN letterale "chain" usata per crearla. Il task
+    #   successivo (il database del chain, figlio di questo overlay)
+    #   fallirebbe con "No such object" cercando un genitore che non esiste
+    #   con quel nome esatto.
+    #
+    # COME: bind verso il master via SASL/EXTERNAL con gli stessi
+    #   certificati mTLS gia' distribuiti a questo nodo per syncrepl
+    #   (master_server, ssl_cert_path/ssl_key_path/ssl_ca_path - variabili
+    #   gia' definite in questo file per la PKI) - nessuna password in
+    #   chiaro da gestire, coerente con lo schema di autenticazione usato
+    #   in tutto il resto del progetto.
+    #
+    # DIPENDENZA: richiede che l'ACL {4} sul MASTER conceda "write" (non
+    #   solo "read") a dn.subtree="ou=system,..." sugli attributi di
+    #   lockout - vedi play multimaster v1.8. Senza quella, la connessione
+    #   in arrivo dal chain (autenticata con l'identita' mTLS del nodo
+    #   read-only, che vive in ou=system) verrebbe respinta dall'ACL prima
+    #   ancora di arrivare alla logica di ppolicy sul master.
+    #
+    # NON TOCCA LO STACK STABILIZZATO: questo overlay vive sul database
+    #   frontend, un ramo separato di cn=config rispetto a {1}mdb dove
+    #   vivono memberof/nestgroup/ppolicy/syncrepl - non altera l'ordine
+    #   di quello stack ne' i timeout syncrepl gia' verificati funzionanti
+    #   (timeout=5/network-timeout=5/keepalive=10:5:2, vedi piu' sotto).
+    #
+    # INCERTEZZA RESIDUA (onesta, da verificare dopo il deploy): non e'
+    #   ancora confermato se la scrittura inoltrata dal chain superi la
+    #   restrizione NO-USER-MODIFICATION che protegge pwdFailureTime/
+    #   pwdAccountLockedTime sul master, o se debba essere riconosciuta
+    #   come operazione ppolicy interna per bypassarla. Verificare
+    #   ripetendo lo stesso test (bind sbagliato mirato alla read-only, poi
+    #   "ldapsearch ... '*' '+'" per leggere pwdFailureTime, con
+    #   olcLogLevel a "stats sync acl" su ENTRAMBI i lati - master e
+    #   read-only - per vedere l'esito preciso su entrambi).
+    # --------------------------------------------------------------------
+
+    - name: "[CHAIN] Carica il modulo back_ldap (richiesto dal database del chain overlay)"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "back_ldap"
+        state: present
+
+    - name: "[CHAIN] Inizializza l'overlay chain sul database frontend"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={0}chain,olcDatabase={-1}frontend,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcChainConfig
+        attributes:
+          olcOverlay: "{0}chain"
+          # Se l'inoltro verso il master fallisce, si ottiene un errore
+          # esplicito invece di un successo silenzioso ma incompleto -
+          # preferibile per poter diagnosticare, invece di scoprire il
+          # problema solo dall'assenza del dato nei log.
+          olcChainReturnError: "TRUE"
+        state: present
+
+    - name: "[CHAIN] Configura il database ldap del chain (bind SASL/EXTERNAL verso il master)"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={0}ldap,olcOverlay={0}chain,olcDatabase={-1}frontend,cn=config"
+        objectClass:
+          - olcLDAPConfig
+          - olcChainDatabase
+        attributes:
+          olcDatabase: "{0}ldap"
+          # Punta esplicitamente al coordinatore (master_server): e' lo
+          # stesso nodo verso cui il frontend di slapd ha gia' mostrato di
+          # indirizzare i referral per le scritture (osservato durante il
+          # testing della Fase 2 del play di test ppolicy). Non e' l'unico
+          # master possibile nella mesh N-way, ma e' quello noto e
+          # verificato: se master_server fosse irraggiungibile, il chain
+          # fallirebbe (in modo visibile, grazie a olcChainReturnError) -
+          # limite noto, accettabile per ora.
+          olcDbURI: "ldaps://{{ master_server }}:636"
+          # mode=none (NON piu' mode=self): correzione rispetto alla prima
+          # versione di questo blocco, dove avevo descritto male mode=self
+          # come "il chain si presenta con la propria identita'" - e'
+          # l'opposto: mode=self fa si' che il chain asserisca l'identita'
+          # DEL CLIENT ORIGINALE (qui, l'utente il cui bind e' fallito -
+          # es. testuser), non la propria. Per un'operazione di
+          # contabilita' interna di ppolicy (non "per conto di" nessun
+          # utente), non ha senso impersonare l'utente - che oltretutto
+          # non avrebbe comunque i permessi per scrivere un attributo
+          # NO-USER-MODIFICATION. mode=none fa si' che il chain scriva
+          # SEMPRE con la propria identita' (quella del certificato mTLS
+          # di questo nodo, in ou=system), coerente con l'ACL {4} del
+          # master (vedi sotto, ora "manage" invece di "write").
+          olcDbIDAssertBind: >-
+            mode=none bindmethod=sasl saslmech=EXTERNAL
+            tls_cert={{ ssl_cert_path }} tls_key={{ ssl_key_path }} tls_cacert={{ ssl_ca_path }}
+            tls_reqcert=demand starttls=no
+          # olcDbRebindAsUser rimosso: era pertinente solo con mode=self/
+          # proxy (rebind come l'utente asserito quando si segue un
+          # referral) - con mode=none non c'e' alcuna identita' asserita
+          # da ri-autenticare, sarebbe un parametro vestigiale.
+          olcDbChaseReferrals: "TRUE"
         state: present
 
     # --------------------------------------------------------------------
