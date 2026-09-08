@@ -2,7 +2,7 @@
 # TITOLO:       Test Completo Password Policy e Replicazione Multi-Master
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     2.2 (review)
+# VERSIONE:     2.3 (review)
 # SCOPO:        1. Cleanup e creazione utente su Node1.
 #               2. Test del confine ESATTO di pwdMinLength (rifiuto a
 #                  min-1, accettazione a esattamente min).
@@ -169,6 +169,43 @@
 #     una versione/pacchetto OpenLDAP diverso, un fallimento della Fase 5
 #     sarebbe stato difficile da distinguere da un vero problema di ACL.
 #
+# NOVITÀ v2.3 rispetto a v2.2 (tre correzioni portate da un file di test
+# parallelo/piu' vecchio - "verifica_ppolicy.yml" - caricato per un controllo
+# di ridondanza: non era ridondante, aveva tre punti validi che il nostro
+# file non copriva ancora):
+#   - node1/other_nodes ora derivati da cluster_nodes = groups['cluster'] |
+#     sort, non piu' da groups['cluster'][0]/[1:] grezzo. I play di deploy
+#     determinano ca_server/master_server con lo stesso sort() - senza
+#     applicarlo anche qui, se l'inventory non elenca gli host in ordine
+#     alfabetico, il "node1" di questo test poteva puntare a un nodo
+#     DIVERSO dal coordinatore vero del deploy.
+#   - Rimosso "slappasswd -s {{ pw_initial }}" per generare l'hash della
+#     password di bootstrap: anche con no_log:true sul task Ansible (che
+#     nasconde solo l'output nei LOG di Ansible), la password compariva
+#     comunque in chiaro tra gli argomenti del processo sul nodo remoto,
+#     visibile con "ps aux"/"/proc/<pid>/cmdline" a chiunque altro avesse
+#     accesso shell a quel nodo mentre il comando girava. Sostituito con la
+#     creazione diretta dell'utente con userPassword in chiaro via modulo
+#     Ansible, lasciando che sia olcPPolicyHashCleartext=TRUE (gia'
+#     configurato nel deploy, si applica sia ad ADD che a MODIFY) a fare
+#     l'hashing lato server - la password non passa mai per un argomento di
+#     processo esterno.
+#   - VERIFICA 3d (lockout distribuito) semplificata e rinforzata: prima
+#     accettava "'Account locked' in ... OR rc==49" come prova sufficiente -
+#     ma verificato sui log reali di questa sessione che il nostro OpenLDAP
+#     non restituisce mai il testo "Account locked" (sempre il generico
+#     "Invalid credentials (49)"), quindi quel ramo dell'assert non scattava
+#     MAI: tutta la prova ricadeva gia' solo su rc==49, che da solo e'
+#     ambiguo (vale per QUALSIASI password sbagliata, non solo per un
+#     account bloccato). Aggiunta una nuova VERIFICA 3d-attr che legge
+#     pwdAccountLockedTime direttamente (lettura ADMIN, come gia' fatto per
+#     VERIFICA 3c sul nodo di origine, ora estesa a tutti i nodi secondari)
+#     PRIMA del tentativo di bind: prova univoca e non ambigua che il
+#     lockout si sia replicato. TEST 3d/VERIFICA 3d restano come conferma
+#     comportamentale complementare (l'effetto lato client e' davvero
+#     osservabile), semplificati a "item.rc != 0" dato che la prova di
+#     merito arriva ormai dalla lettura diretta.
+#
 # NOVITÀ v2.2 rispetto a v2.1 (il precheck introdotto in v2.1 rimosso, run
 # reale alla mano):
 #   - Il precheck falliva: il server di questo cluster non pubblicizza
@@ -309,10 +346,17 @@
     # con lo stato lasciato dalle Fasi 1-3 su quell'utente.
     admin_test_user_dn: "cn=admintest,ou=people,{{ suffix }}"
 
-    node1: "{{ groups['cluster'][0] }}"
-    other_nodes: "{{ groups['cluster'][1:] }}"
+    # cluster_nodes ordinato esplicitamente: i play di deploy determinano
+    # ca_server/master_server con "groups['cluster'] | sort" - senza lo
+    # stesso sort() qui, se l'inventory non elenca gli host in ordine
+    # alfabetico, il "node1" di questo test potrebbe puntare a un nodo
+    # DIVERSO dal coordinatore vero del deploy, rompendo silenziosamente
+    # assunzioni su certificati/PKI legate a quel nodo specifico.
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    node1: "{{ cluster_nodes[0] }}"
+    other_nodes: "{{ cluster_nodes[1:] }}"
     readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
-    all_nodes: "{{ groups['cluster'] + readonly_nodes }}"
+    all_nodes: "{{ cluster_nodes + readonly_nodes }}"
     # Tutti i nodi secondari su cui verificare che password/lockout si
     # siano propagati: gli altri master del cluster + tutte le repliche
     # read-only.
@@ -395,15 +439,15 @@
           pw_initial: "{{ 'InitialBootstrapPW1!' ~ ('X' * ([(ppolicy_min_length | int) - 11, 0] | max)) }}"
         run_once: true
 
-      - name: "[SETUP] Genera hash SSHA per la password di bootstrap"
-        ansible.builtin.command: "slappasswd -s {{ pw_initial }}"
-        register: initial_pw_hash
-        delegate_to: "{{ node1 }}"
-        run_once: true
-        changed_when: false
-        no_log: true
-
-      - name: "[SETUP] Crea l'utente di test con la password di bootstrap hashata su node1"
+      - name: >-
+          [SETUP] Crea l'utente di test con la password di bootstrap in chiaro
+          su node1 (hash lato server via olcPPolicyHashCleartext=TRUE)
+        # userPassword in chiaro passato via modulo Ansible (non un argomento
+        # di processo esterno tipo slappasswd sulla riga di comando): la
+        # password non compare mai in "ps aux"/"/proc/<pid>/cmdline" sul nodo
+        # remoto. E' l'overlay ppolicy (olcPPolicyHashCleartext=TRUE, gia'
+        # configurato nel deploy) a fare l'hashing lato server, sia per ADD
+        # che per MODIFY.
         community.general.ldap_entry:
           server_uri: "ldapi:///"
           bind_dn: "{{ bind_dn }}"
@@ -413,7 +457,7 @@
           attributes:
             cn: testuser
             sn: Test
-            userPassword: "{{ initial_pw_hash.stdout }}"
+            userPassword: "{{ pw_initial }}"
           state: present
         delegate_to: "{{ node1 }}"
         run_once: true
@@ -704,6 +748,30 @@
           success_msg: "OK: pwdAccountLockedTime presente su node1 esattamente a {{ ppolicy_max_failure }} fallimenti - confine confermato alla fonte."
         run_once: true
 
+      - name: >-
+          [VERIFICA 3d-attr] Legge pwdAccountLockedTime IN LOCALE su ciascun nodo secondario
+          (lettura ADMIN, nessuna ambiguita' sul motivo di un eventuale rifiuto del bind)
+        ansible.builtin.command: >
+          ldapsearch -x -H ldaps://127.0.0.1/ -D "{{ bind_dn }}" -w "{{ bind_pw }}"
+          -LLL -b "{{ test_user_dn }}" -s base pwdAccountLockedTime
+        register: distributed_lock_check
+        delegate_to: "{{ item }}"
+        loop: "{{ verify_nodes }}"
+        run_once: true
+        changed_when: false
+        no_log: true
+
+      - name: "[VERIFICA 3d-attr] Valida che pwdAccountLockedTime sia presente su ciascun nodo secondario"
+        ansible.builtin.assert:
+          that:
+            - "'pwdAccountLockedTime' in item.stdout"
+          fail_msg: "ERRORE CRITICO: pwdAccountLockedTime assente su {{ item.item }} - il lockout non si e' replicato su questo nodo."
+          success_msg: "OK: pwdAccountLockedTime confermato presente su {{ item.item }} (lettura diretta, nessuna ambiguita')."
+        loop: "{{ distributed_lock_check.results }}"
+        loop_control:
+          label: "{{ item.item }}"
+        run_once: true
+
       - name: "[TEST 3d - LOCKOUT] Tenta il login con la password CORRETTA su tutti i nodi secondari (altri master + repliche read-only)"
         ansible.builtin.command: >
           ldapsearch -H ldaps://{{ item }}/
@@ -717,13 +785,26 @@
         changed_when: false
         no_log: true
 
-      - name: "[VERIFICA 3d] Valida che l'account risulti BLOCCATO su tutti i nodi secondari esattamente a pwdMaxFailure={{ ppolicy_max_failure }} fallimenti"
+      - name: >-
+          [VERIFICA 3d] Valida che il bind con la password CORRETTA fallisca comunque su
+          tutti i nodi secondari (prova comportamentale, a complemento della lettura diretta sopra)
+        # NOTA: qui NON si controlla piu' il testo "Account locked" in aggiunta
+        # a rc==49 come alternativa sufficiente - verificato sui log reali di
+        # questa sessione che il nostro OpenLDAP non lo restituisce mai
+        # (sempre il generico "Invalid credentials (49)"), quindi quel ramo
+        # dell'assert originale non scattava mai: tutto il peso della prova
+        # ricadeva gia' solo su rc==49. Non e' piu' un problema di ambiguita'
+        # (rc==49 da solo varrebbe per QUALSIASI password sbagliata) perche'
+        # la prova univoca che sia davvero lockout arriva ora dalla lettura
+        # diretta dell'attributo appena sopra (VERIFICA 3d-attr) - questo
+        # task resta solo a conferma che l'effetto lato client (bind negato
+        # con la password giusta) sia davvero osservabile, non solo il flag
+        # impostato sul server.
         ansible.builtin.assert:
           that:
             - item.rc != 0
-            - "'Account locked' in item.stderr or 'Account locked' in item.stdout or item.rc == 49"
           fail_msg: "ERRORE CRITICO: L'utente e' stato bloccato su node1 ma riesce ancora ad accedere su {{ item.item }}!"
-          success_msg: "OK: Replicazione pwdAccountLockedTime verificata! L'account risulta BLOCCATO anche sul nodo {{ item.item }}."
+          success_msg: "OK: Il bind con la password corretta viene correttamente rifiutato anche sul nodo {{ item.item }}."
         loop: "{{ lockout_check.results }}"
         loop_control:
           label: "{{ item.item }}"
