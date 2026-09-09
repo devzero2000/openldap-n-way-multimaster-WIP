@@ -1,5 +1,8 @@
 # ==============================================================================
 # TITOLO:       Verifica Dataset RIDOTTO (MemberOf + Nested Group + Refint)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.1 (review)
 # SCOPO:        Stesse metriche di lettura del play di verifica a piena scala
 #               (memberof/nestgroup), piu' un test dedicato di refint:
 #               cancella UN utente (non tutti), verifica che i gruppi che lo
@@ -10,6 +13,17 @@
 # gruppo radice, utente refint in 3 gruppi noti) sono GARANTITE dal generatore
 # ridotto (create_custom_scale_data_small.yml) - non presuppongono nulla di
 # casuale.
+#
+# NOVITÀ v1.1 rispetto a v1.0 (review):
+#   - ou=People -> ou=people ovunque: cosmetico (LDAP e' case-insensitive
+#     sul confronto di "ou="), ma uniformato per coerenza col resto del
+#     progetto (vedi stesso fix nel generatore, create_custom_scale_data_
+#     small.yml v1.1, dove e' spiegato il dettaglio).
+#   - Aggiunto no_log:true sul task "[REFINT] Ricrea l'utente di test": la
+#     password passa via stdin (non sulla riga di comando, quindi gia' al
+#     riparo da "ps aux"), ma senza no_log comparirebbe comunque nei log
+#     verbosi di Ansible stesso.
+# ==============================================================================
 # ==============================================================================
 ---
 - name: "Validazione Dataset RIDOTTO (MemberOf + Nested Group + Refint)"
@@ -20,17 +34,17 @@
     admin_dn: "cn=admin,dc=example,dc=com"
     admin_pw: "openldap"
 
-    test_user_standard: "uid=csmall-user-10,ou=People,dc=example,dc=com"
+    test_user_standard: "uid=csmall-user-10,ou=people,dc=example,dc=com"
     test_user_standard_pw: "csmall-user-10.1"
-    test_user_architect: "uid=csmall-user-1,ou=People,dc=example,dc=com"
+    test_user_architect: "uid=csmall-user-1,ou=people,dc=example,dc=com"
     test_user_architect_pw: "csmall-user-1.1"
-    test_user_deep: "uid=csmall-user-50,ou=People,dc=example,dc=com"
+    test_user_deep: "uid=csmall-user-50,ou=people,dc=example,dc=com"
     test_user_deep_pw: "csmall-user-50.1"
 
     target_deep_root_group: "cn=csmall-root-deep-1,ou=groups,{{ suffix }}"
     target_check_group: "cn=csmall-group-10,ou=groups,{{ suffix }}"
 
-    refint_test_user_dn: "uid=csmall-user-15,ou=People,{{ suffix }}"
+    refint_test_user_dn: "uid=csmall-user-15,ou=people,{{ suffix }}"
     refint_test_user_pw: "csmall-user-15.1"
     refint_test_groups:
       - "cn=csmall-group-1,ou=groups,{{ suffix }}"
@@ -79,7 +93,7 @@
     - name: "[METRICA 3] Verifica puntuale utente-gruppo (garantita dal generatore)"
       ansible.builtin.command: >
         ldapsearch -x -H ldapi:/// -D "{{ test_user_standard }}" -w "{{ test_user_standard_pw }}"
-        -b "ou=People,{{ suffix }}" -s sub "(&(uid=csmall-user-10)(memberOf={{ target_check_group }}))" dn
+        -b "ou=people,{{ suffix }}" -s sub "(&(uid=csmall-user-10)(memberOf={{ target_check_group }}))" dn
       register: query_3_result
       changed_when: false
       no_log: true
@@ -94,7 +108,7 @@
     - name: "[METRICA 4] Query inversa nested expansion sotto il gruppo radice (architect garantito)"
       ansible.builtin.command: >
         ldapsearch -x -H ldapi:/// -D "{{ test_user_architect }}" -w "{{ test_user_architect_pw }}"
-        -b "ou=People,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberof={{ target_deep_root_group }}))" dn
+        -b "ou=people,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberof={{ target_deep_root_group }}))" dn
       register: query_4_result
       changed_when: false
       no_log: true
@@ -202,6 +216,7 @@
           sn: ScaleUser15
           userPassword: {{ refint_test_user_pw }}
       changed_when: true
+      no_log: true
       run_once: true
       delegate_to: "{{ groups['cluster'] | sort | first }}"
 

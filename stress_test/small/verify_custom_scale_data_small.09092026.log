@@ -1,0 +1,347 @@
+
+PLAY [Validazione Dataset RIDOTTO (MemberOf + Nested Group + Refint)] **********
+
+TASK [Gathering Facts] *********************************************************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SETUP] Verifica presenza del comando 'time'] ****************************
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+ok: [ubuntu24lts1.example.com]
+
+TASK [[SETUP] Installa il pacchetto 'time' se assente] *************************
+skipping: [ubuntu24lts1.example.com]
+skipping: [ubuntu24lts2.example.com]
+skipping: [ubuntu24lts4.example.com]
+skipping: [ubuntu24lts3.example.com]
+
+TASK [[METRICA 1] Lettura memberOf persistente su utente standard] *************
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+ok: [ubuntu24lts1.example.com]
+
+TASK [[METRICA 2] Lettura memberOf persistente su Cloud Architect] *************
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 3] Verifica puntuale utente-gruppo (garantita dal generatore)] ***
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts1.example.com]
+
+TASK [[VERIFICA 3] La coppia utente/gruppo garantita deve risultare presente] ***
+ok: [ubuntu24lts1.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+ok: [ubuntu24lts2.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+ok: [ubuntu24lts3.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+ok: [ubuntu24lts4.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+
+TASK [[METRICA 4] Query inversa nested expansion sotto il gruppo radice (architect garantito)] ***
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[VERIFICA 4] L'architect garantito deve comparire nell'espansione nidificata] ***
+ok: [ubuntu24lts1.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+ok: [ubuntu24lts2.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+ok: [ubuntu24lts3.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+ok: [ubuntu24lts4.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+
+TASK [[METRICA 5] memberOf su utente in fondo alla catena di deep nesting] *****
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 6] Membri strutturali diretti del gruppo radice] ****************
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[REFINT] Verifica che l'utente di test sia presente nei 3 gruppi noti PRIMA della cancellazione] ***
+ok: [ubuntu24lts1.example.com] => (item=cn=csmall-group-1,ou=groups,dc=example,dc=com)
+ok: [ubuntu24lts1.example.com] => (item=cn=csmall-group-2,ou=groups,dc=example,dc=com)
+ok: [ubuntu24lts1.example.com] => (item=cn=csmall-group-3,ou=groups,dc=example,dc=com)
+
+TASK [[REFINT] Assert - il riferimento deve esistere PRIMA della cancellazione] ***
+ok: [ubuntu24lts1.example.com] => (item=cn=csmall-group-1,ou=groups,dc=example,dc=com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": [
+            "ldapsearch",
+            "-Y",
+            "EXTERNAL",
+            "-H",
+            "ldapi:///",
+            "-b",
+            "cn=csmall-group-1,ou=groups,dc=example,dc=com",
+            "-s",
+            "base",
+            "member"
+        ],
+        "delta": "0:00:00.019057",
+        "end": "2026-09-09 11:27:52.260966",
+        "failed": false,
+        "item": "cn=csmall-group-1,ou=groups,dc=example,dc=com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-09 11:27:52.241909",
+        "stderr": "SASL/EXTERNAL authentication started\nSASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth\nSASL SSF: 0",
+        "stderr_lines": [
+            "SASL/EXTERNAL authentication started",
+            "SASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth",
+            "SASL SSF: 0"
+        ],
+        "stdout": "# extended LDIF\n#\n# LDAPv3\n# base <cn=csmall-group-1,ou=groups,dc=example,dc=com> with scope baseObject\n# filter: (objectclass=*)\n# requesting: member \n#\n\n# csmall-group-1, groups, example.com\ndn: cn=csmall-group-1,ou=groups,dc=example,dc=com\nmember: uid=csmall-user-15,ou=People,dc=example,dc=com\nmember: uid=csmall-user-18,ou=People,dc=example,dc=com\nmember: uid=csmall-user-26,ou=People,dc=example,dc=com\nmember: uid=csmall-user-33,ou=People,dc=example,dc=com\nmember: uid=csmall-user-40,ou=People,dc=example,dc=com\nmember: uid=csmall-user-42,ou=People,dc=example,dc=com\nmember: uid=csmall-user-70,ou=People,dc=example,dc=com\nmember: uid=csmall-user-77,ou=People,dc=example,dc=com\nmember: uid=csmall-user-81,ou=People,dc=example,dc=com\nmember: uid=csmall-user-100,ou=People,dc=example,dc=com\n\n# search result\nsearch: 2\nresult: 0 Success\n\n# numResponses: 2\n# numEntries: 1",
+        "stdout_lines": [
+            "# extended LDIF",
+            "#",
+            "# LDAPv3",
+            "# base <cn=csmall-group-1,ou=groups,dc=example,dc=com> with scope baseObject",
+            "# filter: (objectclass=*)",
+            "# requesting: member ",
+            "#",
+            "",
+            "# csmall-group-1, groups, example.com",
+            "dn: cn=csmall-group-1,ou=groups,dc=example,dc=com",
+            "member: uid=csmall-user-15,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-18,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-26,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-33,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-40,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-42,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-70,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-77,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-81,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-100,ou=People,dc=example,dc=com",
+            "",
+            "# search result",
+            "search: 2",
+            "result: 0 Success",
+            "",
+            "# numResponses: 2",
+            "# numEntries: 1"
+        ]
+    },
+    "msg": "All assertions passed"
+}
+ok: [ubuntu24lts1.example.com] => (item=cn=csmall-group-2,ou=groups,dc=example,dc=com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": [
+            "ldapsearch",
+            "-Y",
+            "EXTERNAL",
+            "-H",
+            "ldapi:///",
+            "-b",
+            "cn=csmall-group-2,ou=groups,dc=example,dc=com",
+            "-s",
+            "base",
+            "member"
+        ],
+        "delta": "0:00:00.017821",
+        "end": "2026-09-09 11:27:52.851883",
+        "failed": false,
+        "item": "cn=csmall-group-2,ou=groups,dc=example,dc=com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-09 11:27:52.834062",
+        "stderr": "SASL/EXTERNAL authentication started\nSASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth\nSASL SSF: 0",
+        "stderr_lines": [
+            "SASL/EXTERNAL authentication started",
+            "SASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth",
+            "SASL SSF: 0"
+        ],
+        "stdout": "# extended LDIF\n#\n# LDAPv3\n# base <cn=csmall-group-2,ou=groups,dc=example,dc=com> with scope baseObject\n# filter: (objectclass=*)\n# requesting: member \n#\n\n# csmall-group-2, groups, example.com\ndn: cn=csmall-group-2,ou=groups,dc=example,dc=com\nmember: uid=csmall-user-2,ou=People,dc=example,dc=com\nmember: uid=csmall-user-15,ou=People,dc=example,dc=com\nmember: uid=csmall-user-22,ou=People,dc=example,dc=com\nmember: uid=csmall-user-45,ou=People,dc=example,dc=com\nmember: uid=csmall-user-50,ou=People,dc=example,dc=com\n\n# search result\nsearch: 2\nresult: 0 Success\n\n# numResponses: 2\n# numEntries: 1",
+        "stdout_lines": [
+            "# extended LDIF",
+            "#",
+            "# LDAPv3",
+            "# base <cn=csmall-group-2,ou=groups,dc=example,dc=com> with scope baseObject",
+            "# filter: (objectclass=*)",
+            "# requesting: member ",
+            "#",
+            "",
+            "# csmall-group-2, groups, example.com",
+            "dn: cn=csmall-group-2,ou=groups,dc=example,dc=com",
+            "member: uid=csmall-user-2,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-15,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-22,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-45,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-50,ou=People,dc=example,dc=com",
+            "",
+            "# search result",
+            "search: 2",
+            "result: 0 Success",
+            "",
+            "# numResponses: 2",
+            "# numEntries: 1"
+        ]
+    },
+    "msg": "All assertions passed"
+}
+ok: [ubuntu24lts1.example.com] => (item=cn=csmall-group-3,ou=groups,dc=example,dc=com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": [
+            "ldapsearch",
+            "-Y",
+            "EXTERNAL",
+            "-H",
+            "ldapi:///",
+            "-b",
+            "cn=csmall-group-3,ou=groups,dc=example,dc=com",
+            "-s",
+            "base",
+            "member"
+        ],
+        "delta": "0:00:00.018063",
+        "end": "2026-09-09 11:27:53.448159",
+        "failed": false,
+        "item": "cn=csmall-group-3,ou=groups,dc=example,dc=com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-09 11:27:53.430096",
+        "stderr": "SASL/EXTERNAL authentication started\nSASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth\nSASL SSF: 0",
+        "stderr_lines": [
+            "SASL/EXTERNAL authentication started",
+            "SASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth",
+            "SASL SSF: 0"
+        ],
+        "stdout": "# extended LDIF\n#\n# LDAPv3\n# base <cn=csmall-group-3,ou=groups,dc=example,dc=com> with scope baseObject\n# filter: (objectclass=*)\n# requesting: member \n#\n\n# csmall-group-3, groups, example.com\ndn: cn=csmall-group-3,ou=groups,dc=example,dc=com\nmember: uid=csmall-user-14,ou=People,dc=example,dc=com\nmember: uid=csmall-user-15,ou=People,dc=example,dc=com\nmember: uid=csmall-user-30,ou=People,dc=example,dc=com\nmember: uid=csmall-user-31,ou=People,dc=example,dc=com\nmember: uid=csmall-user-34,ou=People,dc=example,dc=com\nmember: uid=csmall-user-62,ou=People,dc=example,dc=com\nmember: uid=csmall-user-88,ou=People,dc=example,dc=com\nmember: uid=csmall-user-89,ou=People,dc=example,dc=com\n\n# search result\nsearch: 2\nresult: 0 Success\n\n# numResponses: 2\n# numEntries: 1",
+        "stdout_lines": [
+            "# extended LDIF",
+            "#",
+            "# LDAPv3",
+            "# base <cn=csmall-group-3,ou=groups,dc=example,dc=com> with scope baseObject",
+            "# filter: (objectclass=*)",
+            "# requesting: member ",
+            "#",
+            "",
+            "# csmall-group-3, groups, example.com",
+            "dn: cn=csmall-group-3,ou=groups,dc=example,dc=com",
+            "member: uid=csmall-user-14,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-15,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-30,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-31,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-34,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-62,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-88,ou=People,dc=example,dc=com",
+            "member: uid=csmall-user-89,ou=People,dc=example,dc=com",
+            "",
+            "# search result",
+            "search: 2",
+            "result: 0 Success",
+            "",
+            "# numResponses: 2",
+            "# numEntries: 1"
+        ]
+    },
+    "msg": "All assertions passed"
+}
+
+TASK [[REFINT] Cancella l'utente di test (cronometrato)] ***********************
+changed: [ubuntu24lts1.example.com]
+
+TASK [[REFINT REPORT] Tempo di cancellazione (costo refint su 3 gruppi)] *******
+ok: [ubuntu24lts1.example.com] => {
+    "msg": [
+        "real\t0m0.034s",
+        "user\t0m0.003s",
+        "sys\t0m0.010s"
+    ]
+}
+
+TASK [[REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi] ***
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (11 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (10 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (9 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (8 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (7 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (6 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (5 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (4 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (3 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (2 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (1 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (0 retries left).
+failed: [ubuntu24lts1.example.com] (item=cn=csmall-group-1,ou=groups,dc=example,dc=com) => {"ansible_loop_var": "item", "attempts": 12, "changed": false, "changed_when_result": false, "cmd": ["ldapsearch", "-Y", "EXTERNAL", "-H", "ldapi:///", "-b", "cn=csmall-group-1,ou=groups,dc=example,dc=com", "-s", "base", "member"], "delta": "0:00:00.019496", "end": "2026-09-09 11:28:37.847716", "item": "cn=csmall-group-1,ou=groups,dc=example,dc=com", "msg": "", "rc": 0, "start": "2026-09-09 11:28:37.828220", "stderr": "SASL/EXTERNAL authentication started\nSASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth\nSASL SSF: 0", "stderr_lines": ["SASL/EXTERNAL authentication started", "SASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth", "SASL SSF: 0"], "stdout": "# extended LDIF\n#\n# LDAPv3\n# base <cn=csmall-group-1,ou=groups,dc=example,dc=com> with scope baseObject\n# filter: (objectclass=*)\n# requesting: member \n#\n\n# csmall-group-1, groups, example.com\ndn: cn=csmall-group-1,ou=groups,dc=example,dc=com\nmember: uid=csmall-user-15,ou=People,dc=example,dc=com\nmember: uid=csmall-user-18,ou=People,dc=example,dc=com\nmember: uid=csmall-user-26,ou=People,dc=example,dc=com\nmember: uid=csmall-user-33,ou=People,dc=example,dc=com\nmember: uid=csmall-user-40,ou=People,dc=example,dc=com\nmember: uid=csmall-user-42,ou=People,dc=example,dc=com\nmember: uid=csmall-user-70,ou=People,dc=example,dc=com\nmember: uid=csmall-user-77,ou=People,dc=example,dc=com\nmember: uid=csmall-user-81,ou=People,dc=example,dc=com\nmember: uid=csmall-user-100,ou=People,dc=example,dc=com\n\n# search result\nsearch: 2\nresult: 0 Success\n\n# numResponses: 2\n# numEntries: 1", "stdout_lines": ["# extended LDIF", "#", "# LDAPv3", "# base <cn=csmall-group-1,ou=groups,dc=example,dc=com> with scope baseObject", "# filter: (objectclass=*)", "# requesting: member ", "#", "", "# csmall-group-1, groups, example.com", "dn: cn=csmall-group-1,ou=groups,dc=example,dc=com", "member: uid=csmall-user-15,ou=People,dc=example,dc=com", "member: uid=csmall-user-18,ou=People,dc=example,dc=com", "member: uid=csmall-user-26,ou=People,dc=example,dc=com", "member: uid=csmall-user-33,ou=People,dc=example,dc=com", "member: uid=csmall-user-40,ou=People,dc=example,dc=com", "member: uid=csmall-user-42,ou=People,dc=example,dc=com", "member: uid=csmall-user-70,ou=People,dc=example,dc=com", "member: uid=csmall-user-77,ou=People,dc=example,dc=com", "member: uid=csmall-user-81,ou=People,dc=example,dc=com", "member: uid=csmall-user-100,ou=People,dc=example,dc=com", "", "# search result", "search: 2", "result: 0 Success", "", "# numResponses: 2", "# numEntries: 1"]}
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (11 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (10 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (9 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (8 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (7 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (6 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (5 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (4 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (3 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (2 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (1 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (0 retries left).
+failed: [ubuntu24lts1.example.com] (item=cn=csmall-group-2,ou=groups,dc=example,dc=com) => {"ansible_loop_var": "item", "attempts": 12, "changed": false, "changed_when_result": false, "cmd": ["ldapsearch", "-Y", "EXTERNAL", "-H", "ldapi:///", "-b", "cn=csmall-group-2,ou=groups,dc=example,dc=com", "-s", "base", "member"], "delta": "0:00:00.029932", "end": "2026-09-09 11:29:21.806835", "item": "cn=csmall-group-2,ou=groups,dc=example,dc=com", "msg": "", "rc": 0, "start": "2026-09-09 11:29:21.776903", "stderr": "SASL/EXTERNAL authentication started\nSASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth\nSASL SSF: 0", "stderr_lines": ["SASL/EXTERNAL authentication started", "SASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth", "SASL SSF: 0"], "stdout": "# extended LDIF\n#\n# LDAPv3\n# base <cn=csmall-group-2,ou=groups,dc=example,dc=com> with scope baseObject\n# filter: (objectclass=*)\n# requesting: member \n#\n\n# csmall-group-2, groups, example.com\ndn: cn=csmall-group-2,ou=groups,dc=example,dc=com\nmember: uid=csmall-user-2,ou=People,dc=example,dc=com\nmember: uid=csmall-user-15,ou=People,dc=example,dc=com\nmember: uid=csmall-user-22,ou=People,dc=example,dc=com\nmember: uid=csmall-user-45,ou=People,dc=example,dc=com\nmember: uid=csmall-user-50,ou=People,dc=example,dc=com\n\n# search result\nsearch: 2\nresult: 0 Success\n\n# numResponses: 2\n# numEntries: 1", "stdout_lines": ["# extended LDIF", "#", "# LDAPv3", "# base <cn=csmall-group-2,ou=groups,dc=example,dc=com> with scope baseObject", "# filter: (objectclass=*)", "# requesting: member ", "#", "", "# csmall-group-2, groups, example.com", "dn: cn=csmall-group-2,ou=groups,dc=example,dc=com", "member: uid=csmall-user-2,ou=People,dc=example,dc=com", "member: uid=csmall-user-15,ou=People,dc=example,dc=com", "member: uid=csmall-user-22,ou=People,dc=example,dc=com", "member: uid=csmall-user-45,ou=People,dc=example,dc=com", "member: uid=csmall-user-50,ou=People,dc=example,dc=com", "", "# search result", "search: 2", "result: 0 Success", "", "# numResponses: 2", "# numEntries: 1"]}
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (11 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (10 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (9 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (8 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (7 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (6 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (5 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (4 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (3 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (2 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (1 retries left).
+FAILED - RETRYING: [ubuntu24lts1.example.com]: [REFINT] Attendi (con retry) che il riferimento pendente sparisca dai 3 gruppi (0 retries left).
+failed: [ubuntu24lts1.example.com] (item=cn=csmall-group-3,ou=groups,dc=example,dc=com) => {"ansible_loop_var": "item", "attempts": 12, "changed": false, "changed_when_result": false, "cmd": ["ldapsearch", "-Y", "EXTERNAL", "-H", "ldapi:///", "-b", "cn=csmall-group-3,ou=groups,dc=example,dc=com", "-s", "base", "member"], "delta": "0:00:00.017778", "end": "2026-09-09 11:30:05.022701", "item": "cn=csmall-group-3,ou=groups,dc=example,dc=com", "msg": "", "rc": 0, "start": "2026-09-09 11:30:05.004923", "stderr": "SASL/EXTERNAL authentication started\nSASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth\nSASL SSF: 0", "stderr_lines": ["SASL/EXTERNAL authentication started", "SASL username: gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth", "SASL SSF: 0"], "stdout": "# extended LDIF\n#\n# LDAPv3\n# base <cn=csmall-group-3,ou=groups,dc=example,dc=com> with scope baseObject\n# filter: (objectclass=*)\n# requesting: member \n#\n\n# csmall-group-3, groups, example.com\ndn: cn=csmall-group-3,ou=groups,dc=example,dc=com\nmember: uid=csmall-user-14,ou=People,dc=example,dc=com\nmember: uid=csmall-user-15,ou=People,dc=example,dc=com\nmember: uid=csmall-user-30,ou=People,dc=example,dc=com\nmember: uid=csmall-user-31,ou=People,dc=example,dc=com\nmember: uid=csmall-user-34,ou=People,dc=example,dc=com\nmember: uid=csmall-user-62,ou=People,dc=example,dc=com\nmember: uid=csmall-user-88,ou=People,dc=example,dc=com\nmember: uid=csmall-user-89,ou=People,dc=example,dc=com\n\n# search result\nsearch: 2\nresult: 0 Success\n\n# numResponses: 2\n# numEntries: 1", "stdout_lines": ["# extended LDIF", "#", "# LDAPv3", "# base <cn=csmall-group-3,ou=groups,dc=example,dc=com> with scope baseObject", "# filter: (objectclass=*)", "# requesting: member ", "#", "", "# csmall-group-3, groups, example.com", "dn: cn=csmall-group-3,ou=groups,dc=example,dc=com", "member: uid=csmall-user-14,ou=People,dc=example,dc=com", "member: uid=csmall-user-15,ou=People,dc=example,dc=com", "member: uid=csmall-user-30,ou=People,dc=example,dc=com", "member: uid=csmall-user-31,ou=People,dc=example,dc=com", "member: uid=csmall-user-34,ou=People,dc=example,dc=com", "member: uid=csmall-user-62,ou=People,dc=example,dc=com", "member: uid=csmall-user-88,ou=People,dc=example,dc=com", "member: uid=csmall-user-89,ou=People,dc=example,dc=com", "", "# search result", "search: 2", "result: 0 Success", "", "# numResponses: 2", "# numEntries: 1"]}
+
+PLAY RECAP *********************************************************************
+ubuntu24lts1.example.com   : ok=14   changed=1    unreachable=0    failed=1    skipped=1    rescued=0    ignored=0   
+ubuntu24lts2.example.com   : ok=10   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts3.example.com   : ok=10   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts4.example.com   : ok=10   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+

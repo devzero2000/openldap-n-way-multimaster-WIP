@@ -1,5 +1,8 @@
 # ==============================================================================
 # TITOLO:       Generazione Dataset RIDOTTO (MemberOf / Nested Group / Refint)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.1 (review)
 # SCOPO:        Versione in scala ridotta, con namespace DISTINTO (csmall-*)
 #               dal dataset custom-scale a piena scala, per poter convivere
 #               per iterazioni rapide (con e senza simulazione WAN) invece
@@ -12,6 +15,36 @@
 # casuali normali), perche' con assegnazione puramente casuale non c'e'
 # garanzia che una coppia utente/gruppo specifica esista - i play di verifica
 # hanno bisogno di relazioni note per testare in modo deterministico.
+#
+# NOVITÀ v1.1 rispetto a v1.0 (review dopo un bug reale osservato in sessione:
+# un utente, csmall-user-15, risultava assente al momento del test refint pur
+# essendo referenziato come member: nei gruppi 1/2/3 - causa isolata a un
+# import parzialmente fallito su un run precedente, mai corretto da un
+# secondo giro perche' tutto il resto dava "Already exists", tollerato per
+# design, mentre l'unica entry mancante non veniva mai ricreata):
+#   - cn: cn=csmall-group-{i} / cn: cn=csmall-root-deep-{i} -> valore senza
+#     il prefisso "cn=" duplicato (stesso bug gia' trovato e corretto nel
+#     generatore a piena scala - qui era rimasto, essendo un file separato).
+#   - ou=People -> ou=people ovunque: cosmetico (LDAP confronta "ou="senza
+#     distinguere maiuscole/minuscole, quindi non causava un bug funzionale),
+#     ma incoerente con ou=people (minuscolo) creato dal deploy - uniformato.
+#   - Aggiunto un RESET CHIRURGICO prima dell'import: cerca e rimuove SOLO
+#     entry csmall-* eventualmente residue da un run precedente incompleto,
+#     mai l'intero ou=People/ou=groups (che su questo cluster ospita ANCHE
+#     il dataset a piena scala custom-scale-* - un reset "a tappeto" lo
+#     cancellerebbe). Garantisce che ogni run riparta da uno stato pulito,
+#     invece di accumulare stato parziale tra un giro e l'altro.
+#   - Aggiunta una VERIFICA DEFINITIVA post-import: conta le entry
+#     REALMENTE presenti (utenti e gruppi) e le confronta con quanto atteso
+#     - indipendente da come ldapmodify riporta gli errori nel proprio
+#     stderr, quindi non aggirabile da un formato di messaggio non
+#     previsto. E' il controllo che avrebbe intercettato subito il problema
+#     osservato in sessione, invece di scoprirlo solo piu' tardi durante un
+#     run di verifica successivo e scollegato.
+#   - Aggiunto no_log:true sul task di import: "-w {{ ldap_pw }}" (password
+#     admin) sulla riga di comando compariva anche nei log di Ansible
+#     stesso (oltre che, inevitabilmente con questo stile di comando, in
+#     "ps aux" sul nodo remoto mentre gira).
 # ==============================================================================
 ---
 - name: "Generazione Dataset RIDOTTO (MemberOf / Nested Group / Refint)"
@@ -102,12 +135,12 @@
                   group_members[g].append(user_dn)
 
           with open("{{ ldif_path }}", "w") as f:
-              f.write(f"dn: ou=People,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: People\n\n")
+              f.write(f"dn: ou=people,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: people\n\n")
               f.write(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n\n")
 
               for i in range(1, total_users + 1):
                   username = f"csmall-user-{i}"
-                  dn = f"uid={username},ou=People,{suffix}"
+                  dn = f"uid={username},ou=people,{suffix}"
                   ssha_password = make_ssha_password(f"{username}.1")
                   f.write(f"dn: {dn}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Custom User {i}\nsn: ScaleUser{i}\nuserPassword: {ssha_password}\n\n")
 
@@ -135,7 +168,7 @@
                           if dn not in group_members[g]:
                               group_members[g].append(dn)
 
-              target_user_dn = f"uid=csmall-user-{deep_nesting_target_user_index},ou=People,{suffix}"
+              target_user_dn = f"uid=csmall-user-{deep_nesting_target_user_index},ou=people,{suffix}"
               for d in range(deep_nesting_levels, 0, -1):
                   group_name = f"cn=csmall-deep-tier-{d},ou=groups,{suffix}"
                   f.write(f"dn: {group_name}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: csmall-deep-tier-{d}\ndescription: Livello profondo {d}\n")
@@ -146,7 +179,7 @@
                   f.write("\n")
 
               for i in range(1, total_groups + 1):
-                  f.write(f"dn: cn=csmall-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=csmall-group-{i}\ndescription: Gruppo custom {i}\n")
+                  f.write(f"dn: cn=csmall-group-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: csmall-group-{i}\ndescription: Gruppo custom {i}\n")
                   members = group_members[i]
                   if not members:
                       members = [f"cn=admin,{suffix}"]
@@ -157,10 +190,10 @@
               # Gruppi Radice: l'anchor_group=1 (il primo) include ESPLICITAMENTE
               # l'architect di test, cosi' METRICA 4 (espansione annidata) ha
               # sempre una relazione nota da verificare
-              architect_dn = f"uid=csmall-user-{test_user_architect_index},ou=People,{suffix}"
+              architect_dn = f"uid=csmall-user-{test_user_architect_index},ou=people,{suffix}"
               for i in range(1, deep_nesting_root_groups + 1):
                   anchor_group = i * deep_nesting_anchor_step
-                  f.write(f"dn: cn=csmall-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: cn=csmall-root-deep-{i}\ndescription: Radice profonda {i}\n")
+                  f.write(f"dn: cn=csmall-root-deep-{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: csmall-root-deep-{i}\ndescription: Radice profonda {i}\n")
                   f.write(f"member: cn=csmall-deep-tier-1,ou=groups,{suffix}\n")
                   f.write(f"member: cn=csmall-group-{anchor_group},ou=groups,{suffix}\n")
                   if i == 1:
@@ -171,6 +204,54 @@
       ansible.builtin.command: python3 /tmp/generate_custom_scale_ldif_small.py
       changed_when: true
 
+    # ==========================================================================
+    # RESET CHIRURGICO PRE-IMPORT: rimuove SOLO entry csmall-* residue da un
+    # run precedente parziale (mai l'intero ou=people/ou=groups: su questo
+    # stesso cluster convive anche il dataset a piena scala custom-scale-*,
+    # che vive negli stessi container - un reset "a tappeto" lo cancellerebbe).
+    #
+    # PERCHE': senza questo reset, un secondo giro dopo un import parzialmente
+    # fallito (una singola entry saltata, il resto andato a buon fine) non la
+    # correggerebbe mai - ldapmodify -a su un'entry gia' esistente fallisce
+    # con "Already exists", tollerato di proposito dal failed_when sotto (per
+    # permettere run idempotenti) - ma quell'entry MANCANTE, non essendo mai
+    # "gia' esistente", da un secondo giro senza reset non verrebbe mai
+    # ricreata. Scenario osservato realmente in questa sessione di lavoro:
+    # un solo utente (csmall-user-15) mancante dopo un run, sopravvissuto
+    # inosservato a un secondo giro perche' tutto il resto dava "Already
+    # exists" e il controllo di allora si fermava li'.
+    # ==========================================================================
+
+    - name: "[RESET] Cerca eventuali utenti csmall-* residui da un run precedente"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "ou=people,{{ suffix }}" -s one "(uid=csmall-*)" dn
+      register: residual_users_check
+      changed_when: false
+
+    - name: "[RESET] Cerca eventuali gruppi csmall-* residui da un run precedente"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "ou=groups,{{ suffix }}" -s one "(cn=csmall-*)" dn
+      register: residual_groups_check
+      changed_when: false
+
+    - name: "[RESET] Deriva la lista combinata dei DN residui da rimuovere"
+      ansible.builtin.set_fact:
+        residual_dns: >-
+          {{ (residual_users_check.stdout_lines + residual_groups_check.stdout_lines)
+             | select('match', '^dn: ')
+             | map('regex_replace', '^dn: ', '')
+             | list }}
+
+    - name: "[RESET] Mostra quante entry residue verranno rimosse (0 = run pulito, nessun residuo da un giro precedente)"
+      ansible.builtin.debug:
+        msg: "Entry csmall-* residue trovate: {{ residual_dns | length }}"
+
+    - name: "[RESET] Rimuove le entry csmall-* residue, se presenti (garantisce un import da zero)"
+      ansible.builtin.command: >
+        ldapdelete -Y EXTERNAL -H ldapi:/// {{ residual_dns | map('quote') | join(' ') }}
+      when: residual_dns | length > 0
+      changed_when: residual_dns | length > 0
+
     - name: "[IMPORT] Inietta il dataset ridotto nel cluster (cronometrato: costo memberof in scrittura)"
       ansible.builtin.shell: >
         time timeout 300 ldapmodify -a -c -H ldapi:/// -x -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ ldif_path }}"
@@ -178,6 +259,20 @@
         executable: /bin/bash
       register: ldapadd_res
       changed_when: true
+      no_log: true
+      # no_log:true - "-w {{ ldap_pw }}" e' la password admin sulla riga di
+      # comando: senza no_log, oltre a comparire in "ps aux" sul nodo remoto
+      # (inevitabile con questo stile di comando), comparirebbe ANCHE nei
+      # log di Ansible stesso (verbose/debug), che no_log invece sopprime.
+      #
+      # Questo failed_when resta un primo filtro grezzo (tollera "Already
+      # exists" per permettere run idempotenti), MA NON E' PIU' L'UNICA
+      # DIFESA: la vera garanzia contro un import parziale/silenzioso e' la
+      # verifica esplicita del conteggio subito sotto, che confronta il
+      # numero di entry REALMENTE presenti con quanto atteso - non si
+      # affida a riconoscere ogni possibile formato di messaggio d'errore
+      # di ldapmodify (fragile: un errore che non inizia esattamente con
+      # "ldap_add:" passerebbe comunque inosservato qui).
       failed_when: >
         ldapadd_res.rc != 0 and
         (ldapadd_res.stderr_lines
@@ -189,6 +284,44 @@
     - name: "[REPORT] Tempo di import"
       ansible.builtin.debug:
         msg: "{{ ldapadd_res.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+
+    # ==========================================================================
+    # VERIFICA DEFINITIVA POST-IMPORT: conta le entry REALMENTE presenti e le
+    # confronta con quanto atteso - indipendente da come ldapmodify riporta
+    # gli errori, quindi non aggirabile da un formato di messaggio non
+    # previsto. E' questo il controllo che avrebbe intercettato subito il
+    # problema osservato in sessione (un utente mancante), invece di
+    # scoprirlo solo piu' tardi durante un run di verifica successivo.
+    # ==========================================================================
+
+    - name: "[VERIFICA IMPORT] Conta gli utenti csmall-* effettivamente presenti"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=people,{{ suffix }}" -s one "(uid=csmall-*)" dn
+      register: created_users_check
+      changed_when: false
+
+    - name: "[VERIFICA IMPORT] Conta i gruppi csmall-* effettivamente presenti (tutte le categorie)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "ou=groups,{{ suffix }}" -s one "(cn=csmall-*)" dn
+      register: created_groups_check
+      changed_when: false
+
+    - name: "[VERIFICA IMPORT] Blocca se il numero di entry create non corrisponde a quanto atteso"
+      ansible.builtin.assert:
+        that:
+          - "(created_users_check.stdout | regex_findall('^dn: ', multiline=True) | length | int) == total_users"
+          - "(created_groups_check.stdout | regex_findall('^dn: ', multiline=True) | length | int) == (total_groups + deep_nesting_levels + deep_nesting_root_groups)"
+        fail_msg: >-
+          ERRORE: import incompleto - attesi {{ total_users }} utenti e
+          {{ total_groups + deep_nesting_levels + deep_nesting_root_groups }} gruppi (generici +
+          deep-tier + root-deep), trovati
+          {{ created_users_check.stdout | regex_findall('^dn: ', multiline=True) | length }} utenti e
+          {{ created_groups_check.stdout | regex_findall('^dn: ', multiline=True) | length }} gruppi.
+          Controlla ldapadd_res (registrato ma no_log - rilancia con -vvv se serve il dettaglio)
+          per capire quale entry e' mancante.
+        success_msg: >-
+          OK: import completo e verificato - {{ total_users }} utenti e
+          {{ total_groups + deep_nesting_levels + deep_nesting_root_groups }} gruppi creati correttamente.
 
     - name: "[CLEANUP] Rimuovi script e LDIF temporanei"
       ansible.builtin.file:

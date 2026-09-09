@@ -1,0 +1,31 @@
+
+PLAY [Generazione Dataset RIDOTTO (MemberOf / Nested Group / Refint)] **********
+
+TASK [Gathering Facts] *********************************************************
+ok: [ubuntu24lts1.example.com]
+
+TASK [[TEMPLATING] Genera lo script Python per il dataset ridotto] *************
+changed: [ubuntu24lts1.example.com]
+
+TASK [[EXECUTE] Esegui script di generazione LDIF] *****************************
+changed: [ubuntu24lts1.example.com]
+
+TASK [[IMPORT] Inietta il dataset ridotto nel cluster (cronometrato: costo memberof in scrittura)] ***
+changed: [ubuntu24lts1.example.com]
+
+TASK [[REPORT] Tempo di import] ************************************************
+ok: [ubuntu24lts1.example.com] => {
+    "msg": [
+        "real\t0m15.759s",
+        "user\t0m0.019s",
+        "sys\t0m0.035s"
+    ]
+}
+
+TASK [[CLEANUP] Rimuovi script e LDIF temporanei] ******************************
+changed: [ubuntu24lts1.example.com] => (item=/tmp/generate_custom_scale_ldif_small.py)
+changed: [ubuntu24lts1.example.com] => (item=/tmp/custom_scale_data_small.ldif)
+
+PLAY RECAP *********************************************************************
+ubuntu24lts1.example.com   : ok=6    changed=4    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+
