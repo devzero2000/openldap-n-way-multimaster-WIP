@@ -1,0 +1,252 @@
+# ==============================================================================
+# TITOLO:       Test Isolato - Misura il Tempo di Replica Sotto Carico Realistico
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     2.0 (riprogettato: non piu' dati sintetici usa-e-getta, ma un
+#               LDIF esterno rappresentativo del carico reale di produzione)
+# SCOPO:        Carica un LDIF (payload, senza struttura di base) via slapadd
+#               su UN SOLO master, riavvia, e misura con PRECISIONE quanto ci
+#               mettono gli ALTRI nodi (master + read-only) a raggiungere lo
+#               stesso stato via syncrepl normale - non un pass/fail, un
+#               tempo reale in secondi per nodo.
+#
+# NOVITÀ v2.0 rispetto a v1.0: la versione precedente generava al volo 5
+# entry sintetiche - utile per validare il MECCANISMO di replica dopo
+# slapadd, ma inutile per stimare tempi realistici. Ora accetta un LDIF
+# esterno: il consiglio e' costruirlo con LO STESSO script di generazione
+# usato per il dataset di produzione (create_custom_scale_data_nested_group_
+# memberof.yml), con le variabili ridotte MA MANTENENDO invariata
+# deep_nesting_levels (il costo della risoluzione dei gruppi annidati
+# dipende dalla PROFONDITA', non dal volume) - poi uno slapcat -b "..." per
+# esportare solo il payload (senza le entry di struttura di base, che
+# altrimenti confliggerebbero con quelle gia' create dal deploy sul master
+# bersaglio).
+#
+# QUESTO PLAYBOOK NON E' LO STRUMENTO DI RIPRISTINO - per quello usa
+# restore_master_from_backup.yml (slapadd su tutti i nodi, nessuna attesa
+# di convergenza). Questo serve solo a MISURARE, periodicamente, quanto
+# tempo impiega una replica a inseguire un master sotto un carico onesto -
+# un indicatore di salute/capacita' del cluster, non un'operazione di
+# ripristino.
+#
+# A FINE TEST, IL DATASET CARICATO VIENE RIMOSSO (cleanup automatico,
+# garantito anche su fallimento): e' pensato per essere rilanciato piu'
+# volte come controllo periodico, non per lasciare dati residui.
+#
+# USO:
+#   ansible-playbook test_slapadd_replication.yml \
+#     -e source_ldif=/percorso/locale/al/tuo/payload_rappresentativo.ldif
+# ==============================================================================
+
+---
+- name: Test Isolato - Misura il Tempo di Replica Sotto Carico Realistico
+  hosts: cluster
+  become: true
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: auto_silent
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    target_node: "{{ cluster_nodes[0] }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    other_nodes: "{{ (cluster_nodes[1:]) + readonly_nodes }}"
+
+    source_ldif: ""
+    max_wait_seconds: 900
+
+  tasks:
+    - name: "[SETUP] Assicura che python3-ldap sia installato (richiesto dai moduli community.general.ldap_*)"
+      ansible.builtin.apt:
+        name: python3-ldap
+        state: present
+      delegate_to: "{{ target_node }}"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 0: GUARDIE
+    # ==========================================================================
+
+    - name: "[GUARDIA] Verifica che source_ldif sia stato impostato e che il file esista localmente"
+      ansible.builtin.stat:
+        path: "{{ source_ldif }}"
+      register: source_ldif_stat
+      delegate_to: localhost
+      connection: local
+      run_once: true
+
+    - name: "[GUARDIA] Blocca se source_ldif e' vuoto, il file non esiste, o e' vuoto"
+      ansible.builtin.assert:
+        that:
+          - source_ldif != ""
+          - source_ldif_stat.stat.exists
+          - source_ldif_stat.stat.size > 0
+        fail_msg: >-
+          ERRORE: source_ldif non impostato, file non trovato, o vuoto ({{ source_ldif }}).
+          Usa: -e source_ldif=/percorso/al/tuo/payload_rappresentativo.ldif
+          (SOLO il payload - niente struttura di base, che confliggerebbe con
+          quella gia' creata dal deploy sul master bersaglio).
+        success_msg: "OK: file sorgente trovato ({{ source_ldif }})."
+      delegate_to: localhost
+      connection: local
+      run_once: true
+
+    - name: "[GUARDIA] Conta le entry nell'LDIF sorgente"
+      ansible.builtin.shell: "grep -c '^dn: ' {{ source_ldif }}"
+      register: source_entry_count_raw
+      delegate_to: localhost
+      connection: local
+      run_once: true
+      changed_when: false
+
+    - name: "[GUARDIA] Deriva il conteggio atteso"
+      ansible.builtin.set_fact:
+        expected_entry_count: "{{ source_entry_count_raw.stdout | int }}"
+
+    - name: "[GUARDIA] Estrae l'elenco COMPLETO dei DN dell'LDIF sorgente (serve al cleanup puntuale a fine test)"
+      ansible.builtin.shell: "grep '^dn: ' {{ source_ldif }} | sed 's/^dn: //'"
+      register: all_source_dns_raw
+      delegate_to: localhost
+      connection: local
+      run_once: true
+      changed_when: false
+
+    - name: "[GUARDIA] Deriva la lista dei DN caricati come fact riutilizzabile"
+      ansible.builtin.set_fact:
+        loaded_dns: "{{ all_source_dns_raw.stdout_lines }}"
+
+    - name: "[GUARDIA] Mostra il piano del test"
+      ansible.builtin.debug:
+        msg:
+          - "Nodo bersaglio (slapadd diretto): {{ target_node }}"
+          - "Nodi da misurare (replica): {{ other_nodes }}"
+          - "LDIF sorgente: {{ source_ldif }} ({{ expected_entry_count }} entry)"
+          - "Tetto massimo di attesa per nodo: {{ max_wait_seconds }}s"
+      run_once: true
+
+    # ==========================================================================
+    # FASE 1: CARICAMENTO SUL SOLO target_node
+    # ==========================================================================
+
+    - name: "[BLOCCO TEST] Corpo del test - cleanup garantito anche in caso di fallimento"
+      block:
+        - name: "[TEST] Ferma slapd su {{ target_node }}"
+          ansible.builtin.systemd:
+            name: slapd
+            state: stopped
+          delegate_to: "{{ target_node }}"
+          run_once: true
+
+        - name: "[TEST] Copia l'LDIF sorgente su {{ target_node }}"
+          ansible.builtin.copy:
+            src: "{{ source_ldif }}"
+            dest: /tmp/replication_timing_test.ldif
+            mode: "0600"
+          delegate_to: "{{ target_node }}"
+          run_once: true
+
+        - name: "[TEST] Carica l'LDIF via slapadd (offline) su {{ target_node }}"
+          ansible.builtin.command: >
+            slapadd -v -F /etc/ldap/slapd.d -b "{{ suffix }}" -l /tmp/replication_timing_test.ldif
+          register: slapadd_result
+          delegate_to: "{{ target_node }}"
+          run_once: true
+          changed_when: true
+
+        - name: "[TEST] Ripristina la proprieta' openldap:openldap sui file del database"
+          ansible.builtin.file:
+            path: /var/lib/ldap
+            owner: openldap
+            group: openldap
+            recurse: true
+          delegate_to: "{{ target_node }}"
+          run_once: true
+
+        - name: "[TEST] Riavvia slapd su {{ target_node }}"
+          ansible.builtin.systemd:
+            name: slapd
+            state: started
+          delegate_to: "{{ target_node }}"
+          run_once: true
+
+        # ======================================================================
+        # FASE 2: MISURAZIONE - loop di polling a livello shell per un tempo
+        # preciso, non una stima approssimata (tentativi * delay).
+        # ======================================================================
+
+        - name: "[MISURA] Attende la convergenza di ciascun nodo, misurando il tempo effettivo"
+          ansible.builtin.shell: |
+            set -e
+            start=$(date +%s)
+            while true; do
+              count=$(ldapsearch -x -D "{{ bind_dn }}" -w "{{ bind_pw }}" -H ldaps://127.0.0.1/ \
+                -b "{{ suffix }}" -s sub "(objectClass=*)" dn 2>/dev/null | grep -c '^dn: ' || true)
+              now=$(date +%s)
+              elapsed=$((now - start))
+              if [ "$count" -ge "{{ expected_entry_count }}" ]; then
+                echo "CONVERGED count=${count} elapsed=${elapsed}"
+                exit 0
+              fi
+              if [ "$elapsed" -ge "{{ max_wait_seconds }}" ]; then
+                echo "TIMEOUT count=${count} elapsed=${elapsed}"
+                exit 1
+              fi
+              sleep 5
+            done
+          register: convergence_check
+          delegate_to: "{{ item }}"
+          loop: "{{ other_nodes }}"
+          loop_control:
+            label: "{{ item }}"
+          run_once: true
+          failed_when: false
+          changed_when: false
+          no_log: true
+
+        - name: "[MISURA] Valida che ogni nodo sia convergente entro il tetto massimo di attesa"
+          ansible.builtin.assert:
+            that:
+              - "'CONVERGED' in item.stdout"
+            fail_msg: "ERRORE: {{ item.item }} NON e' convergente entro {{ max_wait_seconds }}s - dettaglio: {{ item.stdout }}"
+            success_msg: "OK: {{ item.item }} convergente - {{ item.stdout }}"
+          loop: "{{ convergence_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          run_once: true
+
+        - name: "[RIEPILOGO] Tempi di replica misurati (nodo <- quanto ci ha messo a raggiungere target_node)"
+          ansible.builtin.debug:
+            msg: "{{ item.item }}: {{ (item.stdout | regex_replace('^.*elapsed=', '')) | trim }}s"
+          loop: "{{ convergence_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          run_once: true
+
+      always:
+        # ======================================================================
+        # FASE 3: CLEANUP - rimuove ESATTAMENTE i DN caricati (elenco completo
+        # dall'LDIF sorgente, non un pattern indovinato): gira sempre, anche
+        # su fallimento, cosi' il test resta ripetibile senza lasciare
+        # residui. La cancellazione avviene LIVE (non con un altro slapadd),
+        # cosi' si propaga normalmente su tutta la mesh.
+        #
+        # NOTA: tutti i DN vengono passati in un'unica riga di comando - va
+        # bene per un dataset rappresentativo di dimensioni contenute (l'uso
+        # previsto di questo playbook), ma con decine di migliaia di DN
+        # molto lunghi si rischierebbe di avvicinarsi al limite di lunghezza
+        # della riga di comando del sistema operativo (ARG_MAX). Per un
+        # dataset di quella scala, questo playbook non e' comunque lo
+        # strumento giusto - vedi restore_master_from_backup.yml.
+        # ======================================================================
+
+        - name: "[CLEANUP] Rimuove tutti i DN caricati dal test (cancellazione live, si replica da sola)"
+          ansible.builtin.command: >
+            ldapdelete -x -D "{{ bind_dn }}" -w "{{ bind_pw }}" -H ldaps://127.0.0.1/
+            {{ loaded_dns | map('quote') | join(' ') }}
+          delegate_to: "{{ target_node }}"
+          run_once: true
+          failed_when: false
+          changed_when: false
+          no_log: true
