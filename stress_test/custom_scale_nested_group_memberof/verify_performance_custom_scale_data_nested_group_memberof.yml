@@ -1,5 +1,42 @@
 # ==============================================================================
 # TITOLO:       Test di Performance Dataset Custom (MemberOf + Nested Group)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.1 (review)
+# SCOPO:        Misura la latenza di lettura/ricerca su un cluster gia'
+#               popolato con il dataset custom-scale (memberOf + nested
+#               group), su tre profili di utente rappresentativi delle fasce
+#               previste dal generatore (nominale, Cloud Architect, tecnico
+#               in fondo alla catena di deep nesting), producendo un report
+#               leggibile per nodo.
+#
+# NOVITÀ v1.1 rispetto a v1.0 (review):
+#   - hosts: "ldap_all" -> [cluster, readonlyreplica]. "ldap_all" non
+#     corrisponde a nessun gruppo usato altrove in questo progetto (sempre
+#     cluster + readonlyreplica) - se non presente nell'inventory,
+#     Ansible non da' un errore bloccante: esegue semplicemente il play su
+#     ZERO host, silenziosamente, visibile solo guardando con attenzione
+#     il PLAY RECAP finale (0 host elaborati). Corretto per usare
+#     esplicitamente i due gruppi reali.
+#   - Aggiunto failed_when: false sulle Metriche 1-6 (le query con bind):
+#     senza, un singolo bind fallito per qualunque motivo interrompe
+#     l'intero play in quel punto, perdendo il report anche per le
+#     metriche gia' raccolte prima del fallimento. Con failed_when: false,
+#     il report finale si genera comunque, mostrando l'esito (incluso un
+#     eventuale errore di bind) per ciascuna query invece di un'interruzione
+#     secca - piu' utile per un test diagnostico che deve produrre un
+#     quadro d'insieme anche parziale.
+#   - CONFERMATO (verifica incrociata con il deploy reale, non per
+#     supposizione): la Metrica 4 (espansione nidificata via filtro
+#     memberOf=) e' valida - l'overlay nestgroup di OpenLDAP non fa nulla
+#     senza flag espliciti, ma il deploy di questo progetto li ha tutti
+#     attivi (member-values, member-filter, memberof-values,
+#     memberof-filter), quindi il filtro (memberOf=...) espande davvero
+#     l'appartenenza nidificata come il test si aspetta. Nessuna modifica
+#     necessaria su questo punto - la nota del deploy stesso ("Verificare
+#     con slaptest -u prima del deploy in produzione") resta un'incertezza
+#     residua legittima, e questo test e' proprio la verifica empirica di
+#     quel dubbio.
 #
 # Le identita' di test (indici 1, 100, 5000) assumono il modello a fasce del
 # play di creazione: utente 1 e' un Cloud Architect (fino a ~300 gruppi),
@@ -8,7 +45,9 @@
 # ==============================================================================
 ---
 - name: "Validazione Performance Estesa su Cluster (MemberOf + Nested Group Scale)"
-  hosts: ldap_all
+  hosts:
+    - cluster
+    - readonlyreplica
   become: true
   vars:
     suffix: "dc=example,dc=com"
@@ -22,7 +61,6 @@
     target_check_group: "cn=custom-scale-group-100,ou=groups,{{ suffix }}"
 
   tasks:
-
     - name: "[SETUP] Verifica presenza del comando 'time' (GNU time, non il builtin di shell)"
       ansible.builtin.command: which time
       register: time_bin_check
@@ -59,6 +97,7 @@
         executable: /bin/bash
       register: query_1_time
       changed_when: false
+      failed_when: false
       no_log: true
 
     - name: "[METRICA 2] Lettura attributo persistente memberOf su Cloud Architect (~300 gruppi)"
@@ -69,6 +108,7 @@
         executable: /bin/bash
       register: query_2_time
       changed_when: false
+      failed_when: false
       no_log: true
 
     - name: "[METRICA 3] Verifica puntuale utente-gruppo tramite attributo persistente (Filtro combinato)"
@@ -79,6 +119,7 @@
         executable: /bin/bash
       register: query_3_time
       changed_when: false
+      failed_when: false
       no_log: true
 
     - name: "[VERIFICA 3] La coppia utente-100/gruppo-100 garantita deve risultare presente"
@@ -96,6 +137,7 @@
         executable: /bin/bash
       register: query_4_time
       changed_when: false
+      failed_when: false
       no_log: true
 
     - name: "[VERIFICA 4] L'architect garantito deve comparire nell'espansione nidificata"
@@ -113,6 +155,7 @@
         executable: /bin/bash
       register: query_5_time
       changed_when: false
+      failed_when: false
       no_log: true
 
     - name: "[METRICA 6] Ispezione membri strutturali diretti del gruppo radice complesso"
@@ -123,6 +166,7 @@
         executable: /bin/bash
       register: query_6_time
       changed_when: false
+      failed_when: false
       no_log: true
 
     - name: "[STABILITÀ] Controllo sincronizzazione Multi-Master (contextCSN)"

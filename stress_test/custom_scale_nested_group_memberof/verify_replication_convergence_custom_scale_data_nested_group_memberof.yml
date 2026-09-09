@@ -1,5 +1,8 @@
 # ==============================================================================
 # TITOLO:       Verifica Convergenza Replica Dataset Custom Scale (Conteggi)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.1 (review)
 # SCOPO:        Confermare che TUTTI i nodi (master + repliche read-only)
 #               abbiano ricevuto l'intero dataset custom-scale, contando
 #               separatamente entry (utenti/gruppi) e il totale delle
@@ -7,6 +10,34 @@
 #               quest'ultimo intercetta anche il caso di un'entry presente
 #               ma con la lista membri incompleta, che un conteggio di sole
 #               entry non rileverebbe.
+#
+# NOVITÀ v1.1 rispetto a v1.0 (review manuale mirata alle regole di
+# ansible-lint - non un vero passaggio dello strumento, che non e' stato
+# possibile eseguire per assenza di rete nell'ambiente di verifica):
+#   - I 5 task [COUNT] (risky-shell-pipe): usavano "slapcat | grep -c" o
+#     "slapcat | awk" senza alcuna protezione sulla pipe. Se slapcat
+#     fallisse per qualunque motivo (permessi, DB bloccato, argomento -b
+#     sbagliato), il codice di uscita della pipe avrebbe riflesso solo
+#     grep/awk - che leggendo un output vuoto/troncato avrebbero comunque
+#     restituito un conteggio plausibile (spesso zero), mascherando un
+#     errore reale come se fosse un dato legittimo. Il precedente
+#     failed_when:false (necessario perche' grep -c ritorna rc=1 su zero
+#     corrispondenze, un dato valido) rendeva la cosa ancora piu' cieca:
+#     sopprimeva QUALUNQUE fallimento, non solo quello legittimo di grep.
+#     Corretto con ${PIPESTATUS[0]} (richiede args.executable: /bin/bash):
+#     controlla esplicitamente solo l'esito di slapcat, lasciando grep/awk
+#     liberi di restituire zero senza che questo faccia fallire il task -
+#     un vero fallimento di slapcat ora fa fallire il task in modo
+#     esplicito, failed_when:false non serve piu' ed e' stato rimosso.
+#     ATTENZIONE (scoperta testando empiricamente il fix, non per
+#     supposizione): PIPESTATUS NON si propaga se la pipe e' racchiusa in
+#     un command substitution $(...) - il command substitution gira in
+#     una subshell separata, e l'array PIPESTATUS di quella subshell non
+#     e' visibile nella shell chiamante. La pipe va quindi eseguita
+#     DIRETTAMENTE (con l'output rediretto su un file temporaneo, letto
+#     subito dopo), non avvolta in $(...) - la prima versione del fix, che
+#     usava "count=$(pipe...)", sarebbe risultata silenziosamente rotta
+#     (PIPESTATUS[0] sempre a un valore non significativo).
 # ==============================================================================
 ---
 - name: "Conteggio locale del dataset custom-scale su ciascun nodo"
@@ -26,47 +57,109 @@
     # Stesso identico pattern gia' usato con successo per tutta questa
     # sessione di debug tramite lo script conta.sh manuale.
 
+    # NOTA (dopo verifica manuale con le regole di ansible-lint): le pipe
+    # slapcat|grep/awk qui sotto usano ${PIPESTATUS[0]} per controllare
+    # SOLO l'esito di slapcat, non quello di grep/awk - grep -c ritorna
+    # rc=1 quando trova zero corrispondenze (un dato legittimo, non un
+    # errore), quindi un semplice "set -o pipefail" da solo non basterebbe
+    # a distinguere "slapcat e' fallito" da "trovate correttamente zero
+    # entry": userebbe lo stesso codice di uscita per entrambi i casi.
+    # Con il controllo esplicito su PIPESTATUS[0], un vero fallimento di
+    # slapcat (permessi, DB bloccato, argomento -b sbagliato) fa fallire
+    # il task in modo esplicito, mentre uno zero legittimo di grep/awk
+    # continua a essere trattato come il dato valido che e' - quindi
+    # failed_when:false non serve piu', il codice di uscita del task
+    # riflette ora correttamente solo i problemi veri.
+
     - name: "[COUNT] Utenti custom-scale-user-*"
-      ansible.builtin.shell: >
-        slapcat -b "{{ suffix }}" -s "ou=People,{{ suffix }}" | grep -c "^dn: uid=custom-scale-user-"
+      ansible.builtin.shell: |
+        set -o pipefail
+        slapcat -b "{{ suffix }}" -s "ou=People,{{ suffix }}" | grep -c "^dn: uid=custom-scale-user-" > /tmp/count_out.$$
+        slapcat_rc=${PIPESTATUS[0]}
+        count=$(cat /tmp/count_out.$$)
+        rm -f /tmp/count_out.$$
+        if [ "$slapcat_rc" -ne 0 ]; then
+          echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+          exit 1
+        fi
+        echo "$count"
+      args:
+        executable: /bin/bash
       register: user_count_raw
       changed_when: false
-      failed_when: false
-      # failed_when:false: grep -c ritorna rc=1 se zero corrispondenze -
-      # e' un dato legittimo (0), non un errore del comando.
 
     - name: "[COUNT] Gruppi custom-scale-group-* (generici)"
-      ansible.builtin.shell: >
-        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-group-"
+      ansible.builtin.shell: |
+        set -o pipefail
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-group-" > /tmp/count_out.$$
+        slapcat_rc=${PIPESTATUS[0]}
+        count=$(cat /tmp/count_out.$$)
+        rm -f /tmp/count_out.$$
+        if [ "$slapcat_rc" -ne 0 ]; then
+          echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+          exit 1
+        fi
+        echo "$count"
+      args:
+        executable: /bin/bash
       register: group_count_raw
       changed_when: false
-      failed_when: false
 
     - name: "[COUNT] Gruppi deep-tier"
-      ansible.builtin.shell: >
-        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-deep-tier-"
+      ansible.builtin.shell: |
+        set -o pipefail
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-deep-tier-" > /tmp/count_out.$$
+        slapcat_rc=${PIPESTATUS[0]}
+        count=$(cat /tmp/count_out.$$)
+        rm -f /tmp/count_out.$$
+        if [ "$slapcat_rc" -ne 0 ]; then
+          echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+          exit 1
+        fi
+        echo "$count"
+      args:
+        executable: /bin/bash
       register: deep_tier_count_raw
       changed_when: false
-      failed_when: false
 
     - name: "[COUNT] Gruppi radice deep-nesting"
-      ansible.builtin.shell: >
-        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-root-deep-"
+      ansible.builtin.shell: |
+        set -o pipefail
+        slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | grep -c "^dn: cn=custom-scale-root-deep-" > /tmp/count_out.$$
+        slapcat_rc=${PIPESTATUS[0]}
+        count=$(cat /tmp/count_out.$$)
+        rm -f /tmp/count_out.$$
+        if [ "$slapcat_rc" -ne 0 ]; then
+          echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+          exit 1
+        fi
+        echo "$count"
+      args:
+        executable: /bin/bash
       register: root_deep_count_raw
       changed_when: false
-      failed_when: false
 
     - name: "[COUNT] Totale valori 'member:' su tutti i gruppi custom-scale (somma appartenenze)"
-      ansible.builtin.shell: >
+      ansible.builtin.shell: |
+        set -o pipefail
         slapcat -b "{{ suffix }}" -s "ou=groups,{{ suffix }}" | awk '
-        /^dn: cn=custom-scale-(group|deep-tier|root-deep)-/ { inrecord=1; next }
-        /^dn:/ { inrecord=0; next }
-        inrecord && /^member:/ { count++ }
-        END { print count+0 }
-        '
+          /^dn: cn=custom-scale-(group|deep-tier|root-deep)-/ { inrecord=1; next }
+          /^dn:/ { inrecord=0; next }
+          inrecord && /^member:/ { count++ }
+          END { print count+0 }
+        ' > /tmp/count_out.$$
+        slapcat_rc=${PIPESTATUS[0]}
+        count=$(cat /tmp/count_out.$$)
+        rm -f /tmp/count_out.$$
+        if [ "$slapcat_rc" -ne 0 ]; then
+          echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+          exit 1
+        fi
+        echo "$count"
+      args:
+        executable: /bin/bash
       register: member_count_raw
       changed_when: false
-      failed_when: false
 
     - name: "[COMPUTA] Estrai i conteggi numerici da ciascun output"
       ansible.builtin.set_fact:

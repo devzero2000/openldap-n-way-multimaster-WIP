@@ -1,0 +1,373 @@
+
+PLAY [Validazione Performance Estesa su Cluster (MemberOf + Nested Group Scale)] ***
+
+TASK [Gathering Facts] *********************************************************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SETUP] Verifica presenza del comando 'time' (GNU time, non il builtin di shell)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SETUP] Installa il pacchetto 'time' se assente (serve per le metriche sotto)] ***
+skipping: [ubuntu24lts1.example.com]
+skipping: [ubuntu24lts2.example.com]
+skipping: [ubuntu24lts3.example.com]
+skipping: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 1] Lettura istantanea attributo persistente memberOf su utente standard] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 2] Lettura attributo persistente memberOf su Cloud Architect (~300 gruppi)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 3] Verifica puntuale utente-gruppo tramite attributo persistente (Filtro combinato)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[VERIFICA 3] La coppia utente-100/gruppo-100 garantita deve risultare presente] ***
+ok: [ubuntu24lts1.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+ok: [ubuntu24lts2.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+ok: [ubuntu24lts3.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+ok: [ubuntu24lts4.example.com] => {
+    "changed": false,
+    "msg": "OK: coppia utente-gruppo garantita trovata correttamente."
+}
+
+TASK [[METRICA 4] Query inversa per utenti ereditati nel gruppo radice profondo (Nested Expansion)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[VERIFICA 4] L'architect garantito deve comparire nell'espansione nidificata] ***
+ok: [ubuntu24lts1.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+ok: [ubuntu24lts2.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+ok: [ubuntu24lts3.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+ok: [ubuntu24lts4.example.com] => {
+    "changed": false,
+    "msg": "OK: architect trovato correttamente nell'espansione nidificata (nestgroup funziona)."
+}
+
+TASK [[METRICA 5] Estrazione memberOf su utente in fondo alla catena di deep nesting (15 livelli)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 6] Ispezione membri strutturali diretti del gruppo radice complesso] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[STABILITÀ] Controllo sincronizzazione Multi-Master (contextCSN)] ********
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[DIAGNOSTICA] Monitoraggio ingombro fisico su disco di LMDB] *************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[REPORT] Generazione report prestazionale personalizzato (MemberOf + Nested)] ***
+ok: [ubuntu24lts1.example.com] => {
+    "msg": [
+        "==================================================================",
+        " REPORT PERFORMANCE (MEMBEROF / NESTED - MODELLO A FASCE)         ",
+        "==================================================================",
+        "1. Dimensione fisica database LMDB su disco:",
+        "-rw------- 1 openldap openldap 436M Sep  9 10:46 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Latenza lettura memberOf persistente su utente standard (~50 gruppi):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Latenza lettura memberOf persistente su Cloud Architect (~300 gruppi):",
+        [
+            "",
+            "real\t0m0.013s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Latenza verifica puntuale utente-gruppo (Filtro combinato):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Latenza query inversa ricorsiva (Deep Root MemberOf Expansion):",
+        [
+            "",
+            "real\t0m0.014s",
+            "user\t0m0.004s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Latenza lettura memberOf su utente tecnico in fondo alla catena di deep nesting (~150 gruppi):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.003s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Latenza lettura membri strutturali diretti del gruppo radice complesso:",
+        [
+            "",
+            "real\t0m0.011s",
+            "user\t0m0.003s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "8. Stato sincronizzazione (contextCSN) su ubuntu24lts1.example.com:",
+        [
+            "contextCSN: 20260909084652.039220Z#000000#001#000000",
+            "contextCSN: 20260909084624.247826Z#000000#002#000000",
+            "contextCSN: 20260909084625.535613Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+ok: [ubuntu24lts3.example.com] => {
+    "msg": [
+        "==================================================================",
+        " REPORT PERFORMANCE (MEMBEROF / NESTED - MODELLO A FASCE)         ",
+        "==================================================================",
+        "1. Dimensione fisica database LMDB su disco:",
+        "-rw------- 1 openldap openldap 429M Sep  9 10:46 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Latenza lettura memberOf persistente su utente standard (~50 gruppi):",
+        [
+            "",
+            "real\t0m0.014s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Latenza lettura memberOf persistente su Cloud Architect (~300 gruppi):",
+        [
+            "",
+            "real\t0m0.013s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Latenza verifica puntuale utente-gruppo (Filtro combinato):",
+        [
+            "",
+            "real\t0m0.010s",
+            "user\t0m0.005s",
+            "sys\t0m0.005s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Latenza query inversa ricorsiva (Deep Root MemberOf Expansion):",
+        [
+            "",
+            "real\t0m0.014s",
+            "user\t0m0.004s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Latenza lettura memberOf su utente tecnico in fondo alla catena di deep nesting (~150 gruppi):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Latenza lettura membri strutturali diretti del gruppo radice complesso:",
+        [
+            "",
+            "real\t0m0.011s",
+            "user\t0m0.005s",
+            "sys\t0m0.005s"
+        ],
+        "------------------------------------------------------------------",
+        "8. Stato sincronizzazione (contextCSN) su ubuntu24lts3.example.com:",
+        [
+            "contextCSN: 20260909084652.039220Z#000000#001#000000",
+            "contextCSN: 20260909084624.247826Z#000000#002#000000",
+            "contextCSN: 20260909084625.535613Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+ok: [ubuntu24lts2.example.com] => {
+    "msg": [
+        "==================================================================",
+        " REPORT PERFORMANCE (MEMBEROF / NESTED - MODELLO A FASCE)         ",
+        "==================================================================",
+        "1. Dimensione fisica database LMDB su disco:",
+        "-rw------- 1 openldap openldap 429M Sep  9 10:46 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Latenza lettura memberOf persistente su utente standard (~50 gruppi):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Latenza lettura memberOf persistente su Cloud Architect (~300 gruppi):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.003s",
+            "sys\t0m0.006s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Latenza verifica puntuale utente-gruppo (Filtro combinato):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.006s",
+            "sys\t0m0.004s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Latenza query inversa ricorsiva (Deep Root MemberOf Expansion):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.002s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Latenza lettura memberOf su utente tecnico in fondo alla catena di deep nesting (~150 gruppi):",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.005s",
+            "sys\t0m0.005s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Latenza lettura membri strutturali diretti del gruppo radice complesso:",
+        [
+            "",
+            "real\t0m0.011s",
+            "user\t0m0.004s",
+            "sys\t0m0.006s"
+        ],
+        "------------------------------------------------------------------",
+        "8. Stato sincronizzazione (contextCSN) su ubuntu24lts2.example.com:",
+        [
+            "contextCSN: 20260909084652.039220Z#000000#001#000000",
+            "contextCSN: 20260909084624.247826Z#000000#002#000000",
+            "contextCSN: 20260909084625.535613Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+ok: [ubuntu24lts4.example.com] => {
+    "msg": [
+        "==================================================================",
+        " REPORT PERFORMANCE (MEMBEROF / NESTED - MODELLO A FASCE)         ",
+        "==================================================================",
+        "1. Dimensione fisica database LMDB su disco:",
+        "-rw------- 1 openldap openldap 429M Sep  9 10:46 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Latenza lettura memberOf persistente su utente standard (~50 gruppi):",
+        [
+            "",
+            "real\t0m0.013s",
+            "user\t0m0.003s",
+            "sys\t0m0.009s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Latenza lettura memberOf persistente su Cloud Architect (~300 gruppi):",
+        [
+            "",
+            "real\t0m0.014s",
+            "user\t0m0.003s",
+            "sys\t0m0.009s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Latenza verifica puntuale utente-gruppo (Filtro combinato):",
+        [
+            "",
+            "real\t0m0.015s",
+            "user\t0m0.005s",
+            "sys\t0m0.009s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Latenza query inversa ricorsiva (Deep Root MemberOf Expansion):",
+        [
+            "",
+            "real\t0m0.014s",
+            "user\t0m0.002s",
+            "sys\t0m0.010s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Latenza lettura memberOf su utente tecnico in fondo alla catena di deep nesting (~150 gruppi):",
+        [
+            "",
+            "real\t0m0.014s",
+            "user\t0m0.002s",
+            "sys\t0m0.009s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Latenza lettura membri strutturali diretti del gruppo radice complesso:",
+        [
+            "",
+            "real\t0m0.012s",
+            "user\t0m0.002s",
+            "sys\t0m0.009s"
+        ],
+        "------------------------------------------------------------------",
+        "8. Stato sincronizzazione (contextCSN) su ubuntu24lts4.example.com:",
+        [
+            "contextCSN: 20260909084652.039220Z#000000#001#000000",
+            "contextCSN: 20260909084624.247826Z#000000#002#000000",
+            "contextCSN: 20260909084625.535613Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+
+PLAY RECAP *********************************************************************
+ubuntu24lts1.example.com   : ok=13   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts2.example.com   : ok=13   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts3.example.com   : ok=13   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts4.example.com   : ok=13   changed=0    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+
