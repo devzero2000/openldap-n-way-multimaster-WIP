@@ -1,0 +1,33 @@
+---
+- name: "ripristina size limir al default"
+  hosts: ldap_all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: "Rimuove olcSizeLimit (torna al default compilato)"
+      ansible.builtin.command: >
+        ldapmodify -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          delete: olcSizeLimit
+      register: fix_result
+      failed_when: >
+        fix_result.rc != 0 and
+        ('no such attribute' not in fix_result.stderr | lower)
+      changed_when: fix_result.rc == 0
+
+    - name: "Conferma il valore dopo la correzione"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b "olcDatabase={1}mdb,cn=config"
+        -s base olcSizeLimit
+      register: check_result
+      changed_when: false
+
+    - name: "Riepilogo"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: {{
+            check_result.stdout_lines | select('match', '^olcSizeLimit:') | list
+            | default(['(non impostato - default compilato, corretto)'], true) }}
