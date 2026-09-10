@@ -1,0 +1,373 @@
+
+PLAY [Validazione Metriche di Tuning e Performance (mfstress-*)] ***************
+
+TASK [Gathering Facts] *********************************************************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SETUP] Verifica presenza del comando 'time'] ****************************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SETUP] Installa il pacchetto 'time' se assente] *************************
+skipping: [ubuntu24lts1.example.com]
+skipping: [ubuntu24lts2.example.com]
+skipping: [ubuntu24lts3.example.com]
+skipping: [ubuntu24lts4.example.com]
+
+TASK [[SIZELIMIT] Leggi il valore attuale di olcSizeLimit] *********************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SIZELIMIT] Estrai il valore originale (vuoto se non era impostato)] *****
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SIZELIMIT] Riepilogo valore originale rilevato] *************************
+ok: [ubuntu24lts1.example.com] => {
+    "msg": "ubuntu24lts1.example.com: olcSizeLimit originale = '(non impostato, default compilato)'"
+}
+ok: [ubuntu24lts2.example.com] => {
+    "msg": "ubuntu24lts2.example.com: olcSizeLimit originale = '(non impostato, default compilato)'"
+}
+ok: [ubuntu24lts3.example.com] => {
+    "msg": "ubuntu24lts3.example.com: olcSizeLimit originale = '(non impostato, default compilato)'"
+}
+ok: [ubuntu24lts4.example.com] => {
+    "msg": "ubuntu24lts4.example.com: olcSizeLimit originale = '(non impostato, default compilato)'"
+}
+
+TASK [[SIZELIMIT] Alza temporaneamente olcSizeLimit a unlimited] ***************
+changed: [ubuntu24lts1.example.com]
+changed: [ubuntu24lts2.example.com]
+changed: [ubuntu24lts3.example.com]
+changed: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 1] Estrazione diretta dell'attributo memberOf (Verifica indici statici)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[VERIFICA 1] L'appartenenza garantita a cn=mfstress-group.500,ou=groups,dc=example,dc=com deve comparire in memberOf] ***
+ok: [ubuntu24lts1.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata in memberOf."
+}
+ok: [ubuntu24lts2.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata in memberOf."
+}
+ok: [ubuntu24lts3.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata in memberOf."
+}
+ok: [ubuntu24lts4.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata in memberOf."
+}
+
+TASK [[METRICA 2] Query inversa filtrata su un ruolo da 10.000 membri] *********
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[VERIFICA 2] uid=mfstress-testuser-large,ou=people,dc=example,dc=com deve comparire fra i risultati della ricerca inversa] ***
+ok: [ubuntu24lts1.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata dalla ricerca inversa."
+}
+ok: [ubuntu24lts2.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata dalla ricerca inversa."
+}
+ok: [ubuntu24lts3.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata dalla ricerca inversa."
+}
+ok: [ubuntu24lts4.example.com] => {
+    "changed": false,
+    "msg": "OK: appartenenza garantita confermata dalla ricerca inversa."
+}
+
+TASK [[METRICA 3] Estrazione diretta attributo member da un gruppo periferico (10 utenti)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 4] Query inversa filtrata su un gruppo periferico (10 membri)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[METRICA 5] Ricerca wildcard su sottoalbero gruppi (cn=mfstress-group.15*, ~1.111 risultati attesi)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[STABILITÀ] Controllo dello stato di sincronizzazione del cluster (contextCSN)] ***
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[DIAGNOSTICA] Monitora l'I/O fisico del DB di backend LMDB] **************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[REPORT] Generazione del report di impatto] ******************************
+ok: [ubuntu24lts1.example.com] => {
+    "msg": [
+        "==================================================================",
+        " METRICHE PRESTAZIONALI E COMPORTAMENTO STRUTTURALE MEMBEROF (mfstress-*)",
+        "==================================================================",
+        "1. Dimensione reale del database LMDB su disco:",
+        "-rw------- 1 openldap openldap 30G Sep 10 21:47 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Tempo di estrazione diretta di memberOf (Query Base Utente):",
+        [
+            "real\t0m0.010s",
+            "user\t0m0.001s",
+            "sys\t0m0.008s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Tempo di estrazione diretta dei membri di un gruppo (10 utenti):",
+        [
+            "real\t0m0.011s",
+            "user\t0m0.002s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Tempo di risoluzione inversa filtrata su ruolo Large (10k utenti):",
+        [
+            "real\t0m0.142s",
+            "user\t0m0.039s",
+            "sys\t0m0.041s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Tempo di risoluzione inversa filtrata su gruppo Small (10 utenti):",
+        [
+            "real\t0m0.013s",
+            "user\t0m0.005s",
+            "sys\t0m0.005s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Tempo di ricerca parziale Wildcard su 30.000 gruppi (cn=mfstress-group.15*, ~1.111 risultati):",
+        [
+            "real\t0m0.026s",
+            "user\t0m0.004s",
+            "sys\t0m0.013s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Stato dei contatori di replica (contextCSN) sul nodo ubuntu24lts1.example.com:",
+        [
+            "contextCSN: 20260910090000.021000Z#000000#001#000000",
+            "contextCSN: 20260910090000.028000Z#000000#002#000000",
+            "contextCSN: 20260910090000.035000Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+ok: [ubuntu24lts3.example.com] => {
+    "msg": [
+        "==================================================================",
+        " METRICHE PRESTAZIONALI E COMPORTAMENTO STRUTTURALE MEMBEROF (mfstress-*)",
+        "==================================================================",
+        "1. Dimensione reale del database LMDB su disco:",
+        "-rw------- 1 openldap openldap 30G Sep 10 21:47 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Tempo di estrazione diretta di memberOf (Query Base Utente):",
+        [
+            "real\t0m0.009s",
+            "user\t0m0.001s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Tempo di estrazione diretta dei membri di un gruppo (10 utenti):",
+        [
+            "real\t0m0.009s",
+            "user\t0m0.004s",
+            "sys\t0m0.004s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Tempo di risoluzione inversa filtrata su ruolo Large (10k utenti):",
+        [
+            "real\t0m0.165s",
+            "user\t0m0.037s",
+            "sys\t0m0.051s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Tempo di risoluzione inversa filtrata su gruppo Small (10 utenti):",
+        [
+            "real\t0m0.010s",
+            "user\t0m0.003s",
+            "sys\t0m0.006s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Tempo di ricerca parziale Wildcard su 30.000 gruppi (cn=mfstress-group.15*, ~1.111 risultati):",
+        [
+            "real\t0m0.024s",
+            "user\t0m0.007s",
+            "sys\t0m0.010s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Stato dei contatori di replica (contextCSN) sul nodo ubuntu24lts3.example.com:",
+        [
+            "contextCSN: 20260910090000.021000Z#000000#001#000000",
+            "contextCSN: 20260910090000.028000Z#000000#002#000000",
+            "contextCSN: 20260910090000.035000Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+ok: [ubuntu24lts2.example.com] => {
+    "msg": [
+        "==================================================================",
+        " METRICHE PRESTAZIONALI E COMPORTAMENTO STRUTTURALE MEMBEROF (mfstress-*)",
+        "==================================================================",
+        "1. Dimensione reale del database LMDB su disco:",
+        "-rw------- 1 openldap openldap 30G Sep 10 21:47 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Tempo di estrazione diretta di memberOf (Query Base Utente):",
+        [
+            "real\t0m0.009s",
+            "user\t0m0.001s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Tempo di estrazione diretta dei membri di un gruppo (10 utenti):",
+        [
+            "real\t0m0.010s",
+            "user\t0m0.002s",
+            "sys\t0m0.006s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Tempo di risoluzione inversa filtrata su ruolo Large (10k utenti):",
+        [
+            "real\t0m0.123s",
+            "user\t0m0.040s",
+            "sys\t0m0.042s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Tempo di risoluzione inversa filtrata su gruppo Small (10 utenti):",
+        [
+            "real\t0m0.011s",
+            "user\t0m0.003s",
+            "sys\t0m0.005s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Tempo di ricerca parziale Wildcard su 30.000 gruppi (cn=mfstress-group.15*, ~1.111 risultati):",
+        [
+            "real\t0m0.018s",
+            "user\t0m0.006s",
+            "sys\t0m0.010s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Stato dei contatori di replica (contextCSN) sul nodo ubuntu24lts2.example.com:",
+        [
+            "contextCSN: 20260910090000.021000Z#000000#001#000000",
+            "contextCSN: 20260910090000.028000Z#000000#002#000000",
+            "contextCSN: 20260910090000.035000Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+ok: [ubuntu24lts4.example.com] => {
+    "msg": [
+        "==================================================================",
+        " METRICHE PRESTAZIONALI E COMPORTAMENTO STRUTTURALE MEMBEROF (mfstress-*)",
+        "==================================================================",
+        "1. Dimensione reale del database LMDB su disco:",
+        "-rw------- 1 openldap openldap 30G Sep 10 21:47 /var/lib/ldap/data.mdb",
+        "------------------------------------------------------------------",
+        "2. Tempo di estrazione diretta di memberOf (Query Base Utente):",
+        [
+            "real\t0m0.011s",
+            "user\t0m0.002s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "3. Tempo di estrazione diretta dei membri di un gruppo (10 utenti):",
+        [
+            "real\t0m0.011s",
+            "user\t0m0.004s",
+            "sys\t0m0.006s"
+        ],
+        "------------------------------------------------------------------",
+        "4. Tempo di risoluzione inversa filtrata su ruolo Large (10k utenti):",
+        [
+            "real\t0m0.161s",
+            "user\t0m0.037s",
+            "sys\t0m0.058s"
+        ],
+        "------------------------------------------------------------------",
+        "5. Tempo di risoluzione inversa filtrata su gruppo Small (10 utenti):",
+        [
+            "real\t0m0.011s",
+            "user\t0m0.002s",
+            "sys\t0m0.007s"
+        ],
+        "------------------------------------------------------------------",
+        "6. Tempo di ricerca parziale Wildcard su 30.000 gruppi (cn=mfstress-group.15*, ~1.111 risultati):",
+        [
+            "real\t0m0.022s",
+            "user\t0m0.008s",
+            "sys\t0m0.010s"
+        ],
+        "------------------------------------------------------------------",
+        "7. Stato dei contatori di replica (contextCSN) sul nodo ubuntu24lts4.example.com:",
+        [
+            "contextCSN: 20260910090000.021000Z#000000#001#000000",
+            "contextCSN: 20260910090000.028000Z#000000#002#000000",
+            "contextCSN: 20260910090000.035000Z#000000#003#000000"
+        ],
+        "=================================================================="
+    ]
+}
+
+TASK [[SIZELIMIT] Ripristina il valore originale (o lo rimuove se non era impostato)] ***
+changed: [ubuntu24lts1.example.com]
+changed: [ubuntu24lts3.example.com]
+changed: [ubuntu24lts2.example.com]
+changed: [ubuntu24lts4.example.com]
+
+TASK [[SIZELIMIT] Conferma il valore dopo il ripristino] ***********************
+ok: [ubuntu24lts1.example.com]
+ok: [ubuntu24lts2.example.com]
+ok: [ubuntu24lts3.example.com]
+ok: [ubuntu24lts4.example.com]
+
+TASK [[SIZELIMIT] Riepilogo dopo il ripristino] ********************************
+ok: [ubuntu24lts1.example.com] => {
+    "msg": "ubuntu24lts1.example.com: olcSizeLimit dopo il ripristino = '['(non impostato, default compilato - come era in origine)']'"
+}
+ok: [ubuntu24lts2.example.com] => {
+    "msg": "ubuntu24lts2.example.com: olcSizeLimit dopo il ripristino = '['(non impostato, default compilato - come era in origine)']'"
+}
+ok: [ubuntu24lts3.example.com] => {
+    "msg": "ubuntu24lts3.example.com: olcSizeLimit dopo il ripristino = '['(non impostato, default compilato - come era in origine)']'"
+}
+ok: [ubuntu24lts4.example.com] => {
+    "msg": "ubuntu24lts4.example.com: olcSizeLimit dopo il ripristino = '['(non impostato, default compilato - come era in origine)']'"
+}
+
+PLAY RECAP *********************************************************************
+ubuntu24lts1.example.com   : ok=19   changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts2.example.com   : ok=19   changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts3.example.com   : ok=19   changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+ubuntu24lts4.example.com   : ok=19   changed=2    unreachable=0    failed=0    skipped=1    rescued=0    ignored=0   
+

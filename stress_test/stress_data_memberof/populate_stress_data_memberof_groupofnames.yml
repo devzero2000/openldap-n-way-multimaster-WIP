@@ -1,0 +1,235 @@
+# ==============================================================================
+# TITOLO:       Generatore di Carico Dimensionale per slapo-memberof (mfstress-*)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     2.1
+# SCOPO:        Iniezione massiva di 30k utenti e gruppi flat per stress-test
+#               dell'overlay memberof in ambiente Multi-Master.
+#
+# NAMESPACE: mfstress-* (uid=mfstress-user.N, cn=mfstress-group.N,
+# cn=mfstress-architect.N) - coerente col file mfstress_dataset.ldif già
+# generato in formato slapcat, per evitare collisioni con gli altri dataset
+# di test (custom-scale-*, csmall-*) eventualmente gia' presenti.
+#
+# IMPORT A BATCH: stessa mitigazione gia' validata sul dataset custom-scale -
+# un'unica ldapmodify continua su ~60.000 entry (con ~700.000 operazioni
+# effettive contando la cascata memberof: 30.000 gruppi x 10 membri +
+# 40 ruoli x 10.000 membri) genera un burst di scrittura che puo' causare
+# buchi silenziosi nella replica o rendere slapd temporaneamente non
+# responsivo - l'import viene quindi spezzato in batch piu' piccoli, con
+# pausa e retry sullo stesso batch se slapd non risponde.
+#
+# NOVITÀ v2.1 rispetto a v2.0 (review): aggiunti due utenti di TEST DEDICATI
+# (mfstress-testuser-small, mfstress-testuser-large), fuori dal pool numerato
+# 1..total_users - impossibile che collidano ne' col pool ne' con gli altri
+# dataset - con appartenenza GARANTITA esplicitamente a mfstress-group.500 e
+# mfstress-architect.1 rispettivamente. Prima, verificaPerformance_stress_
+# data_memberof.yml usava utenti scelti a caso dal pool numerato (user.500,
+# user.25000) SPERANDO che la formula modulare del generatore li includesse
+# per coincidenza nei gruppi di test - verificato con un calcolo diretto che
+# NON era il caso per nessuno dei due: le metriche 1/2 stavano misurando
+# ricerche che non confermavano alcuna appartenenza reale, non il caso
+# "conferma di appartenenza nota" che il nome delle metriche suggeriva.
+# ==============================================================================
+
+---
+- name: "Generazione Dataset Massivo per Stress Test slapo-memberof (mfstress-*)"
+  hosts: "{{ groups['cluster'] | sort | first }}"
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    ldif_dir: "/tmp/mfstress_batches"
+    ldap_pw: "openldap"
+
+    total_users: 30000
+    total_groups: 30000
+    total_architects: 40
+    members_per_group: 10
+    members_per_architect: 10000
+
+    batch_size: 200
+    batch_pause_seconds: 5
+    batch_timeout_seconds: 120
+    batch_retries: 15
+    batch_retry_delay: 15
+
+  tasks:
+    - name: "[SETUP] Assicura la presenza del comando 'time'"
+      ansible.builtin.command: which time
+      register: time_bin_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SETUP] Installa il pacchetto 'time' se assente"
+      ansible.builtin.apt:
+        name: time
+        state: present
+      when: time_bin_check.rc != 0
+
+    - name: "[CLEANUP PRELIMINARE] Rimuovi eventuali batch residui da un run precedente"
+      ansible.builtin.file:
+        path: "{{ ldif_dir }}"
+        state: absent
+
+    - name: "[TEMPLATING] Genera lo script Python per il dataset a batch"
+      ansible.builtin.copy:
+        dest: /tmp/generate_mfstress_ldif_batched.py
+        mode: '0755'
+        content: |
+          #!/usr/bin/env python3
+          import hashlib
+          import base64
+          import os
+
+          suffix = "{{ suffix }}"
+          total_users = {{ total_users }}
+          total_groups = {{ total_groups }}
+          total_architects = {{ total_architects }}
+          members_per_group = {{ members_per_group }}
+          members_per_architect = {{ members_per_architect }}
+          batch_size = {{ batch_size }}
+          ldif_dir = "{{ ldif_dir }}"
+
+          def make_ssha_password(password_plain):
+              salt = os.urandom(4)
+              ctx = hashlib.sha1(password_plain.encode('utf-8'))
+              ctx.update(salt)
+              ssha_hash = base64.b64encode(ctx.digest() + salt).decode('utf-8')
+              return "{SSHA}" + ssha_hash
+
+          records = []
+          records.append(f"dn: ou=people,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: people\n")
+          records.append(f"dn: ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: organizationalUnit\nou: groups\n")
+
+          # 1. Utenti
+          for i in range(1, total_users + 1):
+              username = f"mfstress-user.{i}"
+              ssha_password = make_ssha_password(f"{username}.1")
+              records.append(f"dn: uid={username},ou=people,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: Test User{i}\nsn: User{i}\nuserPassword: {ssha_password}\n")
+
+          # 1b. Utenti di TEST DEDICATI, fuori dal pool numerato (1..total_users)
+          # cosi' non possono mai collidere con esso, e con appartenenza
+          # GARANTITA esplicitamente (non dedotta dalla formula modulare, che
+          # cambierebbe ad ogni modifica dei parametri) a uno specifico gruppo
+          # piccolo e a uno specifico ruolo grande - permette test deterministici
+          # di verifica dell'appartenenza, invece di scegliere a caso un indice
+          # numerico sperando che la formula lo includa per coincidenza.
+          test_users_dedicated = ["mfstress-testuser-small", "mfstress-testuser-large"]
+          for username in test_users_dedicated:
+              ssha_password = make_ssha_password(f"{username}.1")
+              records.append(f"dn: uid={username},ou=people,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: inetOrgPerson\nuid: {username}\ncn: {username}\nsn: Dedicated\nuserPassword: {ssha_password}\n")
+
+          # 2. Gruppi periferici (members_per_group membri cad., stessa formula modulare dell'originale)
+          for i in range(1, total_groups + 1):
+              lines = f"dn: cn=mfstress-group.{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: mfstress-group.{i}\ndescription: Gruppo {i}\n"
+              start = ((i * 10) % total_users) + 1
+              for u in range(start, start + members_per_group):
+                  actual_u = u if u <= total_users else u - total_users
+                  lines += f"member: uid=mfstress-user.{actual_u},ou=people,{suffix}\n"
+              if i == 500:
+                  # Appartenenza garantita dell'utente di test dedicato "small"
+                  lines += f"member: uid=mfstress-testuser-small,ou=people,{suffix}\n"
+              records.append(lines)
+
+          # 3. Ruoli globali "architect" (members_per_architect membri diretti cad.)
+          for i in range(1, total_architects + 1):
+              lines = f"dn: cn=mfstress-architect.{i},ou=groups,{suffix}\nchangetype: add\nobjectClass: top\nobjectClass: groupOfNames\ncn: mfstress-architect.{i}\ndescription: Ruolo Cloud {i}\n"
+              start = ((i * 500) % 20000) + 1
+              for u in range(start, start + members_per_architect):
+                  actual_u = u if u <= total_users else u - total_users
+                  lines += f"member: uid=mfstress-user.{actual_u},ou=people,{suffix}\n"
+              if i == 1:
+                  # Appartenenza garantita dell'utente di test dedicato "large"
+                  lines += f"member: uid=mfstress-testuser-large,ou=people,{suffix}\n"
+              records.append(lines)
+
+          os.makedirs(ldif_dir, exist_ok=True)
+          num_batches = (len(records) + batch_size - 1) // batch_size
+          for b in range(num_batches):
+              chunk = records[b * batch_size : (b + 1) * batch_size]
+              fname = os.path.join(ldif_dir, f"batch_{b:05d}.ldif")
+              with open(fname, "w") as f:
+                  f.write("\n".join(chunk))
+                  f.write("\n")
+
+          print(f"Record totali: {len(records)}")
+          print(f"Batch generati: {num_batches} (dimensione {batch_size} record/batch)")
+
+    - name: "[EXECUTE] Esegui script di generazione LDIF a batch"
+      ansible.builtin.command: python3 /tmp/generate_mfstress_ldif_batched.py
+      register: gen_result
+      changed_when: true
+
+    - name: "[REPORT] Riepilogo generazione"
+      ansible.builtin.debug:
+        msg: "{{ gen_result.stdout_lines }}"
+
+    - name: "[LISTA] Trova tutti i file batch generati, in ordine"
+      ansible.builtin.find:
+        paths: "{{ ldif_dir }}"
+        patterns: "batch_*.ldif"
+      register: batch_files_raw
+
+    - name: "[LISTA] Ordina i batch per nome (garantisce l'ordine di import)"
+      ansible.builtin.set_fact:
+        batch_files: "{{ batch_files_raw.files | map(attribute='path') | sort | list }}"
+
+    - name: "[REPORT] Numero di batch da importare"
+      ansible.builtin.debug:
+        msg: "{{ batch_files | length }} batch da importare, con {{ batch_pause_seconds }}s di pausa fra uno e l'altro"
+
+    - name: "[TIMING] Segna l'orario di inizio dell'import a batch"
+      ansible.builtin.set_fact:
+        batch_import_start_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: "[IMPORT] Applica ciascun batch (cronometrato, con retry se slapd non risponde)"
+      ansible.builtin.shell: >
+        time timeout {{ batch_timeout_seconds }} ldapmodify -a -c -H ldapi:/// -x
+        -D "cn=admin,{{ suffix }}" -w "{{ ldap_pw }}" -f "{{ item }}"
+      args:
+        executable: /bin/bash
+      loop: "{{ batch_files }}"
+      loop_control:
+        label: "{{ item | basename }}"
+        pause: "{{ batch_pause_seconds }}"
+      register: batch_results
+      changed_when: true
+      until: >
+        not (
+          batch_results.rc == 124 or
+          (batch_results.rc != 0 and
+            (batch_results.stderr_lines
+              | select('match', '^ldap_add:')
+              | reject('search', 'Already exists')
+              | list
+              | length > 0))
+        )
+      retries: "{{ batch_retries }}"
+      delay: "{{ batch_retry_delay }}"
+      failed_when: >
+        batch_results.rc == 124 or
+        (batch_results.rc != 0 and
+          (batch_results.stderr_lines
+            | select('match', '^ldap_add:')
+            | reject('search', 'Already exists')
+            | list
+            | length > 0))
+
+    - name: "[TIMING] Segna l'orario di fine dell'import a batch"
+      ansible.builtin.set_fact:
+        batch_import_end_epoch: "{{ lookup('pipe', 'date +%s') }}"
+
+    - name: "[REPORT] Tempo totale di import"
+      ansible.builtin.debug:
+        msg: >-
+          {{ (((batch_import_end_epoch | int) - (batch_import_start_epoch | int)) / 60) | round(1) }}
+          minuti totali su {{ batch_files | length }} batch ({{ batch_size }} entry/batch,
+          {{ batch_pause_seconds }}s di pausa fra un batch e l'altro)
+
+    - name: "[CLEANUP] Rimuovi script e batch LDIF temporanei"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "/tmp/generate_mfstress_ldif_batched.py"
+        - "{{ ldif_dir }}"

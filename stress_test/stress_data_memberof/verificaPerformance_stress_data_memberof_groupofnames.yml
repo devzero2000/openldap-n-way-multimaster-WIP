@@ -1,0 +1,288 @@
+# ==============================================================================
+# TITOLO:       Verifica Performance e Validazione Stabilità slapo-memberof (mfstress-*)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.3
+# SCOPO:        Verificare i tempi delle query dirette e inverse, l'I/O di LMDB,
+#               e monitorare lo stato di salute e sincronizzazione del cluster.
+#
+# GESTIONE olcSizeLimit: la METRICA 5 restituisce ~1.111 risultati, oltre il
+# limite di default di slapd (500). Invece di lasciare "olcSizeLimit:
+# unlimited" permanentemente sul cluster, il play ora:
+#   1) legge il valore ATTUALE di olcSizeLimit su ciascun nodo, PRIMA di
+#      toccare nulla;
+#   2) lo alza temporaneamente a "unlimited" solo per la durata del test;
+#   3) alla fine (SEMPRE, anche se una metrica fallisse a meta') lo
+#      ripristina esattamente al valore originale - o lo rimuove del tutto
+#      se in origine non era impostato affatto (tornando cosi' al default
+#      compilato di slapd, non a un valore inventato).
+# olcSizeLimit e' locale a cn=config su ciascun nodo (non replicato), quindi
+# lettura/modifica/ripristino avvengono per-nodo.
+#
+# NOVITÀ v1.3 rispetto a v1.2 (osservazione dell'utente, corretta):
+#   - hosts: cluster -> [cluster, readonlyreplica]. Nessun motivo tecnico
+#     valido per escludere la read-only: la modifica di olcSizeLimit e'
+#     un'operazione locale su cn=config via ldapi:///, indipendente dalla
+#     restrizione di sola-lettura sui dati (che riguarda le scritture dei
+#     client LDAP normali, non le modifiche amministrative dirette). Anzi,
+#     visto lo scopo dichiarato del play (verificare salute/sincronismo del
+#     cluster), la read-only - il nodo che serve davvero le letture - era
+#     proprio quella che mancava.
+#
+# NOVITÀ v1.2 rispetto a v1.1 (bug reale scoperto con un run fallito -
+# olcSizeLimit rimasto "unlimited" su tutti i nodi perche' il ripristino
+# non e' mai riuscito a scrivere):
+#   - Il template dell'LDIF di ripristino (task "[SIZELIMIT] Ripristina il
+#     valore originale") usava {%- if %}/{%- else %}/{%- endif %} - il
+#     modificatore "-" toglie anche l'a-capo PRIMA del tag, incollando
+#     "changetype: modify" direttamente al contenuto del ramo (if o else)
+#     senza andare a capo. Nel ramo else (valore originale non impostato,
+#     il caso reale che si e' verificato) il risultato era la riga unica
+#     "changetype: modifydelete: olcSizeLimit" - un changetype inesistente,
+#     rifiutato da ldapmodify. Lo stesso bug avrebbe rotto anche il ramo if
+#     (replace), non e' mai emerso solo perche' non si e' ancora verificato
+#     quel caso. Corretto togliendo il "-" dai tag ({% %} invece di
+#     {%- %}) - verificato con un confronto diretto prima/dopo su entrambi
+#     i rami (vuoto e con valore), non solo sul caso che e' fallito.
+#
+# NOVITÀ v1.1 rispetto a v1.0 (review, verificata con un calcolo diretto -
+# vedi populate_stress_data_memberof_groupofnames.yml v2.1 per il dettaglio):
+#   - test_user_1/test_user_2 ora puntano ai nuovi utenti di test DEDICATI
+#     (mfstress-testuser-small/large) invece che a utenti numerati scelti a
+#     caso dal pool (user.500, user.25000) - nessuno dei due era davvero
+#     membro dei gruppi di test referenziati, quindi METRICA 1/2 stavano
+#     misurando ricerche senza corrispondenza reale, non conferme di
+#     appartenenza nota come il nome delle metriche suggeriva.
+#   - Aggiunte VERIFICA 1 e VERIFICA 2: confermano esplicitamente che
+#     l'appartenenza attesa compaia davvero nel risultato, non solo che la
+#     query abbia impiegato un certo tempo - un regressione futura (es. un
+#     cambio ai parametri del generatore che rompesse la garanzia) verrebbe
+#     ora segnalata esplicitamente, non passerebbe inosservata.
+# ==============================================================================
+
+---
+- name: "Validazione Metriche di Tuning e Performance (mfstress-*)"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  vars:
+    suffix: "dc=example,dc=com"
+    # Utenti di TEST DEDICATI (creati da populate_stress_data_memberof_
+    # groupofnames.yml v2.1+), con appartenenza GARANTITA esplicitamente ai
+    # gruppi sotto - non piu' scelti a caso sperando che la formula modulare
+    # del generatore li includa per coincidenza (verificato NON essere il
+    # caso per user.500/user.25000 nella versione precedente di questo file:
+    # ne' l'uno ne' l'altro erano davvero membri dei gruppi referenziati).
+    test_user_1: "uid=mfstress-testuser-small,ou=people,dc=example,dc=com"
+    test_user_1_pw: "mfstress-testuser-small.1"
+    test_user_2: "uid=mfstress-testuser-large,ou=people,dc=example,dc=com"
+    test_user_2_pw: "mfstress-testuser-large.1"
+
+    test_group_small: "cn=mfstress-group.500,ou=groups,{{ suffix }}"
+    test_group_large: "cn=mfstress-architect.1,ou=groups,{{ suffix }}"
+
+  tasks:
+
+    - name: "[SETUP] Verifica presenza del comando 'time'"
+      ansible.builtin.command: which time
+      register: time_bin_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[SETUP] Installa il pacchetto 'time' se assente"
+      ansible.builtin.apt:
+        name: time
+        state: present
+      when: time_bin_check.rc != 0
+
+    - name: "Blocco principale: alza olcSizeLimit temporaneamente, esegui i test, ripristina sempre"
+      block:
+
+        # ---------------------------------------------------------------
+        # 1) LEGGI il valore ATTUALE di olcSizeLimit prima di toccare nulla
+        # ---------------------------------------------------------------
+        - name: "[SIZELIMIT] Leggi il valore attuale di olcSizeLimit"
+          ansible.builtin.command: >
+            ldapsearch -Y EXTERNAL -H ldapi:/// -b "olcDatabase={1}mdb,cn=config"
+            -s base olcSizeLimit
+          register: sizelimit_before
+          changed_when: false
+
+        - name: "[SIZELIMIT] Estrai il valore originale (vuoto se non era impostato)"
+          ansible.builtin.set_fact:
+            original_sizelimit: >-
+              {{ sizelimit_before.stdout_lines
+                 | select('match', '^olcSizeLimit:')
+                 | map('regex_replace', '^olcSizeLimit:\s*', '')
+                 | list
+                 | first | default('', true) }}
+
+        - name: "[SIZELIMIT] Riepilogo valore originale rilevato"
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: olcSizeLimit originale =
+              '{{ original_sizelimit if original_sizelimit != '' else '(non impostato, default compilato)' }}'
+
+        # ---------------------------------------------------------------
+        # 2) ALZA temporaneamente a unlimited
+        # ---------------------------------------------------------------
+        - name: "[SIZELIMIT] Alza temporaneamente olcSizeLimit a unlimited"
+          ansible.builtin.command: >
+            ldapmodify -Y EXTERNAL -H ldapi:///
+          args:
+            stdin: |
+              dn: olcDatabase={1}mdb,cn=config
+              changetype: modify
+              replace: olcSizeLimit
+              olcSizeLimit: unlimited
+          changed_when: true
+
+        # ---------------------------------------------------------------
+        # METRICHE (invariate)
+        # ---------------------------------------------------------------
+        - name: "[METRICA 1] Estrazione diretta dell'attributo memberOf (Verifica indici statici)"
+          ansible.builtin.shell: >
+            time ldapsearch -x -H ldapi:/// -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+            -b "{{ test_user_1 }}" -s base "(objectClass=*)" memberOf
+          args:
+            executable: /bin/bash
+          register: query_1_time
+          changed_when: false
+          no_log: true
+
+        - name: "[VERIFICA 1] L'appartenenza garantita a {{ test_group_small }} deve comparire in memberOf"
+          ansible.builtin.assert:
+            that:
+              - "'memberOf: ' ~ test_group_small in query_1_time.stdout"
+            fail_msg: >-
+              ERRORE: {{ test_user_1 }} non risulta avere {{ test_group_small }} nel proprio
+              memberOf, nonostante sia un'appartenenza garantita esplicitamente dal generatore -
+              dato mancante o memberof non coerente.
+            success_msg: "OK: appartenenza garantita confermata in memberOf."
+
+        - name: "[METRICA 2] Query inversa filtrata su un ruolo da 10.000 membri"
+          ansible.builtin.shell: >
+            time ldapsearch -x -z 0 -H ldapi:/// -D "{{ test_user_2 }}" -w "{{ test_user_2_pw }}"
+            -b "ou=people,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ test_group_large }}))" dn
+          args:
+            executable: /bin/bash
+          register: query_2_time
+          changed_when: false
+          no_log: true
+
+        - name: "[VERIFICA 2] {{ test_user_2 }} deve comparire fra i risultati della ricerca inversa"
+          ansible.builtin.assert:
+            that:
+              - test_user_2 in query_2_time.stdout
+            fail_msg: >-
+              ERRORE: la ricerca inversa su {{ test_group_large }} non ha trovato
+              {{ test_user_2 }}, nonostante sia un'appartenenza garantita esplicitamente dal
+              generatore - la query stava misurando una ricerca a vuoto, non una conferma di
+              appartenenza reale.
+            success_msg: "OK: appartenenza garantita confermata dalla ricerca inversa."
+
+        - name: "[METRICA 3] Estrazione diretta attributo member da un gruppo periferico (10 utenti)"
+          ansible.builtin.shell: >
+            time ldapsearch -x -H ldapi:/// -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+            -b "{{ test_group_small }}" -s base "(objectClass=*)" member
+          args:
+            executable: /bin/bash
+          register: query_3_time
+          changed_when: false
+          no_log: true
+
+        - name: "[METRICA 4] Query inversa filtrata su un gruppo periferico (10 membri)"
+          ansible.builtin.shell: >
+            time ldapsearch -x -H ldapi:/// -D "{{ test_user_1 }}" -w "{{ test_user_1_pw }}"
+            -b "ou=people,{{ suffix }}" -s sub "(&(objectClass=inetOrgPerson)(memberOf={{ test_group_small }}))" dn
+          args:
+            executable: /bin/bash
+          register: query_4_time
+          changed_when: false
+          no_log: true
+
+        - name: "[METRICA 5] Ricerca wildcard su sottoalbero gruppi (cn=mfstress-group.15*, ~1.111 risultati attesi)"
+          ansible.builtin.shell: >
+            time ldapsearch -x -z 0 -H ldapi:/// -D "{{ test_user_2 }}" -w "{{ test_user_2_pw }}"
+            -b "ou=groups,{{ suffix }}" -s sub "(cn=mfstress-group.15*)" dn
+          args:
+            executable: /bin/bash
+          register: query_5_time
+          changed_when: false
+          no_log: true
+
+        - name: "[STABILITÀ] Controllo dello stato di sincronizzazione del cluster (contextCSN)"
+          ansible.builtin.command: >
+            ldapsearch -Y EXTERNAL -H ldapi:/// -b "{{ suffix }}" -s base "(objectClass=*)" contextCSN
+          register: context_csn_res
+          changed_when: false
+
+        - name: "[DIAGNOSTICA] Monitora l'I/O fisico del DB di backend LMDB"
+          ansible.builtin.command: "ls -lh /var/lib/ldap/data.mdb"
+          register: mdb_disk_size
+          changed_when: false
+
+        - name: "[REPORT] Generazione del report di impatto"
+          ansible.builtin.debug:
+            msg:
+              - "=================================================================="
+              - " METRICHE PRESTAZIONALI E COMPORTAMENTO STRUTTURALE MEMBEROF (mfstress-*)"
+              - "=================================================================="
+              - "1. Dimensione reale del database LMDB su disco:"
+              - "{{ mdb_disk_size.stdout }}"
+              - "------------------------------------------------------------------"
+              - "2. Tempo di estrazione diretta di memberOf (Query Base Utente):"
+              - "{{ query_1_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+              - "------------------------------------------------------------------"
+              - "3. Tempo di estrazione diretta dei membri di un gruppo (10 utenti):"
+              - "{{ query_3_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+              - "------------------------------------------------------------------"
+              - "4. Tempo di risoluzione inversa filtrata su ruolo Large (10k utenti):"
+              - "{{ query_2_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+              - "------------------------------------------------------------------"
+              - "5. Tempo di risoluzione inversa filtrata su gruppo Small (10 utenti):"
+              - "{{ query_4_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+              - "------------------------------------------------------------------"
+              - "6. Tempo di ricerca parziale Wildcard su 30.000 gruppi (cn=mfstress-group.15*, ~1.111 risultati):"
+              - "{{ query_5_time.stderr_lines | select('match', '^(real|user|sys)') | list }}"
+              - "------------------------------------------------------------------"
+              - "7. Stato dei contatori di replica (contextCSN) sul nodo {{ inventory_hostname }}:"
+              - "{{ context_csn_res.stdout_lines | select('match', '^contextCSN:') | list }}"
+              - "=================================================================="
+
+      # -------------------------------------------------------------------
+      # 3) RIPRISTINA SEMPRE, anche se una qualunque metrica sopra fallisce
+      # -------------------------------------------------------------------
+      always:
+        - name: "[SIZELIMIT] Ripristina il valore originale (o lo rimuove se non era impostato)"
+          ansible.builtin.command: >
+            ldapmodify -Y EXTERNAL -H ldapi:///
+          args:
+            stdin: |
+              dn: olcDatabase={1}mdb,cn=config
+              changetype: modify
+              {% if original_sizelimit is defined and original_sizelimit != '' %}
+              replace: olcSizeLimit
+              olcSizeLimit: {{ original_sizelimit }}
+              {% else %}
+              delete: olcSizeLimit
+              {% endif %}
+          changed_when: true
+          when: original_sizelimit is defined
+
+        - name: "[SIZELIMIT] Conferma il valore dopo il ripristino"
+          ansible.builtin.command: >
+            ldapsearch -Y EXTERNAL -H ldapi:/// -b "olcDatabase={1}mdb,cn=config"
+            -s base olcSizeLimit
+          register: sizelimit_after
+          changed_when: false
+          when: original_sizelimit is defined
+
+        - name: "[SIZELIMIT] Riepilogo dopo il ripristino"
+          ansible.builtin.debug:
+            msg: >-
+              {{ inventory_hostname }}: olcSizeLimit dopo il ripristino =
+              '{{ sizelimit_after.stdout_lines | select('match', '^olcSizeLimit:') | list
+                 | default(["(non impostato, default compilato - come era in origine)"], true) }}'
+          when: original_sizelimit is defined
