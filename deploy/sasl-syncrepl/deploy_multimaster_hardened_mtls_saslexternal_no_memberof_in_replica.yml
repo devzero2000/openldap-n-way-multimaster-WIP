@@ -2,8 +2,35 @@
 # TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     1.9 (review)
+# VERSIONE:     1.9.1 (review)
 # SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
+#
+# NOVITÀ v1.9.1 rispetto a v1.9 (incoerenza minore, nessun impatto
+# funzionale - trovata analizzando le statistiche di analyze_ldif.py su un
+# export reale, non un problema che impedisse al deploy di funzionare):
+#   - E2/F2a (OU di base), E2/F2b (gruppo amministratori), E2/F2c (identita'
+#     nodo) usavano un objectClass singolo (organizationalUnit/groupOfNames/
+#     applicationProcess) senza "top" esplicito - a differenza di E2/F2b2
+#     (ou=policies) e E2/F2b3 (password policy), che gia' lo includevano
+#     correttamente come lista [top, ...]. Uniformato ai quattro task: ora
+#     tutti includono "top" esplicitamente, per coerenza/igiene dei dati -
+#     OpenLDAP non richiede "top" in modo stretto per queste entry (il
+#     deploy ha sempre funzionato anche senza), ma e' buona pratica averlo.
+#
+# NOTA (indagine chiusa, nessuna modifica applicata): durante il test del
+# dataset ridotto, un test isolato di refint (cancellazione utente, log
+# level stats/args) non mostrava alcuna traccia di refint nel journalctl -
+# ipotesi iniziale: memberof {1} prima di refint {2} nello stack impedisce
+# a refint di scattare sulla cancellazione. Un tentativo di correzione
+# (scambio indici) era stato scritto e provato in v2.0, poi RITRATTATO:
+# dopo un purge completo + redeploy da zero, lo stesso test isolato ha
+# mostrato refint funzionare correttamente con l'ordine ORIGINALE (questo
+# file, invariato). La causa piu' probabile del comportamento anomalo
+# osservato prima era lo stato del cluster in quel momento (un cleanup di
+# un dataset diverso, interrotto a meta' poco prima) - non l'ordine degli
+# overlay. Nessuna causa definitiva identificata con certezza, ma l'ordine
+# memberof/refint originale (questo file) e' confermato funzionante su
+# ambiente pulito - si resta su questa configurazione.
 #
 # NOVITÀ v1.9 rispetto a v1.8 (Relax Control - grazie a un suggerimento
 # esterno verificato con ricerca mirata, non preso per buono a scatola
@@ -638,7 +665,9 @@
         server_uri: "ldapi:///"
         sasl_class: "external"
         dn: "ou={{ item }},{{ ldap_basedn }}"
-        objectClass: organizationalUnit
+        objectClass:
+          - top
+          - organizationalUnit
         attributes:
           ou: "{{ item }}"
         state: present
@@ -654,7 +683,9 @@
         server_uri: "ldapi:///"
         sasl_class: "external"
         dn: "{{ ldap_admin_group }}"
-        objectClass: groupOfNames
+        objectClass:
+          - top
+          - groupOfNames
         attributes:
           cn: "administrators"
           member: "cn=admin,{{ ldap_basedn }}"
@@ -711,7 +742,9 @@
         server_uri: "ldapi:///"
         sasl_class: "external"
         dn: "cn={{ item }},ou=system,{{ ldap_basedn }}"
-        objectClass: applicationProcess
+        objectClass:
+          - top
+          - applicationProcess
         attributes:
           cn: "{{ item }}"
         state: present
@@ -843,7 +876,7 @@
           olcMemberOfMemberOfAD: "memberOf"
           olcMemberOfDN: "cn=admin,{{ ldap_basedn }}"
           # olcMemberOfRefInt FALSE: la pulizia di member/uniqueMember alla
-          # cancellazione di un'entry e' delegata all'overlay refint {1}
+          # cancellazione di un'entry e' delegata all'overlay refint {2}
           # sottostante, per evitare che due meccanismi scrivano sullo
           # stesso attributo con logiche diverse.
           olcMemberOfAddCheck: "TRUE"
@@ -853,7 +886,7 @@
 
     # --------------------------------------------------------------------
     # REFINT (referential integrity su member/uniqueMember/manager/owner,
-    # NON su memberOf) - istanza {1}
+    # NON su memberOf) - istanza {2}
     # --------------------------------------------------------------------
 
     - name: "[REFINT] Carica il modulo globale refint"
@@ -876,7 +909,7 @@
         attributes:
           olcOverlay: "{2}refint"
           # Volutamente NON includere memberOf qui: e' gestito solo da
-          # memberof (overlay {0} sopra).
+          # memberof (overlay {1} sopra).
           olcRefintAttribute:
             - "member"
             - "uniqueMember"
