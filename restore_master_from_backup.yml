@@ -2,11 +2,40 @@
 # TITOLO:       Ripristino Completo del Cluster via slapadd (tutti i nodi)
 # AUTORE:       Elia Pinto
 # DATA:         Settembre 2026
-# VERSIONE:     3.0 (consolidamento: slapadd ovunque, non piu' solo sui master)
+# VERSIONE:     3.1 (slapadd -q, verificato: 42min -> 10s a parita' di risultato)
 # SCOPO:        Ferma TUTTI i nodi (master + read-only), backup di sicurezza
 #               su un solo nodo di riferimento, svuota /var/lib/ldap OVUNQUE,
 #               carica lo STESSO LDIF indipendentemente su OGNI nodo via
 #               slapadd (in parallelo), riavvia tutti, verifica.
+#
+# NOVITÀ v3.1 rispetto a v3.0 (verificata con un test diretto e cronometrato,
+# non un'ipotesi - vedi sessione di lavoro per il dettaglio completo):
+#   - slapadd ora gira con -q (quick mode). SENZA -q, lo stesso identico
+#     dataset di riferimento (38029 entry, ~700000 valori member:) impiegava
+#     42m25s reali (misurato con "time" attorno all'intero playbook,
+#     16%CPU medio - quasi tutto attesa I/O, non calcolo: confermava che il
+#     costo era le garanzie sincrone di scrittura, non l'overlay memberof,
+#     che slapadd bypassa comunque sempre). CON -q, 10 secondi - poi
+#     verificato con analyze_ldif.py: stesso conteggio esatto di entry/
+#     utenti/gruppi, zero disallineamenti memberOf/member, nessuna
+#     differenza rilevabile rispetto al caricamento senza -q.
+#   - IL COMPROMESSO, DOCUMENTATO ESPLICITAMENTE (dalla documentazione
+#     ufficiale slapadd/una segnalazione diretta di uno sviluppatore
+#     OpenLDAP): -q disattiva il journaling/le garanzie transazionali
+#     durante la scrittura - se il caricamento venisse interrotto a meta'
+#     (Ctrl+C, crash, riavvio, perdita di SSH), il risultato NON e' un
+#     database parzialmente caricato da completare, e' un database
+#     CORROTTO da buttare e ricaricare da zero. Aggiunti due avvisi
+#     espliciti a video (nel riepilogo iniziale [GUARDIA] e subito prima
+#     del lancio di slapadd) che ricordano di non interrompere.
+#   - Aggiunto un "sync" esplicito subito dopo il completamento di slapadd,
+#     prima di proseguire: con -q le scritture possono restare nella cache
+#     di pagina del kernel senza essere ancora fisicamente su disco quando
+#     slapadd ritorna (parte di come ottiene la velocita') - un sync
+#     esplicito chiude quella finestra di rischio residua prima di
+#     considerare il caricamento davvero concluso.
+#   - Resta valida la rete di sicurezza gia' presente: il backup automatico
+#     di /var/lib/ldap pre-wipe, su cui tornare in caso di problemi.
 #
 # NOVITÀ v3.0 rispetto a v2.1 (cambio di disegno deliberato, non solo di
 # codice): le versioni precedenti caricavano solo i master via slapadd,
@@ -142,6 +171,9 @@
           - "LDIF di backup: {{ backup_file }} ({{ expected_entry_count }} entry attese)"
           - "Backup di sicurezza pre-wipe (un solo nodo): {{ reference_node }}"
           - "Campione DN per verifica puntuale: {{ sample_dns | length }}"
+          - "ATTENZIONE: slapadd gira in modalita' -q (quick, molto piu' veloce ma"
+          - "non recuperabile se interrotto) - una volta partito il caricamento,"
+          - "NON interrompere questo playbook fino al completamento."
       run_once: true
 
     # ==========================================================================
@@ -231,10 +263,49 @@
       loop: "{{ all_nodes }}"
       run_once: true
 
+    - name: "[CARICAMENTO] ATTENZIONE - avviso prima di procedere: da qui in poi NON interrompere"
+      # -q (quick mode) disattiva il journaling/le garanzie transazionali
+      # durante la scrittura - e' quello che rende slapadd cosi' piu'
+      # veloce (verificato: 42 minuti -> 10 secondi su un dataset di
+      # 38029 entry/~700000 valori member:, risultato identico verificato
+      # con analyze_ldif.py, zero differenze). Ma il prezzo e' esplicito
+      # nella documentazione ufficiale: "if any errors or interruptions
+      # occur, the resulting database will be unusable" - un'interruzione
+      # a meta' (Ctrl+C, crash, riavvio della VM, perdita di connessione
+      # SSH) non lascia un database parzialmente caricato da completare,
+      # lascia un database CORROTTO da buttare e ricaricare da zero.
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " ATTENZIONE: slapadd gira in modalita' -q (quick mode)."
+          - " NON interrompere questo playbook da qui in poi (niente Ctrl+C,"
+          - " niente disconnessioni SSH volontarie, niente riavvii)."
+          - " Se l'operazione venisse interrotta a meta', il database sui nodi"
+          - " coinvolti risulterebbe CORROTTO E NON RECUPERABILE - andrebbe"
+          - " ripristinato dal backup automatico (.bak-{{ backup_timestamp }})"
+          - " e ricaricato da capo, non solo completato."
+          - "=================================================================="
+      run_once: true
+
     - name: "[CARICAMENTO] Lancia slapadd IN PARALLELO su ciascun nodo (async, non aspetta qui)"
       # -F punta alla cn=config LOCALE di ciascun nodo: essenziale per il
       # serverID corretto nell'entryCSN generato per quel nodo specifico.
       # -b disambigua esplicitamente il database di destinazione.
+      #
+      # -q (quick mode): vedi l'avviso esplicito nel task precedente per il
+      # compromesso - qui il motivo della scelta. Verificato con un
+      # confronto diretto, stesso identico dataset (38029 entry, ~700000
+      # valori member:): SENZA -q, 42m25s reali (measured con "time" attorno
+      # all'intero playbook, 16%CPU medio - il tempo era quasi tutto attesa
+      # I/O, non calcolo, confermando che il costo era proprio quello delle
+      # garanzie sincrone di scrittura). CON -q, 10 secondi, poi verificato
+      # con analyze_ldif.py: stesso conteggio esatto di entry/utenti/gruppi,
+      # zero disallineamenti memberOf/member, zero differenze rilevabili
+      # rispetto al caricamento senza -q. Dato il forte guadagno e la
+      # verifica di correttezza gia' fatta, il compromesso (fragilita' a
+      # un'interruzione) e' stato giudicato accettabile per questo caso
+      # d'uso - il backup automatico pre-wipe resta la rete di sicurezza in
+      # caso qualcosa vada comunque storto.
       #
       # async/poll:0: il loop lancia gli slapadd uno dopo l'altro, ma
       # poll:0 fa si' che ciascun lancio ritorni quasi subito (senza
@@ -245,7 +316,7 @@
       # di caricamento di ciascuno. Gli slapadd girano poi VERAMENTE in
       # parallelo su tutti i nodi.
       ansible.builtin.command: >
-        slapadd -v -F /etc/ldap/slapd.d -b "{{ suffix }}" -l /tmp/restore.ldif
+        slapadd -q -v -F /etc/ldap/slapd.d -b "{{ suffix }}" -l /tmp/restore.ldif
       async: 3600
       poll: 0
       register: slapadd_async_jobs
@@ -289,6 +360,21 @@
       loop_control:
         label: "{{ item.item }}"
       run_once: true
+
+    - name: "[CARICAMENTO] Forza le scritture di slapadd -q dalla cache di pagina al disco fisico (sync)"
+      # Con -q le scritture possono restare nella cache di pagina del
+      # kernel senza essere ancora fisicamente su disco quando slapadd
+      # ritorna (e' parte di come ottiene la velocita') - un sync esplicito
+      # qui chiude la finestra di rischio prima di proseguire: da questo
+      # punto in poi i dati sono davvero durevoli, non solo visibili a chi
+      # legge dalla stessa cache (es. uno slapcat immediatamente successivo
+      # li mostrerebbe comunque corretti anche PRIMA del sync, dato che
+      # legge dalla stessa cache - non e' una prova di durabilita' su disco).
+      ansible.builtin.command: sync
+      delegate_to: "{{ item }}"
+      loop: "{{ all_nodes }}"
+      run_once: true
+      changed_when: false
 
     - name: "[CARICAMENTO] Rimuove l'LDIF temporaneo da ciascun nodo"
       ansible.builtin.file:
