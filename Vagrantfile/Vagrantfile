@@ -28,6 +28,40 @@ Vagrant.configure("2") do |config|
       # Provisioning iniziale (eseguito solo alla prima creazione)
       node.vm.provision "shell", inline: <<-SHELL
         export DEBIAN_FRONTEND=noninteractive
+
+        # --- FIX IPv6 / mirror APT (diagnosticato in sessione di lavoro,
+        # settembre 2026): il router di casa non fornisce IPv6 (ne' RA ne'
+        # DHCPv6 rispondono - verificato fino in fondo alla catena: Windows
+        # configurato correttamente, VMware con IPv6 abilitato, router muto).
+        # Senza questo fix, qualunque comando apt che risolva un host con
+        # record AAAA (com'era us.archive.ubuntu.com/security.ubuntu.com di
+        # default) resta bloccato fino al timeout prima di ripiegare su
+        # IPv4 - capitato concretamente gia' su questo stesso apt-get update
+        # qui sotto, alla primissima creazione della VM. Applicato PRIMA di
+        # qualunque altra cosa, cosi' anche questo primo apt-get ne
+        # beneficia, non solo i provisioning successivi.
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1
+        sysctl -w net.ipv6.conf.default.disable_ipv6=1
+        cat << 'EOF' > /etc/sysctl.d/99-disable-ipv6.conf
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+
+        cat << 'EOF' > /etc/apt/sources.list.d/ubuntu.sources
+Types: deb
+URIs: http://ubuntu.mirror.garr.it/ubuntu-archive/
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://ubuntu.mirror.garr.it/ubuntu-archive/
+Suites: noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+        # --- fine fix IPv6 / mirror APT ---
+
         timedatectl set-timezone Europe/Rome
         timedatectl set-ntp true
         systemctl restart systemd-timesyncd
