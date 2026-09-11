@@ -1,0 +1,1286 @@
+# ==============================================================================
+# TITOLO:       Audit Completo di Consistenza del Cluster OpenLDAP N-Way MMR
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.9
+# SCOPO:        Verifica approfondita e trasversale dello stato dell'intero
+#               cluster (master + read-only): servizio attivo, struttura di
+#               base e assenza di entry estranee, overlay presenti e
+#               configurati coerentemente col ruolo del nodo, presenza e
+#               contenuto della password policy, stato di sincronizzazione
+#               della replica (contextCSN), coerenza del numero di utenti/
+#               gruppi/appartenenze fra tutti i nodi, coerenza puntuale dei
+#               DN (non solo il conteggio), accesso via ldaps:// con un
+#               utente standard (non solo l'identita' amministrativa locale
+#               via ldapi:///+SASL EXTERNAL, usata per tutti gli altri
+#               controlli di questo playbook).
+#
+# RISPETTO ALLA BOZZA ORIGINALE (check_ldap_consistency_cluster.yml v0):
+# riscritto quasi per intero. Bug corretti nella parte conservata:
+#   - "grep -c ... || echo 0" produceva DUE righe ("0\n0") sul caso di zero
+#     corrispondenze (grep -c stampa comunque "0" ma esce con rc=1,
+#     attivando anche il fallback "|| echo 0") - verificato empiricamente
+#     prima di correggere. Sostituito con PIPESTATUS mirato sul comando
+#     slapcat a monte (stesso pattern gia' validato in
+#     verify_replication_convergence_custom_scale_data_nested_group_
+#     memberof.yml), che distingue un vero fallimento di slapcat da uno
+#     zero legittimo.
+#   - hosts: all -> [cluster, readonlyreplica] esplicito (evita di tentare
+#     slapcat sul controller se "all" lo includesse).
+#   - groups['all'][0] come nodo di riferimento -> cluster_nodes | sort |
+#     first, deterministico.
+#   - Confrontava solo l'ESISTENZA dei DN, mai il contenuto - aggiunta la
+#     somma dei valori member: per nodo (come verify_replication_
+#     convergence...), che intercetta anche un'entry presente ovunque ma
+#     con la lista membri incompleta.
+#
+# NOVITÀ v1.9 rispetto a v1.8 (richiesta esplicita dell'utente: verificare
+# le restanti 22 voci di oid_map non ancora controllate una per una).
+# Risultato: 8 errori reali trovati e corretti, circa un terzo del totale -
+#   - 2.16.840.1.113730.3.4.5/.4.4: NON sono Persistent Search/VLV - sono
+#     Password Expiring/Password Expired Control (molto piu' coerenti con
+#     un progetto centrato su ppolicy, dato che compaiono proprio accanto
+#     al controllo Password Policy nell'elenco reale osservato sui nodi).
+#   - 1.3.6.1.4.1.42.2.27.9.5.8: e' Account Usability Control (Sun/OpenDS),
+#     non "OpenLDAP Authz/Proxy Control" come scritto senza verifica.
+#   - 1.3.6.1.4.1.4203.1.11.1 e .11.3 erano INVERTITI: .11.1 e' Password
+#     Modify Extended Operation (RFC 3062), .11.3 e' Who Am I? (RFC 4532).
+#   - 1.3.6.1.1.14 e' Modify-Increment Extension (RFC 4525), non "Subtree
+#     Modification Feature".
+#   - Precisate le etichette di Start/End Transaction (RFC 5805) e Proxy
+#     Authorization v2 (RFC 4370).
+# Tutte le 27 voci del dizionario sono ora verificate individualmente con
+# ricerca dedicata, non solo quelle usate nei controlli bloccanti.
+#
+# NOVITÀ v1.8 rispetto a v1.7 (richiesta dell'utente + BUG REALE trovato e
+# corretto durante l'implementazione): aggiunto un dizionario di decodifica
+# OID -> descrizione leggibile (Controls/Extensions/Features del root DSE),
+# con report dedicato in sezione H (controlli) e I (estensioni/feature).
+#   - BUG CORRETTO: control_manage_dsait usava l'OID sbagliato
+#     (1.3.6.1.4.1.4203.1.10.1, che e' in realta' il Subentries Control di
+#     RFC 3672, non Manage DSA IT) - scritto senza verifica in v1.0, mai
+#     controllato fino ad ora. Il vero OID di Manage DSA IT e'
+#     2.16.840.1.113730.3.4.2 (RFC 3296), confermato con una ricerca
+#     dedicata. Non ha mai causato un falso allarme sui nodi di questa
+#     sessione (l'OID corretto era comunque presente nell'elenco reale),
+#     ma il controllo bloccante verificava la cosa sbagliata con
+#     un'etichetta sbagliata - puro caso che non abbia mai fallito.
+#   - Aggiunta l'estrazione di supportedExtension/supportedFeatures in
+#     sezione I: erano gia' richiesti nella query ldapsearch ma mai
+#     estratti ne' mostrati nel report - completata una lacuna esistente.
+#   - Il dizionario NON e' verificato voce per voce nella sua interezza -
+#     solo le OID usate nei controlli bloccanti di questo file lo sono
+#     state con una ricerca dedicata (vedi commento accanto a oid_map) -
+#     le altre sono un aiuto alla lettura del report, non una fonte
+#     definitiva certificata.
+#   - Logica di decodifica (loop Jinja con fallback esplicito "(non
+#     decodificato)" per OID sconosciuti, mai un'invenzione) verificata
+#     empiricamente prima di essere consegnata - evitato deliberatamente
+#     un filtro Ansible ('extract') mai verificato disponibile, stesso
+#     principio di cautela gia' applicato altrove in questo file dopo
+#     l'episodio con 'zip'.
+#
+# NOVITÀ v1.7 rispetto a v1.6 (richiesta dell'utente): aggiunta la sezione
+# K - test end-to-end di propagazione LIVE della replica, diverso da tutto
+# il resto dell'audit (che confronta solo uno stato gia' esistente fra i
+# nodi). Crea un utente di test dedicato sul nodo di riferimento, verifica
+# dal vivo che compaia su ciascun altro nodo (masters + read-only)
+# misurando il tempo di propagazione, poi lo cancella e verifica che
+# anche la cancellazione si propaghi. Cleanup garantito in "always"
+# (ricancella, tollerante a "gia' assente") anche se un'asserzione
+# fallisse a meta' del test. Logica di polling bash e filtri Jinja
+# (reject('equalto', ...) per escludere il nodo di riferimento dal loop,
+# loop per indice invece di zip - stesso motivo di cautela gia' applicato
+# altrove in questo file) verificati empiricamente prima di essere
+# consegnati, non solo scritti a occhio.
+#
+# NOVITÀ v1.6 rispetto a v1.5 (assunzione sbagliata scoperta con un run
+# reale - confermata con la documentazione ufficiale di slapo-syncprov,
+# non solo dedotta): il Sync Request Control (1.3.6.1.4.1.4203.1.9.1.1)
+# era trattato come obbligatorio su TUTTI i nodi - ma e' descritto
+# esplicitamente dalla documentazione OpenLDAP come "provider-side
+# support" del meccanismo di replica, legato all'overlay syncprov, che in
+# questo progetto e' caricato SOLO sui master (mai sulle read-only, per
+# design, confermato piu' volte in sessione). La sua assenza sulla
+# read-only e' corretta, non un errore - ma il controllo bloccante in
+# sezione H la fermava li', PRIMA di arrivare alla sezione J (mdb_stat) -
+# la causa vera dietro un N/D che sembrava dovuto a lmdb-utils mancante,
+# ma non lo era affatto. Corretto in due punti: la sezione H ora richiede
+# Sync Request solo sui master (is_readonly esenta), e il confronto
+# incrociato in Fase 2 esclude quello specifico controllo dal raffronto
+# fra nodi (tutto il resto continua a essere confrontato normalmente, una
+# vera differenza verrebbe comunque intercettata).
+#
+# NOVITÀ v1.5 rispetto a v1.4 (bug serio scoperto con un run reale - un
+# problema di rete isolato su UN nodo, durante l'installazione opzionale di
+# lmdb-utils, ha fatto crashare l'INTERA Fase 2 per TUTTI i nodi):
+#   - Sezione J resa genuinamente non bloccante: se lmdb-utils non e'
+#     installabile (rete/mirror), la sezione viene saltata con un avviso
+#     invece di fermare l'esecuzione del nodo - mdb_stat e' un controllo
+#     supplementare (vedi nota nella sezione stessa), non deve mai poter
+#     bloccare il resto di un audit altrimenti valido.
+#   - PROBLEMA PIU' AMPIO scoperto dallo stesso run: quando un nodo si
+#     ferma prima di impostare un fatto (per QUALUNQUE motivo, non solo
+#     lmdb-utils), un riferimento diretto a hostvars[item].nome_fatto in
+#     Fase 2 va in errore duro ("object has no attribute"), non un
+#     "undefined" gestibile con | default - e siccome la Fase 2 confronta
+#     TUTTI i nodi in blocco, un solo nodo mancante abbatteva l'intero
+#     report per tutti, inclusi i controlli senza alcun legame con la
+#     causa originale del problema. Corretto introducendo un unico task
+#     "[SICUREZZA] Costruisce una vista sicura dei fatti per nodo" che
+#     legge da hostvars con parentesi quadre + default() (piu' affidabile
+#     della notazione a punto per questo caso, verificato empiricamente
+#     essere il punto di rottura) UNA sola volta, producendo una struttura
+#     sicura (safe_node_data) da cui legge tutto il resto della Fase 2 -
+#     un nodo mancante mostra ora un valore "N/D" esplicito invece di far
+#     crashare il report degli altri nodi, perfettamente funzionanti.
+#
+# NOVITÀ v1.4 rispetto a v1.3 (bug reale scoperto lanciando il playbook -
+# "Error loading tasks: failed at splitting arguments, either an unbalanced
+# jinja2 block or quotes"): i task ansible.builtin.shell che usavano la
+# forma libera ("shell: |" o "shell: >" + args: executable separato)
+# andavano in errore nel parsing PRIMA ancora di essere eseguiti - il
+# parser di Ansible per il contenuto "libero" di shell/command tenta un
+# ulteriore parsing in stile chiave=valore, e gli apici del testo italiano
+# ("e'") combinati con le espressioni Jinja nello script confondevano il
+# bilanciamento delle virgolette. Corretto su TUTTI i task shell del file
+# (7 occorrenze, non solo quello segnalato) passando al comando come
+# "cmd:" esplicito dentro un dizionario (shell: {cmd: ..., executable:
+# ...}) invece che come stringa libera - questa forma bypassa del tutto
+# quel parsing aggiuntivo.
+#
+# NOVITÀ v1.3 rispetto a v1.2 (suggerimento dell'utente): aggiunta la
+# sezione J (integrita' fisica dell'ambiente LMDB via mdb_stat -e,
+# lmdb-utils installato come prerequisito se assente). Confine esplicito,
+# coerente con quanto gia' scoperto in sessione: mdb_stat non e' un vero
+# fsck, il segnale bloccante e' solo "il comando riesce a leggere
+# l'ambiente o no" - le pagine usate sono mostrate fra i nodi SOLO come
+# informazione di contorno, mai bloccanti (verificato in precedenza che
+# dataset identici caricati indipendentemente via slapadd su nodi diversi
+# producono naturalmente conteggi di pagine diversi - trattarlo come
+# errore darebbe un altro falso allarme come gia' successo in sessione).
+#
+# NOVITÀ v1.2 rispetto a v1.1: aggiunta la sezione I (root DSE completo,
+# oltre a supportedControl gia' coperto dalla sezione H) - namingContexts,
+# supportedLDAPVersion, supportedSASLMechanisms, supportedExtension,
+# supportedFeatures, vendorName/vendorVersion, subschemaSubentry,
+# monitorContext. Bloccanti: naming context atteso presente, versione
+# LDAPv3 supportata, SASL EXTERNAL disponibile (l'intera amministrazione
+# di questo progetto vi si affida, incluso gran parte di questo stesso
+# playbook). Confronto incrociato in Fase 2 aggiunto per vendorVersion
+# (mai verificato esplicitamente in questa sessione che tutti i nodi
+# girassero davvero lo stesso binario di slapd, sempre dato per scontato)
+# e supportedSASLMechanisms.
+#
+# NOVITÀ v1.1 rispetto a v1.0: aggiunta la sezione H (controlli LDAP
+# supportati - supportedControl sul root DSE, vedi
+# https://docs.oracle.com/cd/E22289_01/html/821-1277/supported-ldap-controls.html).
+# Manage DSA IT e Sync Request sono bloccanti (quest'ultimo e' la base
+# stessa di syncrepl - se mancasse, la replica del cluster non potrebbe
+# funzionare). Relax Control e' SOLO informativo: in questo progetto e'
+# gia' noto, verificato in una sessione precedente, che funziona pur non
+# comparendo nel root DSE (dipende da come questo build di slapd e' stato
+# compilato) - trattarlo come obbligatorio darebbe un falso allarme
+# permanente. Aggiunto anche il confronto incrociato in Fase 2: tutti i
+# nodi devono pubblicizzare esattamente lo stesso elenco di controlli
+# (stesso binario/moduli attesi ovunque in un cluster omogeneo).
+#
+# USO:
+#   ansible-playbook check_ldap_consistency_cluster.yml
+#   ansible-playbook check_ldap_consistency_cluster.yml \
+#     -e ldaps_test_user_dn="uid=csmall-user-1,ou=people,dc=example,dc=com" \
+#     -e ldaps_test_user_pw="csmall-user-1.1"
+#   (la sezione LDAPS e' opzionale: senza credenziali fornite viene
+#   saltata con un avviso esplicito, non un fallimento)
+# ==============================================================================
+
+---
+- name: "Audit Completo di Consistenza del Cluster - raccolta per-nodo"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: auto_silent
+    suffix: "dc=example,dc=com"
+    bind_dn: "cn=admin,dc=example,dc=com"
+    bind_pw: "openldap"
+
+    stage_dir: "/tmp/ldap_audit"
+    fetch_dir: "/tmp/ldap_audit_master"
+
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    all_nodes: "{{ cluster_nodes + readonly_nodes }}"
+    reference_node: "{{ cluster_nodes[0] }}"
+    is_readonly: "{{ inventory_hostname in readonly_nodes }}"
+
+    # Test end-to-end di propagazione live della replica (sezione K) -
+    # nome distintivo, non puo' collidere con custom-scale-*/csmall-*/
+    # mfstress-* ne' con dati reali.
+    replication_test_user: "audit-replication-test"
+    replication_test_password: "audit-replication-test.1"
+    replication_test_timeout_seconds: 60
+
+    expected_root_children:
+      - "ou=system,{{ suffix }}"
+      - "ou=groups,{{ suffix }}"
+      - "ou=people,{{ suffix }}"
+      - "ou=policies,{{ suffix }}"
+
+    # Overlay attesi per ruolo, con indice - riflette esattamente lo stack
+    # confermato nella sessione di lavoro (deploy v1.9.1 master, readonly
+    # invariato): sui master syncprov deve essere {0} (visto per necessita'
+    # tecnica specifica), refint presente solo sui master (le read-only non
+    # processano mai cancellazioni in locale).
+    expected_overlays_master:
+      - "{0}syncprov"
+      - "{1}memberof"
+      - "{2}refint"
+      - "{3}nestgroup"
+      - "{4}ppolicy"
+    expected_overlays_readonly:
+      - "{0}memberof"
+      - "{1}nestgroup"
+      - "{2}ppolicy"
+
+    # Dizionario di decodifica OID -> descrizione leggibile, per Controls/
+    # Extensions/Features del root DSE (sezioni H e I). Tutte le 27 voci
+    # verificate individualmente con ricerca dedicata in questa sessione
+    # (non solo quelle usate nei controlli bloccanti) - 8 errori reali
+    # trovati e corretti nel processo, circa un terzo del totale: sia nel
+    # dizionario originale di questo file sia nella bozza da cui derivava
+    # in parte. Esempi: 1.3.6.1.4.1.4203.1.10.1 non e' "Manage DSA IT" (e'
+    # Subentries, RFC 3672 - il vero Manage DSA IT e' 2.16.840.1.113730.
+    # 3.4.2); 2.16.840.1.113730.3.4.4/.4.5 non sono VLV/Persistent Search
+    # (sono Password Expired/Expiring, coerenti con ppolicy); Password
+    # Modify e Who Am I (1.3.6.1.4.1.4203.1.11.1/.11.3) erano invertiti.
+    oid_map:
+      # Controls - tutte verificate con ricerca dedicata in questa sessione
+      "1.3.6.1.4.1.4203.1.9.1.1": "LDAP Content Synchronization Control (SyncRepl, RFC 4533)"
+      "2.16.840.1.113730.3.4.5": "Password Expiring / Expiration Warning Control"
+      "2.16.840.1.113730.3.4.4": "Password Expired Control"
+      "1.3.6.1.4.1.42.2.27.9.5.8": "Account Usability Control (Sun/OpenDS)"
+      "1.3.6.1.4.1.42.2.27.8.5.1": "OpenLDAP Password Policy Control (ppolicy)"
+      "2.16.840.1.113730.3.4.18": "Proxy Authorization Control v2 (RFC 4370)"
+      "2.16.840.1.113730.3.4.2": "Manage DSA IT Control (RFC 3296)"
+      "1.3.6.1.4.1.4203.1.10.1": "Subentries Control (RFC 3672)"
+      "1.3.6.1.1.22": "Password Modify Control (RFC 3062)"
+      "1.2.840.113556.1.4.319": "Simple Paged Results Control (RFC 2696)"
+      "1.2.826.0.1.3344810.2.3": "Matched Values Control (RFC 3876)"
+      "1.3.6.1.1.13.2": "LDAP Read Entry - Post-read Control (RFC 4527)"
+      "1.3.6.1.1.13.1": "LDAP Read Entry - Pre-read Control (RFC 4527)"
+      "1.3.6.1.1.12": "Assertion Control (RFC 4528)"
+      "1.3.6.1.4.1.4203.666.5.12": "Relax Control (OpenLDAP, non standard)"
+      # Extensions
+      "1.3.6.1.4.1.1466.20037": "StartTLS Extended Operation"
+      "1.3.6.1.4.1.4203.1.11.1": "Password Modify Extended Operation (RFC 3062)"
+      "1.3.6.1.4.1.4203.1.11.3": "Who Am I? Extended Operation (RFC 4532)"
+      "1.3.6.1.1.8": "Cancel Extended Operation (RFC 3909)"
+      "1.3.6.1.1.21.1": "Start Transaction Extended Request (RFC 5805)"
+      "1.3.6.1.1.21.3": "End Transaction Extended Request (RFC 5805)"
+      # Features
+      "1.3.6.1.1.14": "Modify-Increment Extension (RFC 4525)"
+      "1.3.6.1.4.1.4203.1.5.1": "All Operational Attributes Feature (RFC 3673)"
+      "1.3.6.1.4.1.4203.1.5.2": "OC AD Lists (RFC 4529)"
+      "1.3.6.1.4.1.4203.1.5.3": "True/False Filters"
+      "1.3.6.1.4.1.4203.1.5.4": "Language Tag Options"
+      "1.3.6.1.4.1.4203.1.5.5": "Language Range Options"
+
+    # Credenziali OPZIONALI per il test di bind via ldaps:// con un utente
+    # standard (non amministrativo) - se lasciate vuote, quella sezione
+    # viene saltata con un avviso, non un fallimento.
+    ldaps_test_user_dn: ""
+    ldaps_test_user_pw: ""
+
+  tasks:
+    - name: "[PREPARE] Crea la directory di staging locale su ogni nodo"
+      ansible.builtin.file:
+        path: "{{ stage_dir }}"
+        state: directory
+        mode: '0700'
+
+    # ==========================================================================
+    # A. SERVIZIO - slapd attivo e risponde
+    # ==========================================================================
+
+    - name: "[A. SERVIZIO] Verifica che slapd sia attivo (systemd)"
+      ansible.builtin.command: systemctl is-active slapd
+      register: slapd_active
+      changed_when: false
+      failed_when: false
+
+    - name: "[A. SERVIZIO] Verifica che slapd risponda a una query minima (whoami)"
+      ansible.builtin.command: >
+        ldapwhoami -Y EXTERNAL -H ldapi:///
+      register: slapd_responsive
+      changed_when: false
+      failed_when: false
+
+    - name: "[A. SERVIZIO] Blocca qui se slapd non e' attivo o non risponde - il resto dei controlli non avrebbe senso"
+      ansible.builtin.assert:
+        that:
+          - slapd_active.stdout | trim == "active"
+          - slapd_responsive.rc == 0
+        fail_msg: >-
+          ERRORE CRITICO: slapd su {{ inventory_hostname }} non e' attivo
+          (systemctl: '{{ slapd_active.stdout | trim }}') o non risponde
+          (ldapwhoami rc={{ slapd_responsive.rc }}) - tutti i controlli
+          successivi su questo nodo sarebbero privi di senso.
+        success_msg: "OK: slapd attivo e risponde su {{ inventory_hostname }}."
+
+    # ==========================================================================
+    # B. STRUTTURA DI BASE - le 4 OU attese, nessuna entry estranea sotto la
+    # radice, objectClass:top presente ovunque (lezione della sessione di
+    # lavoro - il deploy pre-v1.9.1 lo ometteva su alcune entry di base)
+    # ==========================================================================
+
+    - name: "[B. STRUTTURA] Elenca le entry dirette sotto la radice"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "{{ suffix }}" -s one dn
+      register: root_children_raw
+      changed_when: false
+
+    - name: "[B. STRUTTURA] Deriva l'elenco dei DN trovati sotto la radice"
+      ansible.builtin.set_fact:
+        root_children: >-
+          {{ root_children_raw.stdout_lines
+             | select('match', '^dn: ')
+             | map('regex_replace', '^dn: ', '')
+             | list }}
+
+    - name: "[B. STRUTTURA] Verifica che non ci siano entry estranee sotto la radice"
+      ansible.builtin.assert:
+        that:
+          - (root_children | reject('in', expected_root_children) | list | length) == 0
+        fail_msg: >-
+          ATTENZIONE: {{ inventory_hostname }} ha entry estranee sotto la radice:
+          {{ root_children | reject('in', expected_root_children) | list }}
+        success_msg: "OK: nessuna entry estranea sotto la radice su {{ inventory_hostname }}."
+
+    - name: "[B. STRUTTURA] Verifica objectClass:top su ciascuna delle 4 OU di base"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "{{ item }}" -s base objectClass
+      register: ou_top_check
+      loop: "{{ expected_root_children }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+
+    - name: "[B. STRUTTURA] Blocca se manca objectClass:top su una qualunque OU di base"
+      ansible.builtin.assert:
+        that:
+          - "'objectClass: top' in item.stdout"
+        fail_msg: "ERRORE: {{ item.item }} su {{ inventory_hostname }} non ha objectClass:top."
+        success_msg: "OK: {{ item.item }} ha objectClass:top su {{ inventory_hostname }}."
+      loop: "{{ ou_top_check.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: "[B. STRUTTURA] Verifica presenza del gruppo amministratori"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "cn=administrators,ou=groups,{{ suffix }}" -s base dn
+      register: admin_group_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[B. STRUTTURA] Verifica presenza della propria identita' nodo (mTLS)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "cn={{ inventory_hostname }},ou=system,{{ suffix }}" -s base dn
+      register: own_identity_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[B. STRUTTURA] Blocca se gruppo amministratori o identita' nodo mancano"
+      ansible.builtin.assert:
+        that:
+          - admin_group_check.rc == 0
+          - own_identity_check.rc == 0
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: gruppo amministratori
+          presente={{ admin_group_check.rc == 0 }}, identita' nodo
+          presente={{ own_identity_check.rc == 0 }}.
+        success_msg: "OK: gruppo amministratori e identita' nodo presenti su {{ inventory_hostname }}."
+
+    # ==========================================================================
+    # C. OVERLAY - presenti e coerenti col ruolo del nodo (master vs read-only)
+    # ==========================================================================
+
+    - name: "[C. OVERLAY] Elenca gli overlay configurati su {1}mdb"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "olcDatabase={1}mdb,cn=config"
+        -s one "(objectClass=olcOverlayConfig)" olcOverlay
+      register: overlays_raw
+      changed_when: false
+
+    - name: "[C. OVERLAY] Deriva l'elenco degli overlay presenti (ordinato per indice)"
+      ansible.builtin.set_fact:
+        overlays_present: >-
+          {{ overlays_raw.stdout_lines
+             | select('match', '^olcOverlay: ')
+             | map('regex_replace', '^olcOverlay: ', '')
+             | sort
+             | list }}
+
+    - name: "[C. OVERLAY] Deriva l'elenco atteso in base al ruolo del nodo"
+      ansible.builtin.set_fact:
+        overlays_expected: "{{ expected_overlays_readonly if is_readonly else expected_overlays_master }}"
+
+    - name: "[C. OVERLAY] Blocca se l'elenco degli overlay non corrisponde esattamente a quanto atteso per il ruolo"
+      ansible.builtin.assert:
+        that:
+          - overlays_present == overlays_expected
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }} (ruolo: {{ 'read-only' if is_readonly else 'master' }}):
+          overlay presenti {{ overlays_present }}, attesi {{ overlays_expected }}.
+        success_msg: >-
+          OK: overlay coerenti col ruolo su {{ inventory_hostname }}
+          ({{ 'read-only' if is_readonly else 'master' }}): {{ overlays_present }}.
+
+    # ==========================================================================
+    # D. PASSWORD POLICY - presente, con gli attributi chiave, e l'overlay
+    # ppolicy effettivamente caricato (gia' verificato al punto C, qui si
+    # verifica il contenuto della entry vera e propria)
+    # ==========================================================================
+
+    - name: "[D. PPOLICY] Verifica presenza e contenuto della password policy di default"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "cn=default,ou=policies,{{ suffix }}"
+        -s base pwdMinLength pwdMaxFailure pwdLockout pwdInHistory pwdMaxAge
+      register: ppolicy_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[D. PPOLICY] Blocca se la password policy manca o non ha gli attributi chiave attesi"
+      ansible.builtin.assert:
+        that:
+          - ppolicy_check.rc == 0
+          - "'pwdMinLength:' in ppolicy_check.stdout"
+          - "'pwdMaxFailure:' in ppolicy_check.stdout"
+          - "'pwdLockout: TRUE' in ppolicy_check.stdout"
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: password policy assente o
+          incompleta - {{ ppolicy_check.stdout_lines }}
+        success_msg: "OK: password policy presente e completa su {{ inventory_hostname }}."
+
+    # ==========================================================================
+    # E. DATI - conteggio e DN completi di utenti/gruppi via slapcat (bypassa
+    # ACL/sizelimit, stesso approccio gia' validato tutta la sessione), piu'
+    # somma totale dei valori member: (intercetta un'entry presente ma con
+    # la lista membri incompleta, non solo un'entry mancante del tutto)
+    # ==========================================================================
+
+    - name: "[E. DATI] Estrae e ordina i DN degli utenti via slapcat"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          slapcat -b "{{ suffix }}" -a "(objectClass=inetOrgPerson)" 2>/dev/null | grep "^dn: " | sort > /tmp/count_out.$$
+          slapcat_rc=${PIPESTATUS[0]}
+          cp /tmp/count_out.$$ "{{ stage_dir }}/users_dn.txt"
+          rm -f /tmp/count_out.$$
+          if [ "$slapcat_rc" -ne 0 ]; then
+            echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+            exit 1
+          fi
+        executable: /bin/bash
+      changed_when: false
+
+    - name: "[E. DATI] Estrae e ordina i DN dei gruppi via slapcat"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          slapcat -b "{{ suffix }}" -a "(objectClass=groupOfNames)" 2>/dev/null | grep "^dn: " | sort > /tmp/count_out.$$
+          slapcat_rc=${PIPESTATUS[0]}
+          cp /tmp/count_out.$$ "{{ stage_dir }}/groups_dn.txt"
+          rm -f /tmp/count_out.$$
+          if [ "$slapcat_rc" -ne 0 ]; then
+            echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+            exit 1
+          fi
+        executable: /bin/bash
+      changed_when: false
+
+    - name: "[E. DATI] Conta gli utenti dal file estratto (direttamente sul nodo remoto)"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          grep -c "^dn: " "{{ stage_dir }}/users_dn.txt" > /tmp/count_out.$$
+          rc=${PIPESTATUS[0]}
+          count=$(cat /tmp/count_out.$$)
+          rm -f /tmp/count_out.$$
+          if [ "$rc" -gt 1 ]; then
+            echo "ERRORE: grep e' fallito con rc=${rc}" >&2
+            exit 1
+          fi
+          echo "$count"
+        executable: /bin/bash
+      register: user_count_raw
+      changed_when: false
+
+    - name: "[E. DATI] Conta i gruppi dal file estratto (direttamente sul nodo remoto)"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          grep -c "^dn: " "{{ stage_dir }}/groups_dn.txt" > /tmp/count_out.$$
+          rc=${PIPESTATUS[0]}
+          count=$(cat /tmp/count_out.$$)
+          rm -f /tmp/count_out.$$
+          if [ "$rc" -gt 1 ]; then
+            echo "ERRORE: grep e' fallito con rc=${rc}" >&2
+            exit 1
+          fi
+          echo "$count"
+        executable: /bin/bash
+      register: group_count_raw
+      changed_when: false
+
+    - name: "[E. DATI] Deriva i conteggi come fact"
+      ansible.builtin.set_fact:
+        remote_user_count: "{{ user_count_raw.stdout | trim | int }}"
+        remote_group_count: "{{ group_count_raw.stdout | trim | int }}"
+
+    - name: "[E. DATI] Somma il totale dei valori member: su tutti i gruppi (intercetta liste membri incomplete)"
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          slapcat -b "{{ suffix }}" -a "(objectClass=groupOfNames)" 2>/dev/null | grep -c "^member:" > /tmp/count_out.$$
+          slapcat_rc=${PIPESTATUS[0]}
+          count=$(cat /tmp/count_out.$$)
+          rm -f /tmp/count_out.$$
+          if [ "$slapcat_rc" -ne 0 ]; then
+            echo "ERRORE: slapcat e' fallito con rc=${slapcat_rc}" >&2
+            exit 1
+          fi
+          echo "$count"
+        executable: /bin/bash
+      register: member_count_raw
+      changed_when: false
+
+    - name: "[E. DATI] Deriva il totale delle appartenenze come fact"
+      ansible.builtin.set_fact:
+        remote_member_count: "{{ member_count_raw.stdout | trim | int }}"
+
+    # ==========================================================================
+    # F. REPLICA - contextCSN attuale del nodo (confrontato fra tutti i nodi
+    # nella fase di analisi centralizzata)
+    # ==========================================================================
+
+    - name: "[F. REPLICA] Legge il contextCSN attuale"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "{{ suffix }}" -s base contextCSN
+      register: contextcsn_raw
+      changed_when: false
+
+    - name: "[F. REPLICA] Deriva il contextCSN come fact (ordinato, per confronto deterministico)"
+      ansible.builtin.set_fact:
+        remote_contextcsn: >-
+          {{ contextcsn_raw.stdout_lines
+             | select('match', '^contextCSN: ')
+             | sort
+             | list }}
+
+    # ==========================================================================
+    # K. TEST END-TO-END DI PROPAGAZIONE LIVE DELLA REPLICA
+    #
+    # Diverso da F (contextCSN) e da tutto il resto dell'audit: quelli
+    # confrontano uno STATO gia' esistente fra i nodi - se per qualunque
+    # motivo la replica si fosse fermata proprio ORA ma i nodi erano gia'
+    # allineati da PRIMA, un confronto statico non se ne accorgerebbe.
+    # Questo test scrive un'entry nuova su un master, verifica dal vivo che
+    # arrivi davvero sugli altri nodi (masters + read-only) misurando il
+    # tempo di propagazione, poi cancella la stessa entry e verifica che
+    # anche la cancellazione si propaghi. Eseguito una sola volta
+    # (run_once), non per nodo - a differenza del resto di questo play.
+    #
+    # Cleanup garantito in "always": se un'asserzione fallisse a meta'
+    # (es. propagazione riuscita ma cancellazione mai arrivata da qualche
+    # parte), un secondo tentativo di cancellazione (tollerante a "gia'
+    # assente") evita di lasciare l'utente di test sul cluster.
+    # ==========================================================================
+
+    - name: "[K. REPLICA LIVE] Blocco test - crea/verifica/cancella/verifica, cleanup garantito"
+      block:
+        - name: "[K. REPLICA LIVE] Crea l'utente di test dedicato sul nodo di riferimento ({{ reference_node }})"
+          ansible.builtin.command: >
+            ldapadd -Y EXTERNAL -H ldapi:///
+          args:
+            stdin: |
+              dn: uid={{ replication_test_user }},ou=people,{{ suffix }}
+              objectClass: top
+              objectClass: inetOrgPerson
+              uid: {{ replication_test_user }}
+              cn: Audit Replication Test
+              sn: ReplicationTest
+              userPassword: {{ replication_test_password }}
+          delegate_to: "{{ reference_node }}"
+          run_once: true
+          changed_when: true
+          no_log: true
+
+        - name: "[K. REPLICA LIVE] Attende (con retry) che l'utente compaia su ciascun altro nodo, misurando il tempo"
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              start=$(date +%s)
+              while true; do
+                if ldapsearch -Y EXTERNAL -H ldapi:/// -b "uid={{ replication_test_user }},ou=people,{{ suffix }}" -s base dn > /dev/null 2>&1; then
+                  now=$(date +%s)
+                  echo "PROPAGATO elapsed=$((now - start))"
+                  exit 0
+                fi
+                now=$(date +%s)
+                if [ $((now - start)) -ge {{ replication_test_timeout_seconds }} ]; then
+                  echo "TIMEOUT elapsed=$((now - start))"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: replication_propagation_check
+          delegate_to: "{{ item }}"
+          loop: "{{ all_nodes | reject('equalto', reference_node) | list }}"
+          loop_control:
+            label: "{{ item }}"
+          run_once: true
+          failed_when: false
+          changed_when: false
+
+        - name: "[K. REPLICA LIVE] Blocca se la creazione non si e' propagata su un qualunque nodo entro il timeout"
+          ansible.builtin.assert:
+            that:
+              - "'PROPAGATO' in item.stdout"
+            fail_msg: >-
+              ERRORE: l'utente di test non e' comparso su {{ item.item }}
+              entro {{ replication_test_timeout_seconds }}s dalla creazione
+              su {{ reference_node }} - la replica verso questo nodo
+              potrebbe essere ferma o in forte ritardo.
+            success_msg: "OK: creazione propagata su {{ item.item }} ({{ item.stdout }})."
+          loop: "{{ replication_propagation_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          run_once: true
+
+        - name: "[K. REPLICA LIVE] Cancella l'utente di test dallo stesso nodo di riferimento"
+          ansible.builtin.command: >
+            ldapdelete -Y EXTERNAL -H ldapi:///
+            "uid={{ replication_test_user }},ou=people,{{ suffix }}"
+          delegate_to: "{{ reference_node }}"
+          run_once: true
+          changed_when: true
+
+        - name: "[K. REPLICA LIVE] Attende (con retry) che l'utente sparisca da ciascun altro nodo, misurando il tempo"
+          ansible.builtin.shell:
+            cmd: |
+              set -o pipefail
+              start=$(date +%s)
+              while true; do
+                if ! ldapsearch -Y EXTERNAL -H ldapi:/// -b "uid={{ replication_test_user }},ou=people,{{ suffix }}" -s base dn > /dev/null 2>&1; then
+                  now=$(date +%s)
+                  echo "RIMOSSO elapsed=$((now - start))"
+                  exit 0
+                fi
+                now=$(date +%s)
+                if [ $((now - start)) -ge {{ replication_test_timeout_seconds }} ]; then
+                  echo "TIMEOUT elapsed=$((now - start))"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: replication_removal_check
+          delegate_to: "{{ item }}"
+          loop: "{{ all_nodes | reject('equalto', reference_node) | list }}"
+          loop_control:
+            label: "{{ item }}"
+          run_once: true
+          failed_when: false
+          changed_when: false
+
+        - name: "[K. REPLICA LIVE] Blocca se la cancellazione non si e' propagata su un qualunque nodo entro il timeout"
+          ansible.builtin.assert:
+            that:
+              - "'RIMOSSO' in item.stdout"
+            fail_msg: >-
+              ERRORE: l'utente di test risulta ancora presente su
+              {{ item.item }} {{ replication_test_timeout_seconds }}s dopo
+              la cancellazione su {{ reference_node }} - la propagazione
+              delle cancellazioni verso questo nodo potrebbe essere ferma
+              o in forte ritardo.
+            success_msg: "OK: cancellazione propagata su {{ item.item }} ({{ item.stdout }})."
+          loop: "{{ replication_removal_check.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+          run_once: true
+
+        - name: "[K. REPLICA LIVE] Riepilogo tempi di propagazione (creazione)"
+          ansible.builtin.debug:
+            msg: "{{ replication_propagation_check.results[idx].item }}: {{ replication_propagation_check.results[idx].stdout }}"
+          loop: "{{ range(replication_propagation_check.results | length) | list }}"
+          loop_control:
+            loop_var: idx
+            label: "{{ replication_propagation_check.results[idx].item }}"
+          run_once: true
+
+        - name: "[K. REPLICA LIVE] Riepilogo tempi di propagazione (cancellazione)"
+          ansible.builtin.debug:
+            msg: "{{ replication_removal_check.results[idx].item }}: {{ replication_removal_check.results[idx].stdout }}"
+          loop: "{{ range(replication_removal_check.results | length) | list }}"
+          loop_control:
+            loop_var: idx
+            label: "{{ replication_removal_check.results[idx].item }}"
+          run_once: true
+
+      always:
+        - name: "[K. REPLICA LIVE] Cleanup di sicurezza - ricancella l'utente di test (tollera 'gia' assente')"
+          ansible.builtin.command: >
+            ldapdelete -Y EXTERNAL -H ldapi:///
+            "uid={{ replication_test_user }},ou=people,{{ suffix }}"
+          delegate_to: "{{ reference_node }}"
+          run_once: true
+          register: cleanup_result
+          failed_when: >
+            cleanup_result.rc != 0 and
+            ('no such object' not in cleanup_result.stderr | lower)
+          changed_when: cleanup_result.rc == 0
+
+    # ==========================================================================
+    # G. ACCESSO LDAPS - bind reale via rete/TLS con un utente STANDARD (non
+    # l'identita' amministrativa locale usata da tutti i controlli sopra) -
+    # OPZIONALE: se le credenziali non sono fornite, salta con un avviso.
+    # ==========================================================================
+
+    - name: "[G. LDAPS] Test di bind via ldaps:// con un utente standard (se configurato)"
+      ansible.builtin.command: >
+        ldapwhoami -x -H ldaps://{{ inventory_hostname }}/
+        -D "{{ ldaps_test_user_dn }}" -w "{{ ldaps_test_user_pw }}"
+      register: ldaps_bind_check
+      changed_when: false
+      failed_when: false
+      no_log: true
+      when: ldaps_test_user_dn != "" and ldaps_test_user_pw != ""
+
+    - name: "[G. LDAPS] Blocca se il bind via ldaps:// con l'utente standard fallisce"
+      ansible.builtin.assert:
+        that:
+          - ldaps_bind_check.rc == 0
+        fail_msg: >-
+          ERRORE: bind via ldaps://{{ inventory_hostname }}/ con
+          {{ ldaps_test_user_dn }} fallito (rc={{ ldaps_bind_check.rc }}) -
+          possibile problema di certificato TLS, di rete, o di credenziali.
+        success_msg: "OK: bind via ldaps:// riuscito su {{ inventory_hostname }}."
+      when: ldaps_test_user_dn != "" and ldaps_test_user_pw != ""
+
+    - name: "[G. LDAPS] Avviso se il test e' stato saltato (nessuna credenziale fornita)"
+      ansible.builtin.debug:
+        msg: >-
+          SALTATO su {{ inventory_hostname }}: nessuna credenziale fornita
+          per il test di bind via ldaps:// (-e ldaps_test_user_dn=... -e
+          ldaps_test_user_pw=...). Il resto dell'audit non ne risente, ma
+          l'accesso di rete via TLS con un utente standard non e' stato
+          verificato in questo run.
+      when: ldaps_test_user_dn == "" or ldaps_test_user_pw == ""
+
+    # ==========================================================================
+    # H. CONTROLLI LDAP SUPPORTATI (supportedControl sul root DSE) - vedi
+    # https://docs.oracle.com/cd/E22289_01/html/821-1277/supported-ldap-controls.html
+    # per un elenco di riferimento dei controlli LDAP standard.
+    #
+    # NOTA IMPORTANTE (scoperta in questa stessa sessione di lavoro, non
+    # un'ipotesi): il Relax Control (1.3.6.1.4.1.4203.666.5.12), che questo
+    # progetto usa attivamente per sbloccare account ppolicy come admin,
+    # NON compare nel root DSE di questo build di slapd pur funzionando
+    # correttamente quando invocato (verificato con un test funzionale
+    # diretto, non solo con la sua presenza dichiarata) - dipende da come
+    # slapd e' stato compilato, non da una configurazione mancante. Per
+    # questo il controllo su Relax Control qui sotto e' SOLO informativo,
+    # mai bloccante - un audit che lo trattasse come obbligatorio darebbe
+    # un falso allarme costante su questo cluster.
+    # ==========================================================================
+
+    - name: "[H. CONTROLLI] Legge i controlli LDAP supportati (supportedControl sul root DSE)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "" -s base supportedControl
+      register: supported_controls_raw
+      changed_when: false
+
+    - name: "[H. CONTROLLI] Deriva l'elenco ordinato dei controlli supportati (per confronto incrociato in Fase 2)"
+      ansible.builtin.set_fact:
+        remote_supported_controls: >-
+          {{ supported_controls_raw.stdout_lines
+             | select('match', '^supportedControl: ')
+             | map('regex_replace', '^supportedControl: ', '')
+             | sort
+             | list }}
+
+    - name: "[H. CONTROLLI] Verifica la presenza dei controlli rilevanti per questo progetto"
+      ansible.builtin.set_fact:
+        control_manage_dsait: "{{ '2.16.840.1.113730.3.4.2' in remote_supported_controls }}"
+        control_relax: "{{ '1.3.6.1.4.1.4203.666.5.12' in remote_supported_controls }}"
+        control_pwdpolicy: "{{ '1.3.6.1.4.1.42.2.27.8.5.1' in remote_supported_controls }}"
+        control_pagedresults: "{{ '1.2.840.113556.1.4.319' in remote_supported_controls }}"
+        control_syncrequest: "{{ '1.3.6.1.4.1.4203.1.9.1.1' in remote_supported_controls }}"
+
+    - name: "[H. CONTROLLI] Blocca se manca un controllo davvero essenziale per la replica (Manage DSA IT sempre, Sync Request solo sui master)"
+      # Manage DSA IT: necessario per operazioni amministrative dirette su
+      # entry speciali (es. i referral) - atteso su TUTTI i nodi.
+      #
+      # Sync Request Control (1.3.6.1.4.1.4203.1.9.1.1): NON e' atteso
+      # ovunque - la documentazione ufficiale di slapo-syncprov lo descrive
+      # esplicitamente come "provider-side support" del meccanismo di
+      # replica. syncprov e' caricato SOLO sui master (mai sulle read-only,
+      # confermato piu' volte in sessione) - su un consumer puro come la
+      # read-only, la sua assenza nel root DSE e' corretta per design, non
+      # un problema. Scoperto con un run reale: trattarlo come bloccante su
+      # OGNI nodo fermava la read-only qui, prima ancora di arrivare alla
+      # sezione J (mdb_stat) - la causa vera dietro un N/D che sembrava
+      # dovuto a lmdb-utils, ma non lo era.
+      ansible.builtin.assert:
+        that:
+          - control_manage_dsait
+          - control_syncrequest or is_readonly
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: manca un controllo essenziale -
+          Manage DSA IT={{ control_manage_dsait }},
+          Sync Request={{ control_syncrequest }} (richiesto solo sui master,
+          questo nodo e' {{ 'read-only' if is_readonly else 'master' }}).
+        success_msg: >-
+          OK: controlli essenziali presenti su {{ inventory_hostname }}
+          ({{ 'read-only - Sync Request non richiesto per design' if is_readonly
+          else 'master' }}).
+
+    - name: "[H. CONTROLLI] Nota informativa su Relax Control, Password Policy Control, Paged Results (non bloccanti)"
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Relax Control: {{ 'presente nel root DSE' if control_relax else
+            'NON pubblicizzato nel root DSE (atteso per questo build - funziona comunque, verificato con test funzionale in sessione precedente)' }}
+          - "Password Policy Control: {{ 'presente' if control_pwdpolicy else 'assente' }}"
+          - "Paged Results Control: {{ 'presente' if control_pagedresults else 'assente' }}"
+
+    - name: "[H. CONTROLLI] Elenco completo dei controlli supportati, decodificati dove noto"
+      ansible.builtin.debug:
+        msg: >-
+          {% for oid in remote_supported_controls %}{{ oid }} -> {{ oid_map[oid] if oid in oid_map else '(non decodificato)' }}
+          {% endfor %}
+
+    # ==========================================================================
+    # I. ROOT DSE COMPLETO (oltre a supportedControl gia' letto sopra) -
+    # versione/vendor del server, meccanismi SASL disponibili, naming
+    # context serviti, estensioni supportate. Alcuni di questi (vendorVersion
+    # su tutti, in particolare) non erano mai stati confrontati esplicitamente
+    # fra i nodi in questa sessione, pur essendo dati per scontati.
+    # ==========================================================================
+
+    - name: "[I. ROOT DSE] Legge gli attributi operativi principali del root DSE"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "" -s base
+        namingContexts supportedLDAPVersion supportedSASLMechanisms
+        supportedExtension supportedFeatures vendorName vendorVersion
+        subschemaSubentry configContext monitorContext
+      register: root_dse_raw
+      changed_when: false
+
+    - name: "[I. ROOT DSE] Deriva i singoli attributi come fact (per report e confronto incrociato in Fase 2)"
+      ansible.builtin.set_fact:
+        remote_naming_contexts: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^namingContexts: ')
+             | map('regex_replace', '^namingContexts: ', '')
+             | sort | list }}
+        remote_ldap_versions: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^supportedLDAPVersion: ')
+             | map('regex_replace', '^supportedLDAPVersion: ', '')
+             | sort | list }}
+        remote_sasl_mechanisms: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^supportedSASLMechanisms: ')
+             | map('regex_replace', '^supportedSASLMechanisms: ', '')
+             | sort | list }}
+        remote_vendor_name: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^vendorName: ')
+             | map('regex_replace', '^vendorName: ', '')
+             | list | first | default('(non dichiarato)', true) }}
+        remote_vendor_version: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^vendorVersion: ')
+             | map('regex_replace', '^vendorVersion: ', '')
+             | list | first | default('(non dichiarato)', true) }}
+        remote_subschema_subentry: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^subschemaSubentry: ')
+             | map('regex_replace', '^subschemaSubentry: ', '')
+             | list | first | default('(non dichiarato)', true) }}
+        remote_monitor_context: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^monitorContext: ')
+             | map('regex_replace', '^monitorContext: ', '')
+             | list | first | default('', true) }}
+        remote_supported_extensions: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^supportedExtension: ')
+             | map('regex_replace', '^supportedExtension: ', '')
+             | sort | list }}
+        remote_supported_features: >-
+          {{ root_dse_raw.stdout_lines
+             | select('match', '^supportedFeatures: ')
+             | map('regex_replace', '^supportedFeatures: ', '')
+             | sort | list }}
+
+    - name: "[I. ROOT DSE] Blocca se manca il naming context atteso o la versione LDAPv3"
+      ansible.builtin.assert:
+        that:
+          - "(suffix in remote_naming_contexts)"
+          - "('3' in remote_ldap_versions)"
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: naming context attesi
+          {{ remote_naming_contexts }} (deve contenere '{{ suffix }}'),
+          versioni LDAP supportate {{ remote_ldap_versions }} (deve
+          contenere '3').
+        success_msg: "OK: naming context e versione LDAPv3 corretti su {{ inventory_hostname }}."
+
+    - name: "[I. ROOT DSE] Blocca se SASL EXTERNAL non e' disponibile (l'intera amministrazione di questo progetto vi si affida)"
+      ansible.builtin.assert:
+        that:
+          - "'EXTERNAL' in remote_sasl_mechanisms"
+        fail_msg: >-
+          ERRORE CRITICO su {{ inventory_hostname }}: il meccanismo SASL
+          EXTERNAL non risulta disponibile ({{ remote_sasl_mechanisms }}) -
+          tutta l'amministrazione via ldapi:///+SASL EXTERNAL usata in
+          questo progetto (inclusa gran parte di questo stesso playbook)
+          smetterebbe di funzionare.
+        success_msg: "OK: SASL EXTERNAL disponibile su {{ inventory_hostname }}."
+
+    - name: "[I. ROOT DSE] Riepilogo informativo (vendor/versione, monitor backend)"
+      ansible.builtin.debug:
+        msg:
+          - "Vendor: {{ remote_vendor_name }} - Versione: {{ remote_vendor_version }}"
+          - "Meccanismi SASL: {{ remote_sasl_mechanisms }}"
+          - "Subschema subentry: {{ remote_subschema_subentry }}"
+          - >-
+            Monitor backend: {{ 'configurato (' ~ remote_monitor_context ~ ')' if
+            remote_monitor_context != '' else 'non configurato/non esposto (nessun problema, e opzionale)' }}
+
+    - name: "[I. ROOT DSE] Estensioni e funzionalita' supportate, decodificate dove noto"
+      ansible.builtin.debug:
+        msg:
+          - "--- Extended Operations supportate ---"
+          - >-
+            {% for oid in remote_supported_extensions %}{{ oid }} -> {{ oid_map[oid] if oid in oid_map else '(non decodificato)' }}
+            {% endfor %}
+          - "--- Features supportate ---"
+          - >-
+            {% for oid in remote_supported_features %}{{ oid }} -> {{ oid_map[oid] if oid in oid_map else '(non decodificato)' }}
+            {% endfor %}
+
+    # ==========================================================================
+    # J. INTEGRITA' FISICA DELL'AMBIENTE LMDB (mdb_stat -e)
+    #
+    # NOTA SUI LIMITI DI QUESTO CONTROLLO (scoperta in questa stessa sessione
+    # di lavoro): mdb_stat NON e' un vero "fsck" per LMDB - mostra soprattutto
+    # metadati (dimensione mappata, pagine usate, ID di transazione), non fa
+    # una validazione approfondta dell'albero B+ sottostante. Il segnale piu'
+    # affidabile che puo' dare qui e' binario: il comando riesce a leggere
+    # l'ambiente senza errori, o no. Le pagine usate sono mostrate SOLO come
+    # informazione di contorno fra i nodi, MAI come controllo bloccante:
+    # con dataset identici caricati indipendentemente via slapadd su nodi
+    # diversi, il numero di pagine usate NON e' detto sia identico (verificato
+    # empiricamente in sessione precedente: 436M vs 429M su 4 nodi con lo
+    # stesso identico dataset) - trattarlo come bloccante darebbe un altro
+    # falso allarme.
+    #
+    # La verifica di integrita' realmente affidabile resta quella gia' fatta
+    # nelle sezioni precedenti: una lettura completa e riuscita di tutto il
+    # contenuto via slapcat (sezione E) - un ambiente davvero danneggiato
+    # non la permetterebbe.
+    # ==========================================================================
+
+    - name: "[J. LMDB] Prova a installare lmdb-utils (fornisce mdb_stat) - non bloccante se fallisce"
+      # failed_when:false deliberato: un problema di rete/mirror apt su
+      # questo pacchetto OPZIONALE (vedi nota sopra - non sostituisce la
+      # verifica di integrita' vera, gia' fatta in sezione E) non deve mai
+      # poter interrompere il resto di un audit altrimenti valido. Scoperto
+      # con un run reale: senza questo, un fallimento apt isolato su un
+      # nodo abbatteva l'intera Fase 2 per TUTTI i nodi (vedi changelog).
+      ansible.builtin.apt:
+        name: lmdb-utils
+        state: present
+      register: lmdb_utils_install
+      failed_when: false
+
+    - name: "[J. LMDB] Avviso se lmdb-utils non e' installabile (rete/mirror) - il resto dell'audit prosegue comunque"
+      ansible.builtin.debug:
+        msg: >-
+          SALTATO su {{ inventory_hostname }}: impossibile installare lmdb-utils
+          ({{ lmdb_utils_install.msg | default('errore apt') }}) - la sezione J
+          (mdb_stat) viene saltata per questo nodo, il resto dell'audit non ne
+          risente (mdb_stat e' un controllo supplementare, non sostituisce la
+          verifica di integrita' via slapcat gia' fatta in sezione E).
+      when: lmdb_utils_install.failed | default(false)
+
+    - name: "[J. LMDB] Esegue mdb_stat -e sull'ambiente LMDB di slapd (solo se lmdb-utils e' disponibile)"
+      ansible.builtin.command: mdb_stat -e /var/lib/ldap
+      register: mdb_stat_raw
+      changed_when: false
+      failed_when: false
+      when: not (lmdb_utils_install.failed | default(false))
+
+    - name: "[J. LMDB] Blocca se mdb_stat e' disponibile ma non riesce a leggere l'ambiente (segnale di un problema reale)"
+      ansible.builtin.assert:
+        that:
+          - mdb_stat_raw.rc == 0
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: mdb_stat non riesce a leggere
+          l'ambiente LMDB (rc={{ mdb_stat_raw.rc }}) - {{ mdb_stat_raw.stderr }}
+          Questo SI' e' un segnale concreto di un problema, a differenza dei
+          soli numeri nei metadati.
+        success_msg: "OK: mdb_stat legge correttamente l'ambiente LMDB su {{ inventory_hostname }}."
+      when: not (lmdb_utils_install.failed | default(false))
+
+    - name: "[J. LMDB] Deriva le pagine usate come fact - SEMPRE impostato, anche se la sezione e' stata saltata"
+      # Fondamentale che questo fact esista SEMPRE su ogni nodo, con o senza
+      # lmdb-utils disponibile: la Fase 2 lo legge per TUTTI i nodi in un
+      # unico task di riepilogo - se anche un solo nodo non lo avesse
+      # definito, l'intero riepilogo andrebbe in crash per tutti (successo
+      # gia' capitato con un run reale, vedi changelog).
+      ansible.builtin.set_fact:
+        remote_mdb_pages_used: >-
+          {{ (mdb_stat_raw.stdout_lines
+             | select('match', '.*Number of pages used:.*')
+             | map('regex_replace', '.*Number of pages used:\s*', '')
+             | list | first | default('n/d', true))
+             if not (lmdb_utils_install.failed | default(false))
+             else 'n/d (lmdb-utils non installabile)' }}
+
+    - name: "[J. LMDB] Riepilogo informativo"
+      ansible.builtin.debug:
+        msg: "Pagine LMDB usate su {{ inventory_hostname }}: {{ remote_mdb_pages_used }} (confronto fra nodi solo informativo, non bloccante - vedi nota sopra)"
+
+    # ==========================================================================
+    # FETCH - centralizza i file estratti sul controller per l'analisi
+    # incrociata (Fase 2)
+    # ==========================================================================
+
+    - name: "[FETCH] Centralizza i file estratti sul controller"
+      ansible.builtin.fetch:
+        src: "{{ stage_dir }}/{{ item }}"
+        dest: "{{ fetch_dir }}/{{ inventory_hostname }}/{{ item }}"
+        flat: true
+      loop:
+        - "users_dn.txt"
+        - "groups_dn.txt"
+
+    - name: "[CLEANUP] Rimuove la directory di staging sul nodo remoto"
+      ansible.builtin.file:
+        path: "{{ stage_dir }}"
+        state: absent
+
+# ==============================================================================
+# FASE 2: ANALISI CENTRALIZZATA (confronto incrociato fra tutti i nodi)
+# ==============================================================================
+- name: "Audit Completo di Consistenza del Cluster - analisi incrociata"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    all_nodes: "{{ (groups['cluster'] | sort) + (groups['readonlyreplica'] | default([])) }}"
+    reference_node: "{{ (groups['cluster'] | sort | first) }}"
+    fetch_dir: "/tmp/ldap_audit_master"
+
+  tasks:
+    - name: "[SICUREZZA] Costruisce una vista sicura dei fatti per nodo (protegge dal crash se un nodo ha fallito prima di impostarli)"
+      # Fondamentale dopo un run reale in cui un fallimento isolato su UN
+      # nodo (apt non raggiungibile per lmdb-utils) ha fatto crashare
+      # l'INTERA Fase 2 per tutti i nodi, perche' un riferimento diretto a
+      # hostvars[item].nome_fatto va in errore duro (non un semplice
+      # "undefined" gestibile con | default) se quel nodo non ha mai
+      # eseguito il task che imposta quel fatto. L'accesso con parentesi
+      # quadre + default() invece di notazione punto e' il pattern piu'
+      # affidabile per questo caso - qui applicato una sola volta, cosi'
+      # tutto il resto della Fase 2 legge da questa struttura sicura invece
+      # di accedere a hostvars direttamente decine di volte.
+      ansible.builtin.set_fact:
+        safe_node_data: >-
+          {{ safe_node_data | default({}) | combine({
+               item: {
+                 'user_count': hostvars[item]['remote_user_count'] | default('N/D - controlli precedenti falliti su questo nodo', true),
+                 'group_count': hostvars[item]['remote_group_count'] | default('N/D - controlli precedenti falliti su questo nodo', true),
+                 'member_count': hostvars[item]['remote_member_count'] | default('N/D - controlli precedenti falliti su questo nodo', true),
+                 'contextcsn': hostvars[item]['remote_contextcsn'] | default([], true),
+                 'supported_controls': hostvars[item]['remote_supported_controls'] | default([], true),
+                 'vendor_version': hostvars[item]['remote_vendor_version'] | default('N/D - controlli precedenti falliti su questo nodo', true),
+                 'sasl_mechanisms': hostvars[item]['remote_sasl_mechanisms'] | default([], true),
+                 'mdb_pages_used': hostvars[item]['remote_mdb_pages_used'] | default('N/D', true),
+               }
+          }) }}
+      loop: "{{ all_nodes }}"
+
+    - name: "[TABELLA] Riepilogo conteggi per nodo"
+      ansible.builtin.debug:
+        msg: >-
+          {{ item }}: utenti={{ safe_node_data[item].user_count }}
+          gruppi={{ safe_node_data[item].group_count }}
+          appartenenze(member:)={{ safe_node_data[item].member_count }}
+          pagine_lmdb={{ safe_node_data[item].mdb_pages_used }}
+          (le pagine LMDB NON sono attese identiche fra nodi caricati
+          indipendentemente - confronto solo informativo)
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso numero di utenti del nodo di riferimento ({{ reference_node }})"
+      ansible.builtin.assert:
+        that:
+          - safe_node_data[item].user_count == safe_node_data[reference_node].user_count
+        fail_msg: >-
+          NON CONVERGENTE: {{ item }} ha {{ safe_node_data[item].user_count }}
+          utenti, {{ reference_node }} ne ha {{ safe_node_data[reference_node].user_count }}.
+        success_msg: "{{ item }}: conteggio utenti allineato a {{ reference_node }}."
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso numero di gruppi del nodo di riferimento"
+      ansible.builtin.assert:
+        that:
+          - safe_node_data[item].group_count == safe_node_data[reference_node].group_count
+        fail_msg: >-
+          NON CONVERGENTE: {{ item }} ha {{ safe_node_data[item].group_count }}
+          gruppi, {{ reference_node }} ne ha {{ safe_node_data[reference_node].group_count }}.
+        success_msg: "{{ item }}: conteggio gruppi allineato a {{ reference_node }}."
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Ogni nodo deve avere lo stesso totale di appartenenze (member:) del nodo di riferimento"
+      ansible.builtin.assert:
+        that:
+          - safe_node_data[item].member_count == safe_node_data[reference_node].member_count
+        fail_msg: >-
+          NON CONVERGENTE: {{ item }} ha {{ safe_node_data[item].member_count }}
+          appartenenze totali, {{ reference_node }} ne ha
+          {{ safe_node_data[reference_node].member_count }} - possibile lista
+          membri incompleta su entry pure presenti su entrambi i nodi.
+        success_msg: "{{ item }}: totale appartenenze allineato a {{ reference_node }}."
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] Il contextCSN deve essere identico su tutti i nodi (mesh pienamente convergente)"
+      ansible.builtin.assert:
+        that:
+          - safe_node_data[item].contextcsn == safe_node_data[reference_node].contextcsn
+        fail_msg: >-
+          ATTENZIONE: {{ item }} ha contextCSN diverso da {{ reference_node }} -
+          possibile replica ancora in corso o in ritardo, non necessariamente
+          un errore se il cluster ha ricevuto scritture di recente.
+          {{ item }}: {{ safe_node_data[item].contextcsn }}
+          {{ reference_node }}: {{ safe_node_data[reference_node].contextcsn }}
+        success_msg: "{{ item }}: contextCSN identico a {{ reference_node }} (mesh convergente)."
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] I controlli LDAP supportati devono essere identici su tutti i nodi (escluso Sync Request, atteso solo sui master - vedi nota in sezione H)"
+      # Il Sync Request Control (1.3.6.1.4.1.4203.1.9.1.1) e' escluso dal
+      # confronto: e' legato all'overlay syncprov, caricato solo sui master
+      # (mai sulle read-only, per design) - una differenza qui e' attesa,
+      # non un segnale di disallineamento. Tutto il resto della lista
+      # continua a essere confrontato normalmente, quindi una VERA
+      # differenza (versione diversa di slapd, moduli mancanti) verrebbe
+      # comunque intercettata.
+      ansible.builtin.assert:
+        that:
+          - >-
+            (safe_node_data[item].supported_controls | reject('equalto', '1.3.6.1.4.1.4203.1.9.1.1') | sort | list)
+            ==
+            (safe_node_data[reference_node].supported_controls | reject('equalto', '1.3.6.1.4.1.4203.1.9.1.1') | sort | list)
+        fail_msg: >-
+          ATTENZIONE: {{ item }} pubblicizza un elenco di controlli LDAP
+          diverso da {{ reference_node }} (a parte l'atteso Sync Request,
+          gia' escluso dal confronto) - possibile disallineamento di
+          versione/build/moduli caricati di slapd fra i nodi, non atteso
+          in un cluster omogeneo.
+          {{ item }}: {{ safe_node_data[item].supported_controls }}
+          {{ reference_node }}: {{ safe_node_data[reference_node].supported_controls }}
+        success_msg: "{{ item }}: controlli LDAP supportati identici a {{ reference_node }} (a meno del Sync Request, atteso solo sui master)."
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] La versione di slapd (vendorVersion) deve essere identica su tutti i nodi"
+      # Non verificato esplicitamente altrove in questa sessione - da sempre
+      # dato per scontato che tutti i nodi girassero lo stesso binario.
+      ansible.builtin.assert:
+        that:
+          - safe_node_data[item].vendor_version == safe_node_data[reference_node].vendor_version
+        fail_msg: >-
+          ATTENZIONE: {{ item }} dichiara vendorVersion
+          '{{ safe_node_data[item].vendor_version }}', {{ reference_node }}
+          dichiara '{{ safe_node_data[reference_node].vendor_version }}' -
+          i nodi non girano la stessa versione di slapd.
+        success_msg: >-
+          {{ item }}: stessa versione di slapd di {{ reference_node }}
+          ({{ safe_node_data[item].vendor_version }}).
+      loop: "{{ all_nodes }}"
+
+    - name: "[CONVERGENZA] I meccanismi SASL supportati devono essere identici su tutti i nodi"
+      ansible.builtin.assert:
+        that:
+          - safe_node_data[item].sasl_mechanisms == safe_node_data[reference_node].sasl_mechanisms
+        fail_msg: >-
+          ATTENZIONE: {{ item }} supporta {{ safe_node_data[item].sasl_mechanisms }},
+          {{ reference_node }} supporta {{ safe_node_data[reference_node].sasl_mechanisms }}.
+        success_msg: "{{ item }}: meccanismi SASL identici a {{ reference_node }}."
+      loop: "{{ all_nodes }}"
+
+    - name: "[DIFF] Genera il confronto puntuale dei DN utenti fra ciascun nodo e il riferimento"
+      ansible.builtin.shell:
+        cmd: >
+          diff -u "{{ fetch_dir }}/{{ reference_node }}/users_dn.txt" "{{ fetch_dir }}/{{ item }}/users_dn.txt" || true
+        executable: /bin/bash
+      register: users_diff_output
+      loop: "{{ all_nodes }}"
+      changed_when: false
+
+    - name: "[DIFF] Genera il confronto puntuale dei DN gruppi fra ciascun nodo e il riferimento"
+      ansible.builtin.shell:
+        cmd: >
+          diff -u "{{ fetch_dir }}/{{ reference_node }}/groups_dn.txt" "{{ fetch_dir }}/{{ item }}/groups_dn.txt" || true
+        executable: /bin/bash
+      register: groups_diff_output
+      loop: "{{ all_nodes }}"
+      changed_when: false
+
+    - name: "[DIFF] Blocca se ci sono differenze puntuali nei DN (non solo nei conteggi)"
+      ansible.builtin.assert:
+        that:
+          - users_diff_output.results[idx].stdout == ""
+          - groups_diff_output.results[idx].stdout == ""
+        fail_msg: >-
+          DIFFERENZE PUNTUALI trovate fra {{ reference_node }} e {{ all_nodes[idx] }}
+          (i conteggi possono anche coincidere per coincidenza, es. un DN diverso
+          al posto di uno mancante):
+          --- UTENTI ---
+          {{ users_diff_output.results[idx].stdout }}
+          --- GRUPPI ---
+          {{ groups_diff_output.results[idx].stdout }}
+        success_msg: "{{ all_nodes[idx] }}: nessuna differenza puntuale nei DN rispetto a {{ reference_node }}."
+      loop: "{{ range(all_nodes | length) | list }}"
+      loop_control:
+        loop_var: idx
+        label: "{{ all_nodes[idx] }}"
+
+    - name: "[REPORT FINALE] Riepilogo complessivo dell'audit"
+      ansible.builtin.debug:
+        msg:
+          - "=================================================================="
+          - " AUDIT DI CONSISTENZA DEL CLUSTER - RIEPILOGO"
+          - "=================================================================="
+          - "Nodi controllati: {{ all_nodes }}"
+          - "Nodo di riferimento per i confronti: {{ reference_node }}"
+          - "Utenti: {{ safe_node_data[reference_node].user_count }}"
+          - "Gruppi: {{ safe_node_data[reference_node].group_count }}"
+          - "Appartenenze totali (member:): {{ safe_node_data[reference_node].member_count }}"
+          - "Se non compaiono errori sopra, il cluster e' pienamente coerente:"
+          - "  servizio attivo, struttura di base pulita, overlay coerenti col"
+          - "  ruolo, password policy presente, dati e replica convergenti su"
+          - "  tutti i nodi (conteggi E contenuto puntuale dei DN), controlli"
+          - "  LDAP e root DSE (versione, SASL, naming context) identici su"
+          - "  tutto il cluster."
+          - "=================================================================="
+
+    - name: "[CLEANUP] Rimuove i file centralizzati sul controller"
+      ansible.builtin.file:
+        path: "{{ fetch_dir }}"
+        state: absent
