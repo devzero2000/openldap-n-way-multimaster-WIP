@@ -4,7 +4,7 @@
 # TITOLO:       analyze_ldif.py - Analisi statistica di un LDIF LDAP (utenti/gruppi)
 # AUTORE:       Elia Pinto
 # DATA:         Settembre 2026
-# VERSIONE:     1.2
+# VERSIONE:     1.4
 # SCOPO:        Legge un file LDIF (RFC 2849) e produce statistiche utili a
 #               caratterizzare una base dati LDAP: conteggi di entry per
 #               tipo, distribuzione dei membri per gruppo e dei gruppi per
@@ -13,6 +13,34 @@
 #               riferimenti pendenti (dangling), valori duplicati, coerenza
 #               incrociata memberOf/member. Nessuna dipendenza esterna -
 #               solo libreria standard di Python 3.
+#
+# NOVITÀ v1.4 rispetto a v1.3 (errore reale trovato controllando l'output
+# di un run vero di analyze_rootdse.py contro un server, non solo
+# rileggendo il dizionario): 1.3.6.1.1.22 non e' "Password Modify
+# Control" - una ricerca precedente aveva restituito risultati pertinenti
+# a un OID DIVERSO (1.3.6.1.4.1.4203.1.11.1) senza mai confermare
+# davvero questo OID specifico. Confermato dal registro ufficiale IANA:
+# e' il "Don't Use Copy Control" (RFC 6171). Stesso fix applicato in
+# parallelo a analyze_rootdse.py e check_ldap_consistency_cluster.yml.
+#
+# NOVITÀ v1.3 rispetto a v1.2:
+#   - Aggiunta una sezione dedicata all'ENTRY RADICE del suffisso (quella
+#     con la profondita' di DN minore, es. "dc=example,dc=com") - prima
+#     trattata come una qualunque altra entry "altro", ora evidenziata
+#     separatamente con i suoi attributi (objectClass, contextCSN se
+#     presente, entryUUID, altro).
+#   - Aggiunto un dizionario di 27 OID di protocollo LDAP (Controls/
+#     Extensions/Features) -> descrizione leggibile, con scansione di
+#     TUTTI i valori del file alla ricerca di corrispondenze. Tutte le 27
+#     voci verificate individualmente con ricerca dedicata (8 errori reali
+#     trovati e corretti in una bozza precedente, circa un terzo del
+#     totale - vedi commento accanto a OID_MAP per il dettaglio).
+#     ATTENZIONE: un LDIF di dati normalmente NON contiene questi OID da
+#     nessuna parte - sono concetti del protocollo LDAP (controlli,
+#     estensioni), non della directory data, e vivono nel root DSE di un
+#     server in esecuzione, non in un export statico. Un conteggio a zero
+#     e' l'esito normale e atteso, non un difetto dello script - la
+#     sezione e' comunque inclusa come rete di sicurezza e per completezza.
 #
 # NOVITÀ v1.2 rispetto a v1.1:
 #   - Aggiunto il confronto memberOf vs member: per utente (non solo un
@@ -241,6 +269,118 @@ def detect_member_attr(groups: List[LdifEntry]) -> str:
 
 
 # ==============================================================================
+# 2b. DIZIONARIO OID -> DESCRIZIONE LEGGIBILE (Controls/Extensions/Features
+# del protocollo LDAP) + ENTRY RADICE DEL SUFFISSO
+#
+# Le 27 voci sono state verificate individualmente con ricerca dedicata
+# (non solo le piu' comuni) - 8 errori reali sono stati trovati e corretti
+# nel processo rispetto a una prima bozza (circa un terzo del totale):
+# vale la pena non fidarsi mai di un dizionario di questo tipo a scatola
+# chiusa senza verifica, cosa gia' successa una volta con questo stesso
+# elenco prima di essere corretto.
+#
+# NOTA IMPORTANTE PER QUESTO SCRIPT: un LDIF di dati (utenti/gruppi) di
+# norma non contiene questi OID da nessuna parte - sono concetti del
+# PROTOCOLLO LDAP (controlli, estensioni), non della directory data vera
+# e propria. Il root DSE (dove questi OID compaiono davvero, in
+# supportedControl/supportedExtension/supportedFeatures) non esiste in un
+# export statico - vive solo su un server LDAP in esecuzione. Questo
+# dizionario qui e' quindi principalmente una rete di sicurezza per il
+# raro caso di coincidenza, o di un file che non sia davvero un export
+# dati - un conteggio a zero e' l'esito normale e atteso, non un difetto
+# dello script.
+# ==============================================================================
+
+OID_MAP = {
+    # Controls
+    "1.3.6.1.4.1.4203.1.9.1.1": "LDAP Content Synchronization Control (SyncRepl, RFC 4533)",
+    "2.16.840.1.113730.3.4.5": "Password Expiring / Expiration Warning Control",
+    "2.16.840.1.113730.3.4.4": "Password Expired Control",
+    "1.3.6.1.4.1.42.2.27.9.5.8": "Account Usability Control (Sun/OpenDS)",
+    "1.3.6.1.4.1.42.2.27.8.5.1": "OpenLDAP Password Policy Control (ppolicy)",
+    "2.16.840.1.113730.3.4.18": "Proxy Authorization Control v2 (RFC 4370)",
+    "2.16.840.1.113730.3.4.2": "Manage DSA IT Control (RFC 3296)",
+    "1.3.6.1.4.1.4203.1.10.1": "Subentries Control (RFC 3672)",
+    "1.3.6.1.1.22": "Don't Use Copy Control (RFC 6171)",
+    "1.2.840.113556.1.4.319": "Simple Paged Results Control (RFC 2696)",
+    "1.2.826.0.1.3344810.2.3": "Matched Values Control (RFC 3876)",
+    "1.3.6.1.1.13.2": "LDAP Read Entry - Post-read Control (RFC 4527)",
+    "1.3.6.1.1.13.1": "LDAP Read Entry - Pre-read Control (RFC 4527)",
+    "1.3.6.1.1.12": "Assertion Control (RFC 4528)",
+    "1.3.6.1.4.1.4203.666.5.12": "Relax Control (OpenLDAP, non standard)",
+    # Extensions
+    "1.3.6.1.4.1.1466.20037": "StartTLS Extended Operation",
+    "1.3.6.1.4.1.4203.1.11.1": "Password Modify Extended Operation (RFC 3062)",
+    "1.3.6.1.4.1.4203.1.11.3": "Who Am I? Extended Operation (RFC 4532)",
+    "1.3.6.1.1.8": "Cancel Extended Operation (RFC 3909)",
+    "1.3.6.1.1.21.1": "Start Transaction Extended Request (RFC 5805)",
+    "1.3.6.1.1.21.3": "End Transaction Extended Request (RFC 5805)",
+    # Features
+    "1.3.6.1.1.14": "Modify-Increment Extension (RFC 4525)",
+    "1.3.6.1.4.1.4203.1.5.1": "All Operational Attributes Feature (RFC 3673)",
+    "1.3.6.1.4.1.4203.1.5.2": "OC AD Lists (RFC 4529)",
+    "1.3.6.1.4.1.4203.1.5.3": "True/False Filters",
+    "1.3.6.1.4.1.4203.1.5.4": "Language Tag Options",
+    "1.3.6.1.4.1.4203.1.5.5": "Language Range Options",
+}
+
+
+def find_root_entries(entries: List[LdifEntry]) -> List[LdifEntry]:
+    """Trova la vera entry radice del suffisso, se presente nel file.
+
+    NON usa semplicemente "la profondita' di DN minore" - su un LDIF
+    payload-only (senza struttura di base, come quelli usati in questo
+    stesso progetto per separare i dati di test dalla gerarchia condivisa)
+    tutte le entry possono avere la STESSA profondita' uniforme, facendo
+    scattare quel criterio su ogni singola entry del file (bug reale
+    trovato testando questa funzione su un file payload-only prima di
+    consegnarla). Il criterio corretto: trova il suffisso di DN comune a
+    TUTTE le entry del file, poi verifica se un'entry con ESATTAMENTE
+    quel DN esiste davvero nel file - se non esiste (es. file payload-only
+    dove la radice e' stata volutamente rimossa), restituisce lista vuota,
+    non un indovinello sbagliato.
+    """
+    if not entries:
+        return []
+
+    def dn_components(dn: str) -> List[str]:
+        return [c.strip() for c in dn.split(",")]
+
+    all_components = [dn_components(e.dn) for e in entries]
+    min_len = min(len(c) for c in all_components)
+
+    common_suffix: List[str] = []
+    for i in range(1, min_len + 1):
+        candidates = {tuple(c[-i:]) for c in all_components}
+        if len(candidates) == 1:
+            common_suffix = list(next(iter(candidates)))
+        else:
+            break
+
+    if not common_suffix:
+        return []
+
+    root_dn_normalized = ",".join(common_suffix).lower()
+    return [e for e in entries if e.dn.lower() == root_dn_normalized]
+
+
+def scan_known_oids(entries: List[LdifEntry]) -> List[Tuple[str, str, str]]:
+    """Scansiona TUTTI i valori di TUTTI gli attributi di TUTTE le entry
+    alla ricerca di stringhe che corrispondono a un OID noto in OID_MAP.
+    Normalmente in un LDIF di dati non trova nulla (vedi nota sopra sul
+    perche') - restituisce (dn, attributo, descrizione) per ciascuna
+    corrispondenza trovata, se ce ne sono."""
+    found = []
+    for e in entries:
+        for attr, values in e.attrs.items():
+            for v in values:
+                v_clean = v.strip()
+                if v_clean in OID_MAP:
+                    found.append((e.dn, attr, OID_MAP[v_clean]))
+    return found
+
+
+# ==============================================================================
 # 3. STATISTICHE
 # ==============================================================================
 
@@ -281,6 +421,9 @@ def analyze(
     user_dns = {u.dn.lower() for u in users}
     group_dns = {g.dn.lower() for g in groups}
     all_known_dns = user_dns | group_dns | {e.dn.lower() for e in other}
+
+    root_entries = find_root_entries(entries)
+    known_oids_found = scan_known_oids(entries)
 
     if member_attr is None:
         member_attr = detect_member_attr(groups)
@@ -437,6 +580,30 @@ def analyze(
             "altro": len(other),
             "member_attr_usato": member_attr,
         },
+        "entry_radice": {
+            "count": len(root_entries),
+            "dn": [e.dn for e in root_entries],
+            "dettaglio": [
+                {
+                    "dn": e.dn,
+                    "objectclass": e.get("objectclass"),
+                    "contextcsn": e.get("contextcsn"),
+                    "entryuuid": e.get("entryuuid"),
+                    "altri_attributi": sorted(
+                        a for a in e.attrs
+                        if a not in ("objectclass", "contextcsn", "entryuuid")
+                    ),
+                }
+                for e in root_entries
+            ],
+        },
+        "oid_noti_trovati": {
+            "count": len(known_oids_found),
+            "dettaglio": [
+                {"dn": dn, "attributo": attr, "descrizione": desc}
+                for dn, attr, desc in known_oids_found[:20]
+            ],
+        },
         "membri_per_gruppo_utenti": dist_stats(group_user_counts),
         "membri_per_gruppo_nidificati": dist_stats(group_nested_counts),
         "membri_per_gruppo_totali": dist_stats(group_total_counts),
@@ -506,6 +673,32 @@ def print_report(stats: dict, source: str) -> None:
     print(f"  Gruppi:            {t['gruppi']}")
     print(f"  Altro:             {t['altro']}")
     print(f"  Attributo membri:  {t['member_attr_usato']}")
+
+    er = stats["entry_radice"]
+    print(f"\nEntry radice del suffisso: {er['count']} trovata/e")
+    for d in er["dettaglio"]:
+        print(f"  dn: {d['dn']}")
+        if d["objectclass"]:
+            print(f"    objectClass: {', '.join(d['objectclass'])}")
+        if d["contextcsn"]:
+            print(f"    contextCSN:")
+            for csn in d["contextcsn"]:
+                print(f"      {csn}")
+        if d["entryuuid"]:
+            print(f"    entryUUID: {d['entryuuid'][0]}")
+        if d["altri_attributi"]:
+            print(f"    altri attributi presenti: {', '.join(d['altri_attributi'])}")
+
+    oid = stats["oid_noti_trovati"]
+    print(f"\nOID di protocollo LDAP noti trovati nei valori del file: {oid['count']}")
+    if oid["count"] > 0:
+        print("  (insolito in un LDIF di dati - vedi dettaglio)")
+        for item in oid["dettaglio"]:
+            print(f"    {item['dn']} / {item['attributo']}: {item['descrizione']}")
+    else:
+        print("  (atteso: questi OID appartengono al protocollo LDAP - controlli,")
+        print("   estensioni - non ai dati della directory. Vivono nel root DSE di")
+        print("   un server in esecuzione, non in un export statico come questo.)")
 
     def print_dist(title: str, d: dict):
         print(f"\n{title}")
