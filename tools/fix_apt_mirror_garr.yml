@@ -1,0 +1,68 @@
+# ==============================================================================
+# TITOLO:       Allineamento Mirror APT su GARR (tutti i nodi del cluster)
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.0
+# SCOPO:        Punta sia l'archivio Ubuntu normale sia quello di sicurezza
+#               al mirror GARR (rete della ricerca italiana) su tutti i nodi
+#               - diagnosticato in sessione di lavoro: il mirror US di
+#               default (us.archive.ubuntu.com) e security.ubuntu.com non
+#               erano raggiungibili per un problema di IPv6 non funzionante
+#               a monte (router di casa senza DHCPv6/RA attivo, confermato
+#               fino in fondo alla catena) - GARR risolve il problema di
+#               fatto, verificato manualmente su un nodo prima di essere
+#               esteso qui a tutti.
+#
+# NOTA (per riferimento futuro, non bloccante per l'uso odierno): tenere
+# anche la sezione "security" su un mirror terzo invece che su
+# security.ubuntu.com ufficiale non e' la scelta consigliata per un
+# ambiente di produzione (i mirror di terze parti possono avere una
+# latenza di sincronizzazione sulle patch di sicurezza) - per questo
+# laboratorio di test va bene, ma se questa configurazione venisse mai
+# portata in produzione varrebbe la pena rivalutarlo (magari risolvendo
+# IPv6 sul router, o quantomeno con fix_disable_ipv6.yml gia' pronto, cosi'
+# da poter tornare a security.ubuntu.com senza il blocco IPv6).
+#
+# USO:
+#   ansible-playbook fix_apt_mirror_garr.yml
+# ==============================================================================
+
+---
+- name: "Allineamento Mirror APT su GARR"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  gather_facts: false
+  vars:
+    ubuntu_sources_path: /etc/apt/sources.list.d/ubuntu.sources
+    garr_mirror: "http://ubuntu.mirror.garr.it/ubuntu-archive/"
+
+  tasks:
+    - name: "Scrive ubuntu.sources con il mirror GARR (backup automatico dell'originale)"
+      ansible.builtin.copy:
+        dest: "{{ ubuntu_sources_path }}"
+        backup: true
+        mode: '0644'
+        content: |
+          Types: deb
+          URIs: {{ garr_mirror }}
+          Suites: noble noble-updates noble-backports
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: {{ garr_mirror }}
+          Suites: noble-security
+          Components: main restricted universe multiverse
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+    - name: "Aggiorna la cache apt (verifica pratica che il mirror sia raggiungibile)"
+      ansible.builtin.command: apt-get update
+      register: apt_update_result
+      changed_when: true
+      failed_when: apt_update_result.rc != 0
+
+    - name: "Riepilogo"
+      ansible.builtin.debug:
+        msg: "OK: {{ inventory_hostname }} allineato al mirror GARR, apt update completato con successo."
