@@ -1,0 +1,255 @@
+# ==============================================================================
+# TITOLO:       Tuning Temporaneo per Test di Ricostruzione Read-Only via Replica
+# AUTORE:       Elia Pinto
+# DATA:         Settembre 2026
+# VERSIONE:     1.1
+# SCOPO:        Applica temporaneamente parametri di tuning per velocizzare un
+#               test di ricostruzione completa di una read-only (svuotamento
+#               di /var/lib/ldap + restart, lasciando che syncrepl la
+#               ripopoli da zero), poi li ripristina esattamente com'erano
+#               prima - non a un default fisso, al valore letto dal vivo al
+#               momento dell'enable, salvato su file perche' enable e disable
+#               sono due invocazioni separate (il test nel mezzo puo' durare
+#               a lungo, i fatti di un run Ansible non sopravvivono al run).
+#
+# NOVITÀ v1.1 rispetto a v1.0 (su indicazione dell'utente): olcDbNoSync: TRUE
+# applicato sempre da "enable", non piu' un'opzione separata
+# (enable_nosync_true) - se si lancia questo test, la velocita' e'
+# esplicitamente lo scopo, non ha senso doverla richiedere a parte.
+#
+# PARAMETRI TOCCATI:
+#   - olcDbNoSync: TRUE (su TUTTI i nodi, master E read-only - quella che
+#     sta davvero scrivendo durante il test e' la read-only): stesso
+#     principio gia' verificato con slapadd -q (42min -> 10s a parita' di
+#     risultato) - applicato SEMPRE da "enable", non un'opzione separata da
+#     ricordare (se lanci questo test, la velocita' e' esplicitamente lo
+#     scopo). "disable" riporta il valore originale letto prima di
+#     "enable" (per questo progetto, tipicamente FALSE), non un default
+#     fisso.
+#   - olcSpCheckpoint (solo master, dove syncprov e' caricato): meno pause
+#     di checkpoint durante il burst di scrittura in uscita verso la
+#     read-only che si ricostruisce.
+#   - olcSpSessionlog (solo master): incluso per completezza, ma nota -
+#     nel caso d'uso di QUESTO test (ricostruzione da zero, non recupero da
+#     breve disconnessione) probabilmente non ha impatto misurabile, dato
+#     che una read-only vuota non ha alcun cookie da cui ripartire in modo
+#     incrementale - fa comunque un refresh completo indipendentemente da
+#     quanto sia grande il session log.
+#
+# USO:
+#   ansible-playbook tuning_massivo_enable_disable.yml -e mode=enable
+#   ... esegui qui il tuo test (svuota /var/lib/ldap sulla read-only,
+#       riavvia slapd, cronometra la ricostruzione) ...
+#   ansible-playbook tuning_massivo_enable_disable.yml -e mode=disable
+# ==============================================================================
+
+---
+- name: "Tuning Temporaneo per Test di Ricostruzione Read-Only - {{ mode | default('MODE NON IMPOSTATO') }}"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  gather_facts: false
+  vars:
+    ansible_python_interpreter: auto_silent
+    state_dir: "/var/lib/ldap-tuning-state"
+    state_file: "{{ state_dir }}/tuning_state.json"
+
+    cluster_nodes: "{{ groups['cluster'] | sort }}"
+    readonly_nodes: "{{ groups['readonlyreplica'] | default([]) }}"
+    is_master: "{{ inventory_hostname in cluster_nodes }}"
+
+    mode: ""
+
+  tasks:
+    - name: "[GUARDIA] Verifica che 'mode' sia enable o disable"
+      ansible.builtin.assert:
+        that:
+          - mode in ['enable', 'disable']
+        fail_msg: >-
+          ERRORE: specifica -e mode=enable oppure -e mode=disable.
+        success_msg: "OK: mode={{ mode }}"
+      run_once: true
+      delegate_to: localhost
+      connection: local
+
+    - name: "[SETUP] Crea la directory di stato, se assente"
+      ansible.builtin.file:
+        path: "{{ state_dir }}"
+        state: directory
+        mode: '0700'
+
+    # ==========================================================================
+    # MODE = ENABLE
+    # ==========================================================================
+
+    - name: "[ENABLE] Verifica che non esista gia' uno stato salvato (niente doppio enable)"
+      ansible.builtin.stat:
+        path: "{{ state_file }}"
+      register: existing_state
+      when: mode == 'enable'
+
+    - name: "[ENABLE] Blocca se esiste gia' uno stato salvato - fai prima 'disable', o il valore 'originale' salvato ora sarebbe gia' un valore di tuning"
+      ansible.builtin.assert:
+        that:
+          - not existing_state.stat.exists
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: esiste gia' {{ state_file }} -
+          probabilmente 'enable' e' gia' stato lanciato senza un 'disable'
+          successivo. Lancia prima 'disable', poi ripeti 'enable'.
+      when: mode == 'enable'
+
+    - name: "[ENABLE] Legge il valore attuale di olcDbNoSync"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "olcDatabase={1}mdb,cn=config"
+        -s base olcDbNoSync
+      register: current_nosync
+      changed_when: false
+      when: mode == 'enable'
+
+    - name: "[ENABLE] Legge il valore attuale di olcSpCheckpoint/olcSpSessionlog (solo master)"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -LLL -b "olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config"
+        -s base olcSpCheckpoint olcSpSessionlog
+      register: current_syncprov
+      changed_when: false
+      when: mode == 'enable' and is_master
+
+    - name: "[ENABLE] Costruisce e salva lo stato originale su file"
+      ansible.builtin.copy:
+        dest: "{{ state_file }}"
+        mode: '0600'
+        content: >-
+          {{
+            {
+              "olcDbNoSync": {
+                "was_set": (current_nosync.stdout_lines | select('match', '^olcDbNoSync: ') | list | length) > 0,
+                "value": (current_nosync.stdout_lines | select('match', '^olcDbNoSync: ') | map('regex_replace', '^olcDbNoSync: ', '') | list | first | default('', true))
+              },
+              "olcSpCheckpoint": {
+                "was_set": is_master and (current_syncprov.stdout_lines | select('match', '^olcSpCheckpoint: ') | list | length) > 0,
+                "value": (current_syncprov.stdout_lines | default([]) | select('match', '^olcSpCheckpoint: ') | map('regex_replace', '^olcSpCheckpoint: ', '') | list | first | default('', true))
+              },
+              "olcSpSessionlog": {
+                "was_set": is_master and (current_syncprov.stdout_lines | select('match', '^olcSpSessionlog: ') | list | length) > 0,
+                "value": (current_syncprov.stdout_lines | default([]) | select('match', '^olcSpSessionlog: ') | map('regex_replace', '^olcSpSessionlog: ', '') | list | first | default('', true))
+              }
+            } | to_nice_json
+          }}
+      when: mode == 'enable'
+
+    - name: "[ENABLE] Applica olcDbNoSync: TRUE"
+      ansible.builtin.command: >
+        ldapmodify -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcDbNoSync
+          olcDbNoSync: TRUE
+      changed_when: true
+      when: mode == 'enable'
+
+    - name: "[ENABLE] Applica olcSpCheckpoint/olcSpSessionlog di tuning (solo master)"
+      ansible.builtin.command: >
+        ldapmodify -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config
+          changetype: modify
+          replace: olcSpSessionlog
+          olcSpSessionlog: 100000
+          -
+          replace: olcSpCheckpoint
+          olcSpCheckpoint: 10000 10
+      changed_when: true
+      when: mode == 'enable' and is_master
+
+    - name: "[ENABLE] Riepilogo"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: tuning applicato (olcDbNoSync=TRUE
+          {{ ', olcSpCheckpoint/Sessionlog alzati (master)' if is_master else '' }}).
+          Stato originale salvato in {{ state_file }}.
+      when: mode == 'enable'
+
+    # ==========================================================================
+    # MODE = DISABLE
+    # ==========================================================================
+
+    - name: "[DISABLE] Verifica che esista uno stato salvato da ripristinare"
+      ansible.builtin.stat:
+        path: "{{ state_file }}"
+      register: state_to_restore
+      when: mode == 'disable'
+
+    - name: "[DISABLE] Blocca se non c'e' nulla da ripristinare"
+      ansible.builtin.assert:
+        that:
+          - state_to_restore.stat.exists
+        fail_msg: >-
+          ERRORE su {{ inventory_hostname }}: nessuno stato salvato in
+          {{ state_file }} - 'enable' non e' mai stato lanciato, o
+          'disable' e' gia' stato eseguito.
+      when: mode == 'disable'
+
+    - name: "[DISABLE] Legge lo stato salvato"
+      ansible.builtin.slurp:
+        path: "{{ state_file }}"
+      register: state_raw
+      when: mode == 'disable'
+
+    - name: "[DISABLE] Deriva lo stato come fact"
+      ansible.builtin.set_fact:
+        saved_state: "{{ state_raw.content | b64decode | from_json }}"
+      when: mode == 'disable'
+
+    - name: "[DISABLE] Ripristina olcDbNoSync al valore originale (replace se era impostato, delete se non lo era)"
+      ansible.builtin.command: >
+        ldapmodify -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: olcDatabase={1}mdb,cn=config
+          changetype: modify
+          {% if saved_state.olcDbNoSync.was_set %}
+          replace: olcDbNoSync
+          olcDbNoSync: {{ saved_state.olcDbNoSync.value }}
+          {% else %}
+          delete: olcDbNoSync
+          {% endif %}
+      changed_when: true
+      when: mode == 'disable'
+
+    - name: "[DISABLE] Ripristina olcSpCheckpoint/olcSpSessionlog (solo master, solo se erano impostati)"
+      ansible.builtin.command: >
+        ldapmodify -Y EXTERNAL -H ldapi:///
+      args:
+        stdin: |
+          dn: olcOverlay={0}syncprov,olcDatabase={1}mdb,cn=config
+          changetype: modify
+          {% if saved_state.olcSpCheckpoint.was_set %}
+          replace: olcSpCheckpoint
+          olcSpCheckpoint: {{ saved_state.olcSpCheckpoint.value }}
+          {% else %}
+          delete: olcSpCheckpoint
+          {% endif %}
+          -
+          {% if saved_state.olcSpSessionlog.was_set %}
+          replace: olcSpSessionlog
+          olcSpSessionlog: {{ saved_state.olcSpSessionlog.value }}
+          {% else %}
+          delete: olcSpSessionlog
+          {% endif %}
+      changed_when: true
+      when: mode == 'disable' and is_master
+
+    - name: "[DISABLE] Rimuove il file di stato (il ripristino e' completo)"
+      ansible.builtin.file:
+        path: "{{ state_file }}"
+        state: absent
+      when: mode == 'disable'
+
+    - name: "[DISABLE] Riepilogo"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: parametri ripristinati al valore originale, stato rimosso."
+      when: mode == 'disable'
