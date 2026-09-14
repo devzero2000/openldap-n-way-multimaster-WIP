@@ -4,7 +4,7 @@
 # TITOLO:       analyze_ldif.py - Analisi statistica di un LDIF LDAP (utenti/gruppi)
 # AUTORE:       Elia Pinto
 # DATA:         Settembre 2026
-# VERSIONE:     1.4
+# VERSIONE:     1.5
 # SCOPO:        Legge un file LDIF (RFC 2849) e produce statistiche utili a
 #               caratterizzare una base dati LDAP: conteggi di entry per
 #               tipo, distribuzione dei membri per gruppo e dei gruppi per
@@ -13,6 +13,19 @@
 #               riferimenti pendenti (dangling), valori duplicati, coerenza
 #               incrociata memberOf/member. Nessuna dipendenza esterna -
 #               solo libreria standard di Python 3.
+#
+# NOVITÀ v1.5 rispetto a v1.4 (richiesta dell'utente: output direttamente
+# pubblicabile su GitHub, senza file intermedi): aggiunta l'opzione
+# --markdown, che produce il report in Markdown nativo (intestazioni "#"/
+# "##", tabelle vere "| colonna |") invece del testo con allineamento a
+# colonne di sempre - quest'ultimo, se semplicemente rinominato .md,
+# renderebbe male su GitHub (nessuna tabella riconosciuta). Stessa
+# identica logica di analisi (la funzione analyze() non e' cambiata) -
+# cambia solo la formattazione dell'output, in una funzione parallela
+# (print_report_markdown) che non tocca quella esistente. Verificato che
+# la modalita' testo esistente resti invariata (nessuna regressione) e
+# che le tabelle Markdown generate abbiano tutte una struttura coerente
+# (stesso numero di colonne su ogni riga della stessa tabella).
 #
 # NOVITÀ v1.4 rispetto a v1.3 (errore reale trovato controllando l'output
 # di un run vero di analyze_rootdse.py contro un server, non solo
@@ -790,6 +803,191 @@ def print_report(stats: dict, source: str) -> None:
 
 
 # ==============================================================================
+# 4b. REPORT IN MARKDOWN NATIVO (per pubblicazione, es. su GitHub)
+#
+# Stessa identica struttura e stessi dati di print_report() sopra - cambia
+# solo la formattazione: intestazioni "#"/"##" vere, tabelle Markdown vere
+# ("| colonna | colonna |") invece di testo allineato a colonne, che su
+# GitHub non renderebbe come tabella.
+# ==============================================================================
+
+def _md_table(headers: List[str], rows: List[List]) -> None:
+    print("| " + " | ".join(headers) + " |")
+    print("|" + "|".join(["---"] * len(headers)) + "|")
+    for row in rows:
+        print("| " + " | ".join(str(c) for c in row) + " |")
+    print()
+
+
+def _md_dist_table(title: str, d: dict) -> None:
+    print(f"**{title}**\n")
+    _md_table(
+        ["count", "min", "max", "media", "mediana", "dev.std"],
+        [[d["count"], d["min"], d["max"], d["mean"], d["median"], d["stddev"]]],
+    )
+
+
+def print_report_markdown(stats: dict, source: str) -> None:
+    print(f"# Analisi LDIF: `{source}`\n")
+
+    t = stats["totali"]
+    print("## Totali\n")
+    _md_table(
+        ["Metrica", "Valore"],
+        [
+            ["Entry totali", t["entry_totali"]],
+            ["Utenti", t["utenti"]],
+            ["Gruppi", t["gruppi"]],
+            ["Altro", t["altro"]],
+            ["Attributo membri usato", t["member_attr_usato"]],
+        ],
+    )
+
+    er = stats["entry_radice"]
+    print(f"## Entry radice del suffisso\n")
+    print(f"Trovata/e: {er['count']}\n")
+    for d in er["dettaglio"]:
+        print(f"- **dn:** `{d['dn']}`")
+        if d["objectclass"]:
+            print(f"  - objectClass: {', '.join(d['objectclass'])}")
+        if d["contextcsn"]:
+            print(f"  - contextCSN:")
+            for csn in d["contextcsn"]:
+                print(f"    - `{csn}`")
+        if d["entryuuid"]:
+            print(f"  - entryUUID: `{d['entryuuid'][0]}`")
+        if d["altri_attributi"]:
+            print(f"  - altri attributi presenti: {', '.join(d['altri_attributi'])}")
+    print()
+
+    oid = stats["oid_noti_trovati"]
+    print(f"## OID di protocollo LDAP noti trovati nei valori del file\n")
+    print(f"Trovati: {oid['count']}\n")
+    if oid["count"] > 0:
+        print("(insolito in un LDIF di dati - vedi dettaglio)\n")
+        _md_table(
+            ["dn", "attributo", "descrizione"],
+            [[i["dn"], i["attributo"], i["descrizione"]] for i in oid["dettaglio"]],
+        )
+    else:
+        print(
+            "Atteso: questi OID appartengono al protocollo LDAP (controlli, "
+            "estensioni) - non ai dati della directory. Vivono nel root DSE "
+            "di un server in esecuzione, non in un export statico come "
+            "questo.\n"
+        )
+
+    print("## Appartenenza a gruppi\n")
+    _md_dist_table("Membri per gruppo (solo UTENTI diretti)", stats["membri_per_gruppo_utenti"])
+    _md_dist_table("Membri per gruppo (solo GRUPPI nidificati)", stats["membri_per_gruppo_nidificati"])
+    _md_dist_table("Membri per gruppo (TOTALI, utenti+gruppi)", stats["membri_per_gruppo_totali"])
+
+    print("**Distribuzione membri per gruppo**\n")
+    _md_table(
+        ["Fascia", "Conteggio"],
+        [[label, count] for label, count in stats["membri_per_gruppo_istogramma"].items()],
+    )
+
+    eg = stats["gruppi_vuoti"]
+    print(f"**Gruppi senza alcun membro:** {eg['count']}\n")
+    if eg["esempi"]:
+        print(f"Esempi: {', '.join('`' + e + '`' for e in eg['esempi'])}\n")
+
+    _md_dist_table("Gruppi per utente (calcolato da member: sui gruppi)", stats["gruppi_per_utente"])
+    print("**Distribuzione gruppi per utente**\n")
+    _md_table(
+        ["Fascia", "Conteggio"],
+        [[label, count] for label, count in stats["gruppi_per_utente_istogramma"].items()],
+    )
+
+    moc = stats["memberof_coerenza"]
+    print("## Coerenza memberOf vs member:\n")
+    print(f"Confronto per utente, non solo per conteggio.\n")
+    print(f"- Utenti con memberOf presente: {moc['utenti_con_memberof']}/{moc['utenti_totali']}")
+    if moc["utenti_con_memberof"] > 0:
+        print()
+        _md_dist_table("Gruppi per utente (calcolato da memberOf dichiarato)", moc["conteggio_da_memberof"])
+        print(f"**Utenti con DISALLINEAMENTO tra memberOf e member:** {moc['utenti_con_disallineamento']}\n")
+        if moc["esempi_disallineamento"]:
+            for ex in moc["esempi_disallineamento"]:
+                print(f"- `{ex}`")
+            print()
+
+    ou = stats["utenti_orfani"]
+    print(f"## Utenti senza alcuna appartenenza a gruppi\n")
+    print(f"Totale: {ou['count']}\n")
+    if ou["esempi"]:
+        print(f"Esempi: {', '.join('`' + e + '`' for e in ou['esempi'])}\n")
+
+    an = stats["annidamento"]
+    print("## Annidamento gruppi\n")
+    _md_table(
+        ["Metrica", "Valore"],
+        [
+            ["Gruppi con figli nidificati", an["gruppi_con_figli_nidificati"]],
+            ["Profondita' massima catena", an["profondita_massima"]],
+            ["Cicli rilevati", an["numero_cicli"]],
+        ],
+    )
+    if an["cicli_rilevati"]:
+        print("**ATTENZIONE - esempi di cicli (gruppo che referenzia se stesso, direttamente o a catena):**\n")
+        for c in an["cicli_rilevati"]:
+            print(f"- `{c}`")
+        print()
+
+    dr = stats["riferimenti_pendenti"]
+    print(f"## Riferimenti pendenti\n")
+    print(f"`member:` che punta a un DN inesistente nel file - totale: {dr['count']}\n")
+    if dr["esempi"]:
+        for ex in dr["esempi"]:
+            print(f"- `{ex}`")
+        print()
+
+    dv = stats["valori_duplicati"]
+    print(f"## Valori duplicati\n")
+    print(f"Gruppi con valori `member:` duplicati nella stessa entry: {dv['gruppi_con_duplicati']}\n")
+    if dv["esempi"]:
+        print(f"Esempi: {', '.join('`' + e + '`' for e in dv['esempi'])}\n")
+
+    print("## objectClass piu' frequenti\n")
+    _md_table(
+        ["objectClass", "Conteggio"],
+        [[oc, count] for oc, count in stats["objectclass_frequenza"].items()],
+    )
+
+    print("## Attributi piu' frequenti\n")
+    _md_table(
+        ["Attributo", "Conteggio"],
+        [[a, count] for a, count in stats["attributi_frequenza"].items()],
+    )
+
+    _md_dist_table("Attributi per entry", stats["attributi_per_entry"])
+
+    pw = stats["password"]
+    print(f"## Password\n")
+    print(f"{pw['utenti_con_password']}/{pw['utenti_totali']} utenti con userPassword impostata\n")
+    if pw["schema_hash"]:
+        print("**Schema di hashing**\n")
+        _md_table(
+            ["Schema", "Conteggio"],
+            [[scheme, count] for scheme, count in pw["schema_hash"].items()],
+        )
+
+    _md_dist_table("Profondita' del DN", stats["dn"]["profondita"])
+    print("**Container (genitore del DN) piu' popolati**\n")
+    _md_table(
+        ["Conteggio", "Container"],
+        [[count, parent] for parent, count in stats["dn"]["container_piu_popolati"].items()],
+    )
+
+    _md_dist_table(
+        "Dimensione approssimata per entry (byte, somma valori attributi)",
+        stats["dimensione_entry_byte"],
+    )
+
+
+
+# ==============================================================================
 # 5. CLI
 # ==============================================================================
 
@@ -831,6 +1029,14 @@ def main() -> None:
         "--json",
         metavar="FILE",
         help="Scrive anche le statistiche in formato JSON su questo file",
+    )
+    parser.add_argument(
+        "--markdown",
+        action="store_true",
+        help="Produce il report in Markdown nativo (intestazioni e tabelle vere) "
+             "invece del testo semplice - pensato per essere scritto direttamente "
+             "in un file .md pubblicabile (es. su GitHub), senza bisogno di "
+             "avvolgerlo in un blocco di codice.",
     )
 
     # Invocato senza alcun argomento: mostra l'help completo (con esempi),
@@ -877,7 +1083,10 @@ def main() -> None:
         sys.exit(1)
 
     stats = analyze(entries, user_oc, group_oc, member_attr)
-    print_report(stats, args.ldif_file)
+    if args.markdown:
+        print_report_markdown(stats, args.ldif_file)
+    else:
+        print_report(stats, args.ldif_file)
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
