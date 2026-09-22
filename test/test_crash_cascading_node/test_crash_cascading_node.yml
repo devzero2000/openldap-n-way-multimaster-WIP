@@ -8,6 +8,15 @@
 #               (mdb_stat), verifica che slapd riparta davvero, misurazione
 #               della convergenza su TUTTO il cluster (master + read-only),
 #               e pulizia automatica del dataset di test.
+# VERSIONE:     8.0 (node1/node2/node3/node4 non sono piu' hostname
+#               scritti a mano in "vars:" - derivati dai gruppi REALI
+#               dell'inventory, "groups['cluster'] | sort" e
+#               "groups['readonlyreplica'] | sort", stesso principio
+#               gia' usato nel playbook di deploy master. Nessun
+#               cambiamento di comportamento atteso - stesso ordine
+#               risultante, dato lo stesso inventory - solo la fonte
+#               del dato cambia da statica a dinamica)
+#
 # VERSIONE:     7.9 (Numero di utenti iniettati ridotto da 2000 a 500.
 #               Un'indagine approfondita (fuori da questo file - vedi
 #               documento di supporto) ha isolato un bug di replica
@@ -505,10 +514,16 @@
 - name: "CRASH TEST 1: Failover a Cascata Non Pulito (nodo2 + nodo3) sotto Carico WAN"
   hosts: localhost
   vars:
-    node1: "ubuntu24lts1.example.com"
-    node2: "ubuntu24lts2.example.com"
-    node3: "ubuntu24lts3.example.com"
-    node4: "ubuntu24lts4.example.com"
+    # Derivati dai gruppi REALI dell'inventory (stesso principio gia' usato
+    # nel playbook di deploy master: "groups['cluster'] | sort | first" per
+    # un ordine deterministico), non hostname scritti a mano. Ogni riga e'
+    # autosufficiente (non fa riferimento ad altre variabili definite in
+    # questo stesso blocco), per non dipendere dall'ordine di risoluzione
+    # delle variabili.
+    node1: "{{ (groups['cluster'] | sort)[0] }}"
+    node2: "{{ (groups['cluster'] | sort)[1] }}"
+    node3: "{{ (groups['cluster'] | sort)[2] }}"
+    node4: "{{ (groups['readonlyreplica'] | sort)[0] }}"
     ldap_basedn: "dc=example,dc=com"
     ldap_admin_dn: "cn=admin,dc=example,dc=com"
     ldap_admin_pass: "openldap"
