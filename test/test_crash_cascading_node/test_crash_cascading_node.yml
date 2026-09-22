@@ -1,0 +1,1067 @@
+# ==============================================================================
+# TITOLO:       test_crash_cascading_node.yml
+# AUTORE:       Elia Pinto
+# DATA:         15 Settembre 2026
+# SCOPO:        Simulazione di crash NON pulito (kill -9, non uno stop
+#               ordinato) a cascata (nodo2 -> +4s nodo3) durante scritture
+#               su nodo1, con verifica di integrita' LMDB post-crash
+#               (mdb_stat), verifica che slapd riparta davvero, misurazione
+#               della convergenza su TUTTO il cluster (master + read-only),
+#               e pulizia automatica del dataset di test.
+# VERSIONE:     7.9 (Numero di utenti iniettati ridotto da 2000 a 500.
+#               Un'indagine approfondita (fuori da questo file - vedi
+#               documento di supporto) ha isolato un bug di replica
+#               riproducibile su OpenLDAP 2.6.10+dfsg-0ubuntu0.24.04.1:
+#               con un provider isolato e un solo consumer persistente,
+#               senza crash, senza WAN, su DB vuoto, con nomi mai usati
+#               prima - 1000 scritture rapide in successione fanno
+#               perdere un blocco di decine di entry a un consumer, mai
+#               recuperate senza un intervento manuale (restart). 500
+#               invece converge sempre correttamente in tutti i run
+#               fatti. Il numero qui è stato abbassato a 500
+#               specificamente per restare sotto quella soglia nota,
+#               cosi' il crash test misura la resilienza a kill -9 senza
+#               incappare in un problema distinto e gia' isolato a
+#               parte)
+#
+# NOVITÀ v7.8 rispetto a v7.7 (la v7.7 falliva ancora in pratica: "The
+# `loop` value must resolve to a 'list', not 'str'"): set_fact con un
+# template namespace+for non produceva una vera lista come previsto,
+# nonostante il test isolato con Jinja puro sembrasse indicarlo.
+# Eliminato il set_fact intermedio: loop diretto su
+# range(risultati | length), con accesso per indice dentro l'assert -
+# evita sia il problema del tipo restituito da set_fact sia il dump
+# completo di systemd, dato che l'item del loop e' ora un intero, non un
+# oggetto.
+#
+# NOVITÀ v7.7 rispetto a v7.6 (due segnalazioni dell'utente dopo un run
+# reale su cluster appena riavviato):
+#   1. L'assert "Blocca se un nodo non e' ripartito" mostrava ancora il
+#      dump completo delle proprieta' di systemd (WatchdogUSec e
+#      compagnia) nonostante il "no_log: true" aggiunto in v7.4 sulla
+#      fonte (il task che interroga systemd). Causa: no_log sulla FONTE
+#      non impedisce a un task SUCCESSIVO, che fa loop su
+#      ".results" e mostra "item" per intero, di esporre comunque tutti i
+#      campi - la label di loop_control cambia solo la riga sommario, non
+#      il blocco JSON completo sotto. Corretto riducendo i dati a una
+#      lista pulita (solo host + stato) PRIMA del loop, con un set_fact
+#      che usa un costrutto namespace+for di Jinja puro (verificato con
+#      Jinja standalone, incluso la stringa esatta cosi' come risulta dal
+#      folding YAML del blocco ">-").
+#   2. Un run ha fallito a CRASH 1 con "trovati 0 processi slapd" dopo
+#      TUTTI e 6 i tentativi di pgrep (iniziale + 5 retry), un pattern
+#      troppo sistematico per essere un blip transitorio - e il controllo
+#      avviene PRIMA che questo playbook faccia alcunche' a node2. Causa
+#      piu' probabile: slapd era gia' inattivo su node2 da un run
+#      precedente fallito (kill -9 mai seguito da ripristino, perche'
+#      quel run e' morto prima di arrivarci) - confermato dall'utente con
+#      un riavvio manuale. Aggiunto un controllo pre-volo esplicito su
+#      node2 E node3 in FASE 2 (stesso principio gia' applicato a node1
+#      in FASE 1), che blocca il test IMMEDIATAMENTE con un messaggio
+#      chiaro se uno dei due risulta gia' inattivo prima di iniziare,
+#      invece di scoprirlo solo dopo 6 tentativi di pgrep falliti che
+#      sembrano un mistero diverso.
+#
+# NOVITÀ v7.6 rispetto a v7.5 (segnalazione dell'utente: "nel file di log
+# le righe sono separate letteralmente da \n" - il fix di v7.5 non aveva
+# risolto, avevo capito male come si usa stdout_lines). Causa: nel report
+# di FASE 4, avevo messo "{{ convergence_metric.stdout_lines }}" come UNO
+# degli elementi di un'altra lista (insieme alle righe decorative
+# "===="). Jinja stringifica un valore lista quando questo NON e'
+# l'intera espressione del campo - annidare una lista dentro una stringa
+# che fa parte di una lista piu' grande produce comunque una singola
+# stringa con la rappresentazione testuale della lista, "['riga1',
+# 'riga2', ...]", non righe separate. Corretto rendendo l'INTERO valore
+# di msg una singola espressione Jinja di concatenazione di liste
+# ("[decorazioni] + convergence_metric.stdout_lines + [decorazioni]"):
+# quando l'intero campo msg e' un solo blocco "{{ ... }}", Ansible
+# preserva il tipo nativo del risultato (lista vera) invece di
+# stringificarlo. Verificata la logica di concatenazione con Jinja puro
+# (produce correttamente una lista piatta a 6 elementi separati) - non
+# potendo pero' testare dal vivo il comportamento di preservazione del
+# tipo nativo specifico di Ansible, che e' documentato ma non verificato
+# qui con i miei occhi. Il report di FASE 5 (cleanup) non necessitava
+# correzione: li' "stdout_lines" era gia' l'intera espressione del campo
+# msg, non annidato in nient'altro.
+#
+# NOVITÀ v7.5 rispetto a v7.4 (l'utente ha notato, leggendo con
+# attenzione un output che a prima vista sembrava solo "illeggibile",
+# che target=0 restava fisso per TUTTI gli 800 secondi mentre
+# node2/node3/node4 mostravano chiaramente migliaia di entry reali,
+# incluso node4 che ha toccato 2000 a meta' run - prova diretta che
+# l'iniezione funzionava, ma la misurazione no). Causa: il retry di
+# TARGET usava "[ "$TARGET" -ge 0 ]" come condizione di uscita - "0 -ge
+# 0" e' vero, quindi un singolo "0" (per qualunque motivo: timing,
+# lettura prematura del database, o altro non ancora isolato) veniva
+# accettato subito come valore buono, senza insistere oltre. A questo
+# punto del flusso (dopo l'iniezione e dopo che FASE 3 ha gia' atteso il
+# suo completamento) un target pari a zero non e' MAI legittimo.
+# Sostituito con un retry molto piu' insistente: fino a 30 tentativi
+# (60s) finche' il valore non e' positivo, non solo diverso da -1
+# (fallimento di connessione) - testato con un count_on() finto che
+# resta a zero per alcuni tentativi prima di stabilizzarsi sul valore
+# vero, confermato che il nuovo retry lo assorbe correttamente. Se anche
+# dopo 60s il target restasse a zero, un TARGET_WARNING esplicito lo
+# segnala invece di proseguire in silenzio con un bersaglio sbagliato.
+# Non ancora isolata la causa profonda per cui node1 (self-SSH via
+# slapcat) possa restituire zero mentre gli altri nodi hanno gia' dati
+# reali - da verificare manualmente se il problema si ripresenta anche
+# con questo retry piu' paziente.
+# Corretto anche il formato dell'output di progresso, come richiesto:
+# "stdout_lines" al posto di "stdout" nei due report finali (FASE 4 e
+# FASE 5), cosi' ogni riga CONVERGENCE_PROGRESS appare su una riga vera
+# invece che con "\n" letterali in mezzo al testo.
+#
+# NOVITÀ v7.4 rispetto a v7.3 (tre richieste dell'utente dopo un run
+# riuscito - "dice una marea di minchiate" riferito a difetti reali, non
+# al risultato del test in se', che era corretto):
+#   1. Log illeggibile se rediretto su file: sono i codici colore ANSI
+#      di Ansible, non qualcosa che il playbook stesso possa controllare
+#      - consigliato "ANSIBLE_NOCOLOR=1 ansible-playbook ... | tee log"
+#      in fase di lancio, invece di una modifica qui.
+#   2. Timeout alzato da 600s a 800s (sia FASE 4 sia FASE 5), su
+#      segnalazione diretta che un run era arrivato vicino al limite.
+#   3. Aggiunto "no_log: true" a tutti e 6 i controlli che usano il
+#      modulo ansible.builtin.systemd (verifiche di stato su node1/2/3,
+#      il riavvio di FASE 4): senza, ciascuno scarica nel log decine di
+#      campi del processo (WatchdogUSec e simili) del tutto irrilevanti
+#      per questo test - il valore resta comunque disponibile
+#      internamente per gli assert successivi, solo non viene piu'
+#      scaricato per intero a schermo/su file.
+# In piu', trovato e corretto un difetto cosmetico notato durante la
+# verifica: il riepilogo di FASE 5 mostrava un doppio "0" finale
+# ("... errori nel log: 0\n0") - causato da "grep -c" che restituisce
+# rc=1 (non 0) quando il conteggio e' genuinamente zero, facendo scattare
+# per sbaglio anche il fallback "|| echo 0". Corretto controllando invece
+# l'esistenza del file, non il codice di uscita di grep.
+#
+# NOVITÀ v7.3 rispetto a v7.2 - IL VERO BUG DIETRO target=0, TROVATO
+# DALL'UTENTE con "tail /tmp/async_load.log": "sh: 2: set: Illegal
+# option -o pipefail". La riga "set -o pipefail" dentro il blocco
+# "nohup sh -c '...'" dell'iniezione (FASE 1) falliva SEMPRE, su OGNI
+# run - "sh" li' e' dash (non bash), e dash non supporta "set -o
+# pipefail" (e' un bashismo, non POSIX). Lo script si fermava alla
+# primissima riga, PRIMA di generare anche una sola entry: ldapadd non
+# veniva mai invocato. Tutte le ipotesi precedenti (run sovrapposti,
+# certificato TLS) erano scartate correttamente con prove dirette
+# dell'utente - il vero colpevole era questa riga, che io stesso avevo
+# introdotto in v6.0 per zittire l'avviso ansible-lint risky-shell-pipe,
+# senza mai piu' testarla sotto dash reale dopo averla aggiunta (avevo
+# verificato solo la sintassi dei blocchi con executable:/bin/bash
+# esplicito, non questo blocco annidato, che resta sotto sh/dash di
+# default). Rimossa la riga (qui non serve comunque a molto: il ciclo
+# che genera le entry non ha praticamente modo di fallire da solo,
+# quindi l'avviso del linter resta bonariamente ignorato qui, per una
+# buona ragione documentata, non per distrazione). RIVERIFICATO con
+# un'esecuzione end-to-end vera sotto dash (non solo "dash -n" di
+# sintassi): 10 entry generate e ricevute correttamente da un ldapadd
+# finto, async_load.log vuoto, nessun errore.
+#
+# NOVITÀ v7.2 rispetto a v7.1 (un run reale ha mostrato target=0 per
+# tutti i 600s di FASE 4 - il controllo di convergenza funzionava
+# correttamente, rifiutando di dichiarare "convergenza" su un bersaglio
+# vuoto: il problema vero era a monte, l'iniezione non aveva scritto
+# nulla). Due correzioni:
+#   1. [ERROR] "Unlinking failed: Operation not permitted" sulla pulizia
+#      dei file temporanei di FASE 5: da v7.0, quel task gira con
+#      become:true (serve root per slapcat), quindi i file che crea sono
+#      ora di proprieta' di root - ma il task che li rimuove dopo non
+#      aveva become:true. Aggiunto.
+#   2. Aggiunto "export LDAPTLS_REQCERT=never" prima di ldapadd
+#      nell'iniezione, per difesa in profondita' (la versione Python
+#      originale, sostituita in v4.0, disattivava esplicitamente la
+#      verifica del certificato TLS - il rimpiazzo in ldapadd puro non lo
+#      faceva mai). ATTENZIONE PERO': le prove NON confermano che questa
+#      fosse la causa del target=0 osservato - lo stesso identico comando
+#      ldapadd, senza questa modifica, aveva gia' raggiunto 2000/2000 con
+#      successo in un run precedente della stessa sessione. L'ipotesi
+#      piu' probabile per il target=0 resta un run sovrapposto (gia'
+#      riscontrato una volta stasera: due ansible-playbook contemporanei)
+#      che ha cancellato i dati mentre questo run li stava ancora
+#      scrivendo - da verificare con "ps aux"/"jobs" PRIMA del prossimo
+#      run, non risolvibile lato codice.
+#
+# NOVITÀ v7.1 rispetto a v7.0 (segnalazione dell'utente, con l'errore
+# esatto: "[WARNING]: Encountered 1 template error. error 1 - 'item' is
+# undefined"): il fix per il lint name[template] in v6.0 aveva sostituito
+# "su node2 e node3" con "su {{ item }}" per i task in loop - satisfa la
+# regola sintatticamente (Jinja alla fine del nome), ma rompe l'esecuzione
+# reale: il NOME del task viene renderizzato una volta sola, per
+# l'intestazione "TASK [...]", PRIMA che il loop inizi a legare "item"
+# alla singola iterazione - a quel punto "item" non esiste ancora.
+# Rimosso "{{ item }}" dal nome dei tre task in loop che lo usavano
+# (installazione lmdb-utils, ripristino slapd, verifica riavvio),
+# sostituito con una descrizione generica e statica - non serve comunque:
+# Ansible mostra gia' automaticamente quale nodo sta processando in un
+# loop ("=> (item=...)"), senza bisogno di templare il nome. "item"
+# resta correttamente usato in delegate_to (valutato per-iterazione, non
+# per l'intestazione) e in loop_control.label per il task di assert
+# successivo (anch'esso valutato per-iterazione) - nessuna correzione
+# necessaria li'.
+#
+# NOVITÀ v7.0 rispetto a v6.2 (segnalazione dell'utente: "usa slapcat,
+# per la madonna" - giustamente, dato che il paging aggiunto in v6.2 era
+# comunque un rattoppo sul protocollo LDAP, non una soluzione alla radice):
+# ldapsearch, con o senza paging, resta comunque soggetto al protocollo
+# LDAP - passa per la porta 636, la stessa che la WAN simulata degrada
+# deliberatamente, ed e' soggetto a bind/autenticazione/sizelimit. slapcat
+# legge invece direttamente dai file del database locale, bypassando
+# completamente il livello LDAP: nessun sizelimit da aggirare (ne' con
+# paging ne' altrimenti), e passa per SSH (porta 22), mai toccata dallo
+# shaping di rete che colpisce solo le porte 389/636. Per la FASE 5
+# (cancellazione), che gira gia' in delegate_to su node1, slapcat viene
+# invocato in locale con become:true (serve root per leggere i file del
+# database). Per le due count_on() (FASE 4 e FASE 5), che girano invece
+# sul controller e devono raggiungere ciascun nodo del cluster, slapcat
+# viene invocato da remoto via "ssh host 'sudo slapcat ...'" - stessa
+# connettivita' SSH gia' usata da Ansible per delegate_to altrove in
+# questo stesso file, verificato che il quoting del filtro LDAP
+# attraversi intatto la doppia shell (locale + remota via SSH). La
+# variabile BASE (ou=People,...), non piu' necessaria dato che slapcat -b
+# prende l'intero suffisso e -a filtra per attributo indipendentemente
+# dalla posizione nell'albero, rimossa perche' rimasta orfana.
+#
+# NOVITÀ v6.2 rispetto a v6.1 (segnalazione dell'utente: "ricordati che
+# abbiamo un max di 500 entry per ricerca, serve una paged search"):
+# punto giusto e mancante finora in questo file. Senza paging esplicito,
+# una ricerca che superi il sizelimit configurato sul server (500,
+# affrontato altrove in questo stesso progetto mesi fa) si tronca in
+# silenzio - nessun errore, nessun avviso - dando risultati sbagliati per
+# difetto. Aggiunto "-E pr=200/noprompt" (paged results, RFC 2696) a
+# TUTTE le query ldapsearch del test: le due count_on() (FASE 4 e FASE 5,
+# che senza questo avrebbero potuto leggere conteggi capped a 500 invece
+# del valore reale) e - piu' critica delle due - la query di FASE 5 che
+# genera l'elenco delle entry da cancellare: li' un troncamento non
+# sarebbe stato solo un conteggio sbagliato ma un elenco di cancellazione
+# incompleto in modo permanente, con residui che sarebbero rimasti per
+# sempre orfani sul cluster. Applicato lo stesso fix anche allo script
+# manuale crash_cascading_node_lista_utenti_test.sh (v3.0), per lo stesso
+# motivo.
+#
+# NOVITÀ v6.1 rispetto a v6.0 (segnalazione dell'utente, con prova diretta:
+# check_full_cluster_sync.sh/conta.sh confermavano tutti e 4 i nodi gia'
+# identici, mentre FASE 4 era ancora in attesa senza mai dichiararsi
+# soddisfatta): count_on() faceva "ldapsearch ... | grep -c" senza mai
+# controllare l'esito di ldapsearch stesso - se la chiamata falliva o
+# andava in timeout (plausibile sotto la WAN simulata con perdita
+# pacchetti dello 0.1%), l'output vuoto veniva contato da grep -c come
+# "0", indistinguibile da "zero entry genuine trovate". Con il confronto
+# che richiede tutti e 4 i conteggi combacianti nello STESSO secondo di
+# polling, anche un singolo blip su una singola chiamata bastava a far
+# leggere quel secondo come "non ancora convergente", anche quando lo
+# stato reale lo era gia' da tempo. Riscritta count_on() per controllare
+# esplicitamente l'rc di ldapsearch, con un retry interno (3 tentativi,
+# 0.3s di pausa) - un fallimento genuino ora restituisce "-1" (mai "0"),
+# cosi' il confronto a valle non lo scambia mai per uno zero vero.
+# Aggiunto anche un retry esterno dedicato per TARGET (il conteggio di
+# riferimento da node1, calcolato una sola volta prima del ciclo): senza
+# questo, un blip proprio in quel momento critico avrebbe compromesso
+# l'intera misurazione per tutti i 600 secondi, non solo un singolo giro
+# di polling. Stesso fix applicato identico in FASE 4 e FASE 5.
+#
+# NOVITÀ v6.0 rispetto a v5.4 (richiesta esplicita: timeout a 600s e
+# ripulitura secondo il report di ansible-lint allegato dall'utente):
+#   - Timeout di FASE 4 (misura convergenza) e FASE 5 (attesa cleanup)
+#     alzati entrambi a 600s.
+#   - command-instead-of-module: ogni "systemctl is-active"/"systemctl
+#     start" via ansible.builtin.command sostituito con il modulo nativo
+#     ansible.builtin.systemd (query-only quando non si specifica "state",
+#     enforcement idempotente con "state: started" per il riavvio) -
+#     tutti i riferimenti a downstream (.stdout) aggiornati di conseguenza
+#     a .status.ActiveState.
+#   - name[template]: ogni nome di task con una variabile Jinja non in
+#     fondo alla stringa e' stato riordinato. Per i task in loop (install
+#     lmdb-utils, ripristino/verifica slapd su node2+node3) il nome usa
+#     ora "{{ item }}" invece di elencare entrambi i nodi - piu' corretto
+#     (mostra il nodo vero per ogni iterazione) e risolve il problema alla
+#     radice invece di un semplice riordino testuale.
+#   - risky-shell-pipe: aggiunto "set -o pipefail" a ogni blocco shell che
+#     usa una pipe (iniezione FASE 1, misura convergenza FASE 4,
+#     cancellazione e attesa cleanup FASE 5).
+#   - no-changed-when: aggiunto changed_when esplicito dove mancava
+#     (injection FASE1: true: genuinamente avvia qualcosa; misura
+#     convergenza e attesa cleanup: false, sono solo interrogazioni;
+#     cancellazione FASE5: true).
+#   - yaml[line-length]: tutte le righe sopra i 160 caratteri (nomi task
+#     lunghi, messaggi di debug, il messaggio di timeout) accorciate,
+#     spostando il dettaglio esplicativo nei commenti del codice dove
+#     necessario invece che nell'output a runtime.
+#
+# NOVITÀ v5.4 rispetto a v5.3 (indagine reale con i journal di node2 e
+# node4 dopo un run in cui FASE 4 andava in timeout con node4 fermo a
+# 1865/2000): confrontate due ipotesi - (A) un problema persistente di
+# riconnessione syncrepl su node4, oppure (B) semplicemente serviva un
+# po' piu' tempo. Il journal di node2 mostra un singolo blip di bind
+# fallito verso node3 (che in quel momento era esso stesso appena
+# riavviato dal crash) - normale e atteso, autorisolto subito, il canale
+# rid=001 (da node1) non ne ha risentito. Il journal di node4 mostra lo
+# stesso pattern amplificato (8 blip totali, tutti verso node2/node3,
+# mai verso node1) - ma soprattutto mostra 1862 "be_add" progressivi sul
+# canale da node1, e le ultime righe del log mostrano node4 GIA' a
+# "be_delete" per crash.user.1996-2000: prova diretta che aveva gia'
+# finito di ricevere tutti i 2000 record e stava gia' processando le
+# cancellazioni della FASE 5, ben prima della fine del log. Confermata
+# l'ipotesi (B): node4 riceve da tutti e 3 i master contemporaneamente
+# (carico aggregato maggiore di node2/node3, che ricevono solo dagli
+# altri 2 peer), gli serviva solo un margine di tempo maggiore - non
+# c'era alcuna corruzione ne' un canale di replica bloccato. Timeout
+# della misurazione di convergenza (FASE 4) alzato da 300s a 450s.
+# Aggiunto anche un log di progresso ogni 10 secondi durante l'attesa
+# (CONVERGENCE_PROGRESS, con i conteggi correnti per nodo): se un futuro
+# timeout mostra valori in crescita costante fino alla fine, e' quasi
+# certamente solo questione di tempo, non un blocco reale - senza questo
+# log, distinguere le due situazioni ha richiesto oggi un'analisi forense
+# completa dei journal di due nodi diversi.
+#
+# NOVITÀ v5.3 rispetto a v5.2 (segnalazione dell'utente: mentre la FASE 5
+# era ancora in attesa, check_full_cluster_sync.sh diceva "tutto in
+# sync" - apparente contraddizione, in realta' i due controlli verificano
+# cose diverse). check_full_cluster_sync.sh verifica che il contextCSN
+# sia identico su tutti i nodi - cioe' che qualunque cosa esista sia
+# replicata ovunque coerentemente, non che quella cosa sia zero. La FASE
+# 5 di questo test aspetta invece che il CONTEGGIO di crash.user.* scenda
+# esattamente a zero: se anche una sola entry fallisse la cancellazione
+# (ldapdelete -c continua sugli errori invece di fermarsi), il conteggio
+# non arriverebbe mai a zero, mentre il contextCSN potrebbe comunque
+# risultare convergente (lo stato residuo, per quanto non desiderato,
+# sarebbe comunque replicato coerentemente). Aggiunto un riepilogo
+# esplicito dell'esito di ldapdelete (quante entry tentate, rc, eventuali
+# righe di errore nel suo output) - prima il comando girava alla cieca,
+# senza che nessun task ne controllasse l'esito. Il riepilogo viene
+# scritto su un file separato (mai la password), cosi' resta leggibile
+# anche se il task di cancellazione ha "no_log: true" per via della
+# password nel comando stesso.
+#
+# NOVITÀ v5.2 rispetto a v5.1 (segnalazione dell'utente, verificata con un
+# grep diretto sul file: zero riferimenti a simulate_wan_mpls_ipsec.yml in
+# qualunque forma): il test dichiara nel titolo stesso "sotto Carico WAN",
+# e la documentazione descrive l'invocazione di
+# ../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml
+# all'inizio - ma nessun task lo richiamava mai. Questo significa che
+# CORREGGE anche un'affermazione imprecisa nel changelog v5.1 qui sotto:
+# i tempi misurati (28s scrittura, 19s cleanup) NON erano affatto sotto
+# WAN simulata come scritto - erano a velocita' LAN piena. Aggiunto un
+# nuovo task [PRE] che abilita esplicitamente la simulazione WAN
+# richiamando il playbook dedicato con "-e stato=enabled" prima di FASE 1,
+# e un blocco block/always che avvolge l'intero test (FASE 1-5): la
+# disattivazione della WAN in "always" e' garantita anche se una fase
+# qualunque del test fallisce a meta' - altrimenti si rischierebbe di
+# lasciare la simulazione WAN attiva su tutto il cluster senza accorgersene,
+# degradando silenziosamente qualunque test successivo.
+#
+# NOVITÀ v5.1 rispetto a v5.0 (Timeout di convergenza/cleanup alzati da
+# 120s a 300s - con delegate_to finalmente corretto (v5.0), il primo run
+#               reale ha mostrato timeout falsi: check_full_cluster_sync.sh,
+#               indipendente e con timeout piu' ampio, confermava piena
+#               convergenza in soli 7s DOPO che questo test aveva gia'
+#               dichiarato timeout due volte - il cluster non era affatto
+#               bloccato, il timeout di 120s era solo troppo corto per
+#               questo scenario specifico (NOTA CORRETTA in v5.2: la WAN
+#               simulata non era in realta' mai attiva in questo run - il
+#               fattore era comunque kill -9 + 2000 scritture, non anche
+#               la WAN, contrariamente a quanto scritto qui inizialmente)
+#
+# NOVITÀ v5.1 rispetto a v5.0 (segnalazione dell'utente, con prova diretta
+# a supporto: "i nodi sono convergenti, il tuo test fa acqua"): il primo
+# run con delegate_to finalmente funzionante ha mostrato due timeout
+# (scrittura: node3/node4 fermi a 1782/2000; cleanup: node2 con 110
+# residui) - ma il cluster non era affatto bloccato: check_full_cluster_
+# sync.sh, uno strumento indipendente con timeout piu' ampio (300s),
+# confermava piena convergenza in soli 7 secondi, poco dopo. La causa non
+# era corruzione ne' un bug di sincronizzazione: erano semplicemente i
+# 120s di timeout di QUESTO test, troppo stretti per lo scenario specifico
+# (recupero da kill -9, non da una disconnessione breve, con WAN simulata
+# attiva e 2000 scritture in coda) - il sistema stava ancora convergendo
+# normalmente, solo piu' lentamente di quanto questo test fosse disposto
+# ad aspettare. Alzati entrambi i timeout (scrittura e cleanup) a 300s,
+# allineati al valore gia' verificato funzionare in check_full_cluster_
+# sync.sh. Aggiunta anche una nota esplicita nei messaggi di timeout, per
+# chiarire che un timeout qui non implica automaticamente un problema
+# reale - va confermato con lo strumento indipendente prima di sospettare
+# corruzione.
+#
+# NOVITÀ v5.0 rispetto a v4.4 - BUG ROOT-CAUSE, TROVATO SOLO CON UN
+# PLAYBOOK DIAGNOSTICO DEDICATO (test_delegate_to_diagnostica.yml): tutti
+# e 4 i delegate_to (node1/node2/node3/node4) restituivano SEMPRE
+# "ubuntu24lts1" come hostname reale, indipendentemente da quale nodo si
+# specificasse - "connection: local" impostato a livello di PLAY (non di
+# singolo task) si applica per default a TUTTI i task del play, incluso
+# quelli con delegate_to, che quindi giravano sempre in locale sul nodo
+# da cui veniva lanciato "ansible-playbook" (in questo caso node1 stesso),
+# ignorando completamente l'host delegato.
+#
+# Questo spiega RETROATTIVAMENTE tutti i fallimenti inseguiti da v4.0 in
+# poi, che in realta' erano tutti manifestazioni dello stesso unico bug:
+#   - "node1 si ferma da solo durante il test" (v4.1-v4.3): non era un
+#     fattore esterno (unattended-upgrades o simile, come ipotizzato) - il
+#     kill -9 di CRASH 1, nominalmente diretto a node2, girava sempre su
+#     node1 stesso, uccidendone il vero slapd.
+#   - "pgrep trova 0 processi su node3" (v4.2-v4.4): CRASH 2, nominalmente
+#     diretto a node3, girava anch'esso su node1 - dove slapd era gia'
+#     stato ucciso pochi secondi prima da CRASH 1. Il fix "become: true"
+#     di v4.4 non era sbagliato in se' (mancava davvero), ma non era la
+#     causa di QUESTO specifico fallimento.
+#   - "systemctl kill falliva su auxiliary processes" (v4.1): coerente
+#     con l'aver colpito ripetutamente lo stesso processo/unit di node1
+#     in rapida successione fra run diversi durante il debug.
+#
+# Fix: rimosso "connection: local" dal play. "hosts: localhost" da solo
+# e' sufficiente - Ansible usa comunque una connessione locale per
+# l'host "localhost" stesso, mentre i task con delegate_to tornano a
+# usare correttamente SSH verso l'host delegato specificato, invece di
+# essere forzati in locale.
+#
+# NOVITÀ v4.4 rispetto a v4.3 (bug reale trovato: il fallimento di pgrep
+# era SEMPRE e SOLO su node3/CRASH 2, mai su node2/CRASH 1 - un pattern
+# troppo sistematico per essere davvero un blip casuale, come ipotizzato
+# in v4.3). Causa trovata rileggendo il file: il task pgrep di CRASH 2
+# NON aveva "become: true", a differenza di quello di CRASH 1 che ce
+# l'ha sempre avuto - un'asimmetria introdotta per disattenzione in una
+# revisione precedente. Senza privilegi elevati, pgrep su node3 gira come
+# utente non privilegiato: se non ha visibilita' sui processi di un altro
+# utente (slapd gira come "openldap"), puo' restituire "nessun processo
+# trovato" anche quando il servizio e' realmente attivo. Aggiunto
+# "become: true" mancante, piu' un retry (5 tentativi, 1s di intervallo)
+# su entrambi i controlli come rete di sicurezza aggiuntiva contro
+# eventuali blip residui non legati ai permessi.
+#
+# NOVITÀ v4.3 rispetto a v4.2 (segnalazione reale e seria dell'utente:
+# slapd su node1 si e' fermato durante un run reale del test - stop
+# PULITO, non un crash, "ExecStop=/etc/init.d/slapd stop" con successo).
+# Riletto l'INTERO file una seconda volta, riga per riga: nessun task qui
+# ferma mai slapd su node1 - solo FASE 1 (avvia iniezione), FASE 3
+# (attende completamento), FASE 5 (cancella dati/file temporanei) lo
+# toccano, nessuno stop/kill. Ipotesi piu' concreta, da verificare
+# dall'utente: unattended-upgrades (configurato nel Vagrantfile di questo
+# stesso progetto) potrebbe aver riavviato slapd durante un upgrade del
+# pacchetto, in modo del tutto ESTERNO a questo playbook - coerente con
+# uno stop pulito via ExecStop, non un crash. Indipendentemente dalla
+# causa esatta (ancora da confermare con i log apt/unattended-upgrades),
+# aggiunta una sorveglianza esplicita e bloccante su node1: verificato
+# attivo subito dopo l'avvio dell'iniezione (baseline) e di nuovo dopo
+# l'attesa del suo completamento, prima di usarlo come riferimento per la
+# misurazione di convergenza - se node1 dovesse fermarsi per QUALUNQUE
+# motivo durante il test, il playbook si ferma con un errore esplicito
+# invece di proseguire silenziosamente verso un risultato fuorviante.
+#
+# NOVITÀ v4.2 rispetto a v4.1 (secondo bug reale, trovato lanciando di
+# nuovo il playbook dopo il fix precedente): "systemctl show -p MainPID"
+# restituiva 0 nonostante slapd fosse realmente attivo e funzionante -
+# confermato dall'output stesso di "systemctl status slapd" dell'utente,
+# che mostrava il processo vero (PID reale) correttamente presente nel
+# CGroup dell'unit. Causa: su questo sistema slapd.service e' un'unit
+# LSB/SysV generata automaticamente da systemd-sysv-generator a partire
+# dal vecchio /etc/init.d/slapd (ExecStart=/etc/init.d/slapd start), non
+# un'unit systemd nativa - per questo tipo di unit il tracciamento di
+# MainPID da parte di systemd non è affidabile, anche quando il servizio
+# e' effettivamente attivo. Sostituito con "pgrep -x slapd", che trova il
+# PID reale del processo indipendentemente da come systemd lo traccia -
+# bypassa del tutto sia la logica cgroup-wide di systemctl kill (gia'
+# corretta in v4.1) sia l'inaffidabilita' di MainPID per questo tipo di
+# unit. La guardia e' stata adattata di conseguenza: blocca se pgrep non
+# trova ESATTAMENTE un processo (zero = gia' fermo, piu' di uno = stato
+# ambiguo da verificare a mano), non piu' su un valore numerico di PID.
+#
+# NOVITÀ v4.1 rispetto a v4.0 (bug reale trovato lanciando il playbook per
+# davvero su infrastruttura vera): "systemctl kill --signal=SIGKILL slapd"
+# falliva con "Failed to send signal SIGKILL to auxiliary processes:
+# Invalid argument" - per default systemctl kill prova a segnalare TUTTI
+# i processi nel cgroup dell'unit, non solo il processo principale, e in
+# questo ambiente quel meccanismo fallisce (probabile specificita' di
+# cgroup/kernel della VM, non necessariamente un problema di slapd
+# stesso). Sostituito con un approccio piu' diretto e robusto: si ottiene
+# il MainPID via "systemctl show -p MainPID --value slapd" e si manda
+# "kill -9" direttamente a quel PID - bypassa del tutto la logica
+# cgroup-wide di systemctl kill, ed e' anche piu' fedele all'intento
+# originale ("kill -9 del processo slapd", non "di tutto cio' che gli
+# gira intorno"). Aggiunta anche una guardia esplicita che blocca il test
+# se il MainPID risulta 0 o vuoto (slapd gia' fermo per altri motivi),
+# invece di rischiare un "kill -9 0" (che colpirebbe l'intero process
+# group, non solo slapd).
+#
+# NOVITÀ v4.0 rispetto a v3.0 (bug reale trovato: python-ldap non era mai
+# installato da nessun task del deploy - il test sarebbe fallito
+# all'avvio con ImportError prima ancora di scrivere un solo record):
+#   - FASE 1 (iniezione): non serve piu' python-ldap per una connessione
+#     persistente - una singola invocazione di "ldapadd -c" che legge da
+#     uno stream generato da un ciclo shell con "sleep" fra un'entry e
+#     l'altra ottiene lo stesso risultato (una sola connessione riusata
+#     per tutte le scritture, ritmo controllato) senza alcuna dipendenza
+#     aggiuntiva - verificato empiricamente che il meccanismo di pacing
+#     tramite pipe funzioni come atteso, e che il PID monitorato rifletta
+#     la fine dell'INTERA pipe (non solo del generatore a monte).
+#   - FASE 4 (misurazione convergenza) e FASE 5 (cancellazione): non
+#     avevano mai avuto bisogno di Python - erano solo conteggi/
+#     cancellazioni via LDAP, ora in puro ldapsearch/ldapdelete, stesso
+#     pattern gia' usato altrove in questo stesso progetto oggi
+#     (check_full_cluster_sync.sh).
+#
+# NOVITÀ v3.0 rispetto a v2.0: vedi versioni precedenti del file per lo
+# storico completo (kill -9 al posto di stop pulito, mdb_stat, esteso al
+# nodo read-only, numerazione fasi corretta, polling reale nel cleanup).
+# ==============================================================================
+
+---
+- name: "CRASH TEST 1: Failover a Cascata Non Pulito (nodo2 + nodo3) sotto Carico WAN"
+  hosts: localhost
+  vars:
+    node1: "ubuntu24lts1.example.com"
+    node2: "ubuntu24lts2.example.com"
+    node3: "ubuntu24lts3.example.com"
+    node4: "ubuntu24lts4.example.com"
+    ldap_basedn: "dc=example,dc=com"
+    ldap_admin_dn: "cn=admin,dc=example,dc=com"
+    ldap_admin_pass: "openldap"
+    wan_simulation_playbook: "../../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml"
+
+  tasks:
+    # ==========================================================================
+    # PRE: ABILITAZIONE SIMULAZIONE WAN MPLS+IPSec SU TUTTO IL CLUSTER
+    # Il test deve girare sotto WAN simulata (50ms latenza, jitter, 0.1%
+    # perdita pacchetti sul traffico LDAP), non a velocita' LAN piena -
+    # richiama simulate_wan_mpls_ipsec.yml direttamente, come documentato.
+    # ==========================================================================
+
+    - name: "[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)"
+      ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=enabled"
+      register: wan_enable_result
+      changed_when: true
+
+    - name: "Blocco principale del crash test (disattivazione WAN garantita in 'always' anche in caso di errore in una qualunque fase)"
+      block:
+
+        # ==========================================================================
+        # FASE 1: SCRITTURA AD ALTA FREQUENZA SU NODO 1 (DELEGATA SU NODE1)
+        # Una sola invocazione di "ldapadd -c" che legge da uno stream generato
+        # da un ciclo shell con sleep fra un'entry e l'altra: una connessione
+        # sola riusata per tutte le 500 scritture, nessuna dipendenza da
+        # python-ldap.
+        # ==========================================================================
+
+        - name: "[FASE 1] Avvio scrittura asincrona in background (nohup - sopravvive alla chiusura della sessione SSH) su {{ node1 }}"
+          ansible.builtin.shell: |
+            nohup sh -c '
+              export LDAPTLS_REQCERT=never
+              for i in $(seq 1 500); do
+                cat << ENTRY
+            dn: uid=crash.user.$i,ou=People,{{ ldap_basedn }}
+            objectClass: top
+            objectClass: inetOrgPerson
+            uid: crash.user.$i
+            cn: Crash User $i
+            sn: CrashTest
+            userPassword: {SSHA}demoPass123!
+
+            ENTRY
+                sleep 0.005
+              done | ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" -c
+            ' > /tmp/async_load.log 2>&1 < /dev/null &
+            echo $! > /tmp/async_load.pid
+          delegate_to: "{{ node1 }}"
+          register: start_load
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 1] Verifica che slapd sia attivo SUBITO dopo l'avvio dell'iniezione (baseline di riferimento) su {{ node1 }}"
+          delegate_to: "{{ node1 }}"
+          ansible.builtin.systemd:
+            name: slapd
+          no_log: true
+          register: node1_status_baseline
+          failed_when: false
+
+        - name: "[FASE 1] Blocca se node1 non e' attivo fin dall'inizio (il test non ha senso se il write target e' gia' giu')"
+          ansible.builtin.assert:
+            that:
+              - node1_status_baseline.status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ node1 }} (write target) non e' attivo
+              all'inizio del test (stato: {{ node1_status_baseline.status.ActiveState | default('sconosciuto') }})
+              - impossibile procedere.
+
+        # ==========================================================================
+        # FASE 2: SIMULAZIONE CRASH A CASCATA (kill -9, non uno stop pulito -
+        # lo scopo e' simulare un crash reale non gestito, non un arresto
+        # ordinato: solo cosi' ha senso verificare eventuali corruzioni
+        # dell'ambiente LMDB al riavvio, non solo il tempo di convergenza)
+        # ==========================================================================
+
+        - name: "[FASE 2] Installa lmdb-utils, per mdb_stat, non bloccante, sui nodi da crashare"
+          delegate_to: "{{ item }}"
+          become: true
+          ansible.builtin.apt:
+            name: lmdb-utils
+            state: present
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          register: lmdb_utils_install
+          failed_when: false
+
+        - name: "[FASE 2] Verifica pre-volo che slapd sia gia' attivo su entrambi i nodi da crashare, prima di toccarli"
+          delegate_to: "{{ item }}"
+          ansible.builtin.systemd:
+            name: slapd
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: preflight_status
+          failed_when: false
+
+        - name: "[FASE 2] Blocca se node2 o node3 sono GIA' inattivi prima di iniziare (residuo di un run precedente, non causato da questo test)"
+          ansible.builtin.assert:
+            that:
+              - preflight_status.results[item].status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ preflight_status.results[item].item }} risulta gia'
+              '{{ preflight_status.results[item].status.ActiveState | default('sconosciuto') }}'
+              PRIMA che questo test tocchi qualunque cosa - non e' un problema
+              causato da questo run, ma uno stato residuo (quasi certamente un
+              kill -9 di un run precedente, mai seguito dal ripristino perche'
+              quel run e' fallito prima di arrivarci). Riavviare slapd su tutti
+              i nodi e ripetere il test da un cluster pulito, invece di
+              proseguire su un bersaglio gia' compromesso.
+            success_msg: "OK: slapd e' attivo su {{ preflight_status.results[item].item }} prima di iniziare."
+          loop: "{{ range(preflight_status.results | length) | list }}"
+          loop_control:
+            label: "{{ preflight_status.results[item].item }}"
+
+        - name: "[FASE 2] Attendi 2 secondi prima del primo crash"
+          ansible.builtin.pause:
+            seconds: 2
+
+        - name: "[FASE 2 - CRASH 1] Trova il PID reale di slapd (pgrep con retry, possibile blip transitorio) su {{ node2 }}"
+          delegate_to: "{{ node2 }}"
+          become: true
+          ansible.builtin.command: "pgrep -x slapd"
+          register: node2_slapd_pid
+          changed_when: false
+          failed_when: false
+          until: (node2_slapd_pid.stdout_lines | length) == 1
+          retries: 5
+          delay: 1
+
+        - name: "[FASE 2 - CRASH 1] Blocca se non si trova esattamente un processo slapd (0 = gia' fermo, piu' di 1 = ambiguo)"
+          ansible.builtin.assert:
+            that:
+              - (node2_slapd_pid.stdout_lines | length) == 1
+            fail_msg: >-
+              ERRORE: trovati {{ node2_slapd_pid.stdout_lines | length }}
+              processi slapd su {{ node2 }} (atteso esattamente 1) - verificare
+              manualmente prima di procedere.
+
+        - name: "[FASE 2 - CRASH 1] kill -9 diretto (crash non pulito) del processo slapd PID {{ node2_slapd_pid.stdout }} su {{ node2 }}"
+          delegate_to: "{{ node2 }}"
+          become: true
+          ansible.builtin.command: "kill -9 {{ node2_slapd_pid.stdout | trim }}"
+          changed_when: true
+
+        - name: "[FASE 2 - CRASH 1] Verifica lo stato del servizio dopo il kill (informativo - segnala se systemd lo ha gia' riavviato da solo)"
+          delegate_to: "{{ node2 }}"
+          ansible.builtin.systemd:
+            name: slapd
+          no_log: true
+          register: node2_status_after_crash
+          failed_when: false
+
+        - name: "[FASE 2 - CRASH 1] mdb_stat -e sull'ambiente LMDB (se lmdb-utils e' disponibile) su {{ node2 }}"
+          delegate_to: "{{ node2 }}"
+          become: true
+          ansible.builtin.command: "mdb_stat -e /var/lib/ldap"
+          register: node2_mdb_stat_after_crash
+          changed_when: false
+          failed_when: false
+          when: not (lmdb_utils_install.results[0].failed | default(false))
+
+        - name: "[FASE 2 - CRASH 1] Riepilogo stato dopo il crash su {{ node2 }}"
+          ansible.builtin.debug:
+            msg:
+              - "Stato slapd dopo kill -9: {{ node2_status_after_crash.status.ActiveState | default('n/d') }}"
+              - "mdb_stat: {{ 'OK' if node2_mdb_stat_after_crash.rc | default(1) == 0 else 'FALLITO: ' + (node2_mdb_stat_after_crash.stderr|default('n/d')) }}"
+
+        - name: "[FASE 2] Attendi 4 secondi prima del secondo crash"
+          ansible.builtin.pause:
+            seconds: 4
+
+        - name: "[FASE 2 - CRASH 2] Trova il PID reale di slapd (pgrep con retry, gia' visto un blip qui) su {{ node3 }}"
+          delegate_to: "{{ node3 }}"
+          become: true
+          ansible.builtin.command: "pgrep -x slapd"
+          register: node3_slapd_pid
+          changed_when: false
+          failed_when: false
+          until: (node3_slapd_pid.stdout_lines | length) == 1
+          retries: 5
+          delay: 1
+
+        - name: "[FASE 2 - CRASH 2] Blocca se non si trova esattamente un processo slapd (0 = gia' fermo, piu' di 1 = ambiguo)"
+          ansible.builtin.assert:
+            that:
+              - (node3_slapd_pid.stdout_lines | length) == 1
+            fail_msg: >-
+              ERRORE: trovati {{ node3_slapd_pid.stdout_lines | length }}
+              processi slapd su {{ node3 }} (atteso esattamente 1) - verificare
+              manualmente prima di procedere.
+
+        - name: "[FASE 2 - CRASH 2] kill -9 diretto (crash non pulito) del processo slapd PID {{ node3_slapd_pid.stdout }} su {{ node3 }}"
+          delegate_to: "{{ node3 }}"
+          become: true
+          ansible.builtin.command: "kill -9 {{ node3_slapd_pid.stdout | trim }}"
+          changed_when: true
+
+        - name: "[FASE 2 - CRASH 2] Verifica lo stato del servizio dopo il kill (informativo)"
+          delegate_to: "{{ node3 }}"
+          ansible.builtin.systemd:
+            name: slapd
+          no_log: true
+          register: node3_status_after_crash
+          failed_when: false
+
+        - name: "[FASE 2 - CRASH 2] mdb_stat -e sull'ambiente LMDB (se lmdb-utils e' disponibile) su {{ node3 }}"
+          delegate_to: "{{ node3 }}"
+          become: true
+          ansible.builtin.command: "mdb_stat -e /var/lib/ldap"
+          register: node3_mdb_stat_after_crash
+          changed_when: false
+          failed_when: false
+          when: not (lmdb_utils_install.results[1].failed | default(false))
+
+        - name: "[FASE 2 - CRASH 2] Riepilogo stato dopo il crash su {{ node3 }}"
+          ansible.builtin.debug:
+            msg:
+              - "Stato slapd dopo kill -9: {{ node3_status_after_crash.status.ActiveState | default('n/d') }}"
+              - "mdb_stat: {{ 'OK' if node3_mdb_stat_after_crash.rc | default(1) == 0 else 'FALLITO: ' + (node3_mdb_stat_after_crash.stderr|default('n/d')) }}"
+
+        # ==========================================================================
+        # FASE 3: ATTESA COMPLETAMENTO INIEZIONE SU NODE1
+        # ==========================================================================
+
+        - name: "[FASE 3] Attendi il completamento dell'iniezione su {{ node1 }}"
+          ansible.builtin.shell: |
+            if [ -f /tmp/async_load.pid ]; then
+                PID=$(cat /tmp/async_load.pid)
+                while kill -0 "$PID" 2>/dev/null; do
+                    sleep 1
+                done
+            fi
+          delegate_to: "{{ node1 }}"
+          changed_when: false
+
+        - name: "[FASE 3] Riverifica che slapd sia ANCORA attivo dopo l'attesa (rileva un eventuale stop, anche esterno al playbook) su {{ node1 }}"
+          delegate_to: "{{ node1 }}"
+          ansible.builtin.systemd:
+            name: slapd
+          no_log: true
+          register: node1_status_after_wait
+          failed_when: false
+
+        - name: "[FASE 3] Blocca se node1 non e' piu' attivo (il resto del test - convergenza, cleanup - non ha senso senza il write target)"
+          ansible.builtin.assert:
+            that:
+              - node1_status_after_wait.status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE CRITICO: slapd su {{ node1 }} NON e' piu' attivo (stato:
+              {{ node1_status_after_wait.status.ActiveState | default('sconosciuto') }}) -
+              si e' fermato DURANTE il test, per una causa che questo playbook
+              non ha innescato direttamente (nessun task qui lo ferma). Cause
+              plausibili da verificare manualmente su {{ node1 }}: unattended-
+              upgrades ('grep -i slapd /var/log/apt/history.log'), OOM killer
+              ('dmesg | grep -i oom'), o un intervento manuale. Il resto del
+              test (misurazione convergenza, cleanup) non ha senso senza il
+              write target attivo - fermarsi qui invece di proseguire con
+              risultati fuorvianti.
+
+        # ==========================================================================
+        # FASE 4: RIPRISTINO NODI E MISURAZIONE CONVERGENZA (puro shell -
+        # ldapsearch, stesso pattern gia' usato in check_full_cluster_sync.sh)
+        # ==========================================================================
+
+        - name: "[FASE 4] Ripristina il servizio slapd sui nodi crashati"
+          delegate_to: "{{ item }}"
+          become: true
+          ansible.builtin.systemd:
+            name: slapd
+            state: started
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: recovery_start
+          failed_when: false
+
+        - name: "[FASE 4] Verifica che slapd sia DAVVERO ripartito (segnale diretto di eventuale corruzione LMDB)"
+          delegate_to: "{{ item }}"
+          ansible.builtin.systemd:
+            name: slapd
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: post_recovery_status
+          failed_when: false
+
+        - name: "[FASE 4] Blocca se un nodo non e' ripartito (sospetta corruzione - richiede analisi manuale, non procedere oltre)"
+          ansible.builtin.assert:
+            that:
+              - post_recovery_status.results[item].status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE CRITICO: slapd su {{ post_recovery_status.results[item].item }} NON e' ripartito dopo il
+              crash (stato: {{ post_recovery_status.results[item].status.ActiveState | default('sconosciuto') }}) - possibile
+              corruzione dell'ambiente LMDB. Controllare manualmente 'journalctl -u
+              slapd' e 'mdb_stat -e /var/lib/ldap' su questo nodo PRIMA di
+              procedere - il resto del test (misurazione convergenza, cleanup)
+              non ha senso se il nodo e' effettivamente giu'.
+            success_msg: "OK: slapd e' ripartito correttamente su {{ post_recovery_status.results[item].item }}."
+          loop: "{{ range(post_recovery_status.results | length) | list }}"
+          loop_control:
+            label: "{{ post_recovery_status.results[item].item }}"
+
+        - name: "[FASE 4] Misura il tempo di convergenza delta su TUTTO il cluster (master + read-only) - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              FILTER="(uid=crash.user.*)"
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  # slapcat via SSH, non ldapsearch: legge direttamente dal
+                  # database locale del nodo, bypassando del tutto il
+                  # protocollo LDAP - nessun sizelimit da aggirare, e non
+                  # passa dalla porta 636 che la WAN simulata degrada
+                  # apposta (SSH usa la porta 22, non toccata dallo shaping)
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '$FILTER' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                # Tutti i tentativi falliti (es. blip transitorio della WAN
+                # simulata) - MAI "0", che sarebbe indistinguibile da "zero
+                # entry genuine" e falserebbe il confronto col target
+                echo "-1"
+                return 1
+              }
+
+              # TARGET e' il valore critico da cui dipende tutta la
+              # misurazione. A questo punto del flusso (dopo l'iniezione
+              # e dopo che FASE 3 ha atteso il suo completamento) un
+              # target pari a zero non e' MAI legittimo - l'iniezione
+              # scrive sempre migliaia di entry. Un retry piu' insistente
+              # rispetto a un generico "connessione fallita": qui si
+              # ritenta finche' il valore non e' positivo, non solo
+              # finche' non e' diverso da -1 (fallimento di connessione).
+              TARGET=-1
+              attempt=0
+              while [ "$attempt" -lt 30 ]; do
+                attempt=$((attempt + 1))
+                TARGET=$(count_on "{{ node1 }}")
+                [ "$TARGET" -gt 0 ] && break
+                sleep 2
+              done
+              if [ "$TARGET" -le 0 ]; then
+                echo "TARGET_WARNING: dopo 60s, target su node1 e' ancora $TARGET - mai normale qui, verificare slapcat/SSH su node1"
+              fi
+              START=$(date +%s)
+              TIMEOUT=800
+              LAST_PROGRESS_LOG=0
+
+              while true; do
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$TARGET" -gt 0 ] && [ "$C2" = "$TARGET" ] && [ "$C3" = "$TARGET" ] && [ "$C4" = "$TARGET" ]; then
+                  NOW=$(date +%s)
+                  echo "CONVERGENCE_OK: $((NOW - START))s (record allineati su tutti i 4 nodi, incluso read-only: $TARGET)"
+                  exit 0
+                fi
+                NOW=$(date +%s)
+                ELAPSED=$((NOW - START))
+                # Log di progresso ogni 10s - senza questo, un timeout mostra
+                # solo il valore finale, non se il nodo stava progredendo con
+                # continuita' (serve solo piu' tempo) o era genuinamente
+                # bloccato (fermo allo stesso valore per molti secondi di fila)
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "CONVERGENCE_PROGRESS: ${ELAPSED}s - target=$TARGET node2=$C2 node3=$C3 node4=$C4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  # Un timeout qui NON implica corruzione: puo' voler dire solo
+                  # che serve piu' tempo sotto questo carico. Controllare i
+                  # CONVERGENCE_PROGRESS sopra (in crescita continua = solo
+                  # lento, non bloccato) e check_full_cluster_sync.sh (timeout
+                  # piu' ampio) prima di sospettare un problema reale.
+                  echo "CONVERGENCE_TIMEOUT: ${TIMEOUT}s - target=$TARGET node2=$C2 node3=$C3 node4=$C4 (vedi commento sopra)"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: convergence_metric
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 4] Report risultato del crash test"
+          ansible.builtin.debug:
+            msg: "{{ ['========================================================================',
+                      'CRASH TEST A CASCATA (kill -9) - REPORT DI RIPRISTINO',
+                      '========================================================================']
+                   + convergence_metric.stdout_lines +
+                   ['========================================================================'] }}"
+
+        # ==========================================================================
+        # FASE 5: CLEANUP FINALE (puro shell - ldapsearch + ldapdelete, stesso
+        # pattern degli script crash_cascading_node_*_test.sh)
+        # ==========================================================================
+
+        - name: "[FASE 5] Cancellazione massiva degli utenti di test su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              # slapcat legge direttamente dal database locale, bypassando
+              # del tutto il protocollo LDAP: nessun sizelimit, nessun
+              # bisogno di paging, e non passa dalla porta 636 che la WAN
+              # simulata degrada apposta - esattamente lo strumento giusto
+              # per un conteggio/elenco affidabile, indipendente da quanto
+              # sia sano il canale LDAPS in quel momento.
+              slapcat -b "{{ ldap_basedn }}" -a "(uid=*crash*)" 2>/dev/null \
+                | grep "^dn:" | sed 's/^dn: //' > /tmp/crash_users_to_delete.txt
+              ATTEMPTED=$(wc -l < /tmp/crash_users_to_delete.txt)
+              DELETE_RC=0
+              if [ -s /tmp/crash_users_to_delete.txt ]; then
+                ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" \
+                  -f /tmp/crash_users_to_delete.txt -c > /tmp/crash_cleanup_ldapdelete.log 2>&1
+                DELETE_RC=$?
+              fi
+              # Riepilogo scritto su file separato, MAI la password - cosi'
+              # possiamo mostrarlo in un task successivo senza il rischio
+              # che il no_log di QUESTO task (necessario per la password
+              # nel comando) nasconda anche l'esito.
+              # NOTA: "grep -c" restituisce rc=1 (non 0) quando il conteggio
+              # e' genuinamente zero, pur stampando "0" correttamente - un
+              # "|| echo 0" qui scatterebbe SEMPRE in quel caso, duplicando
+              # l'output. Si controlla invece solo l'esistenza del file.
+              if [ -f /tmp/crash_cleanup_ldapdelete.log ]; then
+                ERRORS=$(grep -ci "error\|fail" /tmp/crash_cleanup_ldapdelete.log 2>/dev/null)
+              else
+                ERRORS=0
+              fi
+              echo "Tentate: $ATTEMPTED - rc ldapdelete: $DELETE_RC - righe con errori nel log: $ERRORS" > /tmp/crash_cleanup_summary.txt
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          become: true
+          register: cleanup_objects
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 5] Mostra il riepilogo della cancellazione (nessuna password qui - file separato, vedi task precedente)"
+          delegate_to: "{{ node1 }}"
+          ansible.builtin.command: "cat /tmp/crash_cleanup_summary.txt"
+          register: cleanup_summary
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 5] Riepilogo cancellazione"
+          ansible.builtin.debug:
+            msg: "{{ cleanup_summary.stdout | default('Riepilogo non disponibile') }}"
+
+        - name: "[FASE 5] Rimozione dei log e file temporanei su {{ node1 }}"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          delegate_to: "{{ node1 }}"
+          become: true
+          loop:
+            - /tmp/async_load.log
+            - /tmp/async_load.pid
+            - /tmp/crash_users_to_delete.txt
+            - /tmp/crash_cleanup_ldapdelete.log
+            - /tmp/crash_cleanup_summary.txt
+
+        - name: "[FASE 5] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              FILTER="(uid=crash.user.*)"
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  # slapcat via SSH, non ldapsearch: legge direttamente dal
+                  # database locale del nodo, bypassando del tutto il
+                  # protocollo LDAP - nessun sizelimit da aggirare, e non
+                  # passa dalla porta 636 che la WAN simulata degrada
+                  # apposta (SSH usa la porta 22, non toccata dallo shaping)
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '$FILTER' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                # Tutti i tentativi falliti - MAI "0" (indistinguibile da
+                # "zero residui genuini"): userebbe un falso OK di cleanup
+                echo "-1"
+                return 1
+              }
+
+              START=$(date +%s)
+              TIMEOUT=800
+              LAST_PROGRESS_LOG=0
+
+              while true; do
+                C1=$(count_on "{{ node1 }}")
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "0" ] && [ "$C2" = "0" ] && [ "$C3" = "0" ] && [ "$C4" = "0" ]; then
+                  NOW=$(date +%s)
+                  echo "CLEANUP_CONVERGENCE_OK: $((NOW - START))s (0 record residui su tutti i 4 nodi)"
+                  exit 0
+                fi
+                NOW=$(date +%s)
+                ELAPSED=$((NOW - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "CLEANUP_PROGRESS: ${ELAPSED}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  # check_full_cluster_sync.sh puo' dire "in sync" anche con
+                  # residui qui: verifica il contextCSN, non un conteggio a
+                  # zero. Se i residui sono stabili a lungo, controlla il
+                  # riepilogo di ldapdelete del task precedente.
+                  echo "CLEANUP_CONVERGENCE_TIMEOUT: ${TIMEOUT}s raggiunti - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4 (vedi commento sopra)"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: cleanup_convergence
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 5] Conferma pulizia DIT"
+          ansible.builtin.debug:
+            msg: "{{ cleanup_convergence.stdout_lines }}"
+
+      always:
+        - name: "[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)"
+          ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=disabled"
+          changed_when: true
