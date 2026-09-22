@@ -190,10 +190,15 @@ Il fenomeno è stato osservato ripetutamente, in run diversi, con blocchi
 mancanti di dimensione e posizione diverse ogni volta (es. 474-504,
 1584-1604, 299-320), sempre come intervallo compatto, mai sparso.
 
-**Soglia empirica isolata:** 500 entry convergono sempre correttamente,
-in ogni run fatto. 1.000 entry hanno mostrato il fenomeno più volte;
-2.000 e 5.000 lo mostrano sistematicamente, con blocchi mancanti più
-grandi.
+**Soglia empirica isolata:** 500 entry convergono correttamente nella
+maggior parte dei run fatti, ma non in tutti - il fenomeno si è
+ripresentato anche a questo volume in run successivi (vedi "Aggiornamento"
+più sotto), quindi 500 va inteso come "meno probabile", non come una
+soglia sicura in senso assoluto. 1.000 entry hanno mostrato il fenomeno
+più volte, nella maggioranza dei run; 2.000 e 5.000 lo mostrano
+sistematicamente, con blocchi mancanti più grandi. Non è stato
+identificato cosa distingua un run che converge da uno che non converge,
+allo stesso volume e a parità di ogni altra condizione controllata.
 
 ### Riproduzione minima raggiunta
 
@@ -268,16 +273,49 @@ pulita ottenuta in questa indagine è più semplice ancora (un solo
 provider, un solo consumer) e non è coperta esplicitamente da
 quell'affermazione.
 
+### Aggiornamento (22/09/2026): indagine proseguita dopo run successivi
+
+Run successivi del crash test (con `kill -9` reale, non solo scritture
+pulite) hanno mostrato lo stesso fenomeno anche a 500 utenti - fino a
+quel momento ritenuto un volume "sempre sicuro". Il comportamento si è
+rivelato **intermittente anche a questo volume**, non deterministico.
+
+**Prova diretta dal log del provider stesso** (non più solo dedotta dal
+lato consumer): durante uno di questi run, il log di `node2` (con
+`olcLogLevel: stats sync`) ha mostrato tre sessioni consumer simultanee
+(`node1`, `node3`, `node4`) ricevere tutte la stessa risposta:
+```
+syncprov_op_search: nothing changed, finishing up initial search early
+syncprov_sendinfo: refreshDelete cookie=
+```
+- un `refreshDelete` con cookie **vuoto**. Nello stesso momento, un
+controllo diretto (`slapcat` locale, non tramite un pari) su `node2`
+confermava che aveva solo 337 entry su 500 attese. `node2` dichiarava
+quindi "nulla è cambiato" mentre era esso stesso incompleto - e la fase
+di `REFRESH_DELETE` che ne è seguita su `node4` ha cancellato entry che
+`node4` aveva correttamente ricevuto da un altro nodo, propagando
+l'incompletezza di `node2` invece di limitarsi a non aggiornarsi.
+
+**Ipotesi del `syncprov-checkpoint` testata e esclusa**: dato che il
+`contextCSN` è aggiornato in memoria a ogni scrittura ma persistito su
+disco solo al checkpoint configurato (`olcSpCheckpoint: 1000 10` nel
+nostro deploy) o allo shutdown pulito, si è ipotizzato che uno shutdown
+non pulito (`kill -9`) potesse far ripartire un nodo da un `contextCSN`
+su disco stantio. Testato stringendo il checkpoint a `50 1` (venti volte
+più frequente) e ripetendo il crash test più volte: **nessun
+cambiamento** misurabile nel comportamento. L'ipotesi è stata quindi
+esclusa come causa principale o come mitigazione praticabile.
+
 ### Stato
 
-Il fenomeno non è stato ancora segnalato al bug tracker ufficiale di
-OpenLDAP (ITS). La riproduzione minima descritta sopra è sufficientemente
-pulita da poter essere la base di una segnalazione, se si deciderà di
-procedere. Nel frattempo, il numero di utenti iniettati da questo test è
-stato abbassato a 500 - sotto la soglia nota - in modo che il crash test
-misuri quello per cui è stato progettato (la resilienza a un `kill -9`
-non pulito) senza confondersi con questo problema distinto, già isolato
-a parte.
+Il fenomeno è stato segnalato al bug tracker ufficiale di OpenLDAP (ITS):
+**[bug #10604](https://bugs.openldap.org/show_bug.cgi?id=10604)**. Nel
+frattempo, il numero di utenti iniettati da questo test è stato abbassato
+a 500 - sotto la soglia nota - in modo che il crash test misuri quello
+per cui è stato progettato (la resilienza a un `kill -9` non pulito)
+senza confondersi con questo problema distinto, già isolato a parte. Va
+comunque tenuto presente che anche 500 si è mostrato non sempre sicuro in
+run successivi - vedi "Aggiornamento" qui sopra.
 
 ---
 
