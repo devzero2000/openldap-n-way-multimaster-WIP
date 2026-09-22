@@ -1,0 +1,187 @@
+
+PLAY [CRASH TEST 1: Failover a Cascata Non Pulito (nodo2 + nodo3) sotto Carico WAN] ***
+
+TASK [Gathering Facts] *********************************************************
+ok: [localhost]
+
+TASK [[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)] ***
+changed: [localhost]
+
+TASK [[FASE 1] Avvio scrittura asincrona in background (nohup - sopravvive alla chiusura della sessione SSH) su ubuntu24lts1.example.com] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 1] Verifica che slapd sia attivo SUBITO dopo l'avvio dell'iniezione (baseline di riferimento) su ubuntu24lts1.example.com] ***
+ok: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 1] Blocca se node1 non e' attivo fin dall'inizio (il test non ha senso se il write target e' gia' giu')] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 2] Installa lmdb-utils, per mdb_stat, non bloccante, sui nodi da crashare] ***
+ok: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com)
+
+TASK [[FASE 2] Verifica pre-volo che slapd sia gia' attivo su entrambi i nodi da crashare, prima di toccarli] ***
+ok: [localhost -> ubuntu24lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu24lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 2] Blocca se node2 o node3 sono GIA' inattivi prima di iniziare (residuo di un run precedente, non causato da questo test)] ***
+ok: [localhost] => (item=ubuntu24lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: slapd e' attivo su ubuntu24lts2.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu24lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: slapd e' attivo su ubuntu24lts3.example.com prima di iniziare."
+}
+
+TASK [[FASE 2] Attendi 2 secondi prima del primo crash] ************************
+Pausing for 2 seconds
+(ctrl+C then 'C' = continue early, ctrl+C then 'A' = abort)
+ok: [localhost]
+
+TASK [[FASE 2 - CRASH 1] Trova il PID reale di slapd (pgrep con retry, possibile blip transitorio) su ubuntu24lts2.example.com] ***
+ok: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 2 - CRASH 1] Blocca se non si trova esattamente un processo slapd (0 = gia' fermo, piu' di 1 = ambiguo)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 2 - CRASH 1] kill -9 diretto (crash non pulito) del processo slapd PID 7713 su ubuntu24lts2.example.com] ***
+changed: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 2 - CRASH 1] Verifica lo stato del servizio dopo il kill (informativo - segnala se systemd lo ha gia' riavviato da solo)] ***
+ok: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 2 - CRASH 1] mdb_stat -e sull'ambiente LMDB (se lmdb-utils e' disponibile) su ubuntu24lts2.example.com] ***
+ok: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 2 - CRASH 1] Riepilogo stato dopo il crash su ubuntu24lts2.example.com] ***
+ok: [localhost] => {
+    "msg": [
+        "Stato slapd dopo kill -9: inactive",
+        "mdb_stat: OK"
+    ]
+}
+
+TASK [[FASE 2] Attendi 4 secondi prima del secondo crash] **********************
+Pausing for 4 seconds
+(ctrl+C then 'C' = continue early, ctrl+C then 'A' = abort)
+ok: [localhost]
+
+TASK [[FASE 2 - CRASH 2] Trova il PID reale di slapd (pgrep con retry, gia' visto un blip qui) su ubuntu24lts3.example.com] ***
+ok: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 2 - CRASH 2] Blocca se non si trova esattamente un processo slapd (0 = gia' fermo, piu' di 1 = ambiguo)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 2 - CRASH 2] kill -9 diretto (crash non pulito) del processo slapd PID 7734 su ubuntu24lts3.example.com] ***
+changed: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 2 - CRASH 2] Verifica lo stato del servizio dopo il kill (informativo)] ***
+ok: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 2 - CRASH 2] mdb_stat -e sull'ambiente LMDB (se lmdb-utils e' disponibile) su ubuntu24lts3.example.com] ***
+ok: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 2 - CRASH 2] Riepilogo stato dopo il crash su ubuntu24lts3.example.com] ***
+ok: [localhost] => {
+    "msg": [
+        "Stato slapd dopo kill -9: inactive",
+        "mdb_stat: OK"
+    ]
+}
+
+TASK [[FASE 3] Attendi il completamento dell'iniezione su ubuntu24lts1.example.com] ***
+ok: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 3] Riverifica che slapd sia ANCORA attivo dopo l'attesa (rileva un eventuale stop, anche esterno al playbook) su ubuntu24lts1.example.com] ***
+ok: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 3] Blocca se node1 non e' piu' attivo (il resto del test - convergenza, cleanup - non ha senso senza il write target)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 4] Ripristina il servizio slapd sui nodi crashati] *****************
+changed: [localhost -> ubuntu24lts2.example.com] => (item=(censored due to no_log))
+changed: [localhost -> ubuntu24lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 4] Verifica che slapd sia DAVVERO ripartito (segnale diretto di eventuale corruzione LMDB)] ***
+ok: [localhost -> ubuntu24lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu24lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 4] Blocca se un nodo non e' ripartito (sospetta corruzione - richiede analisi manuale, non procedere oltre)] ***
+ok: [localhost] => (item=ubuntu24lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: slapd e' ripartito correttamente su ubuntu24lts2.example.com."
+}
+ok: [localhost] => (item=ubuntu24lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: slapd e' ripartito correttamente su ubuntu24lts3.example.com."
+}
+
+TASK [[FASE 4] Misura il tempo di convergenza delta su TUTTO il cluster (master + read-only) - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 4] Report risultato del crash test] ********************************
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "CRASH TEST A CASCATA (kill -9) - REPORT DI RIPRISTINO",
+        "========================================================================",
+        "CONVERGENCE_OK: 1s (record allineati su tutti i 4 nodi, incluso read-only: 500)",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 5] Cancellazione massiva degli utenti di test su ubuntu24lts1.example.com] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 5] Mostra il riepilogo della cancellazione (nessuna password qui - file separato, vedi task precedente)] ***
+ok: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 5] Riepilogo cancellazione] ****************************************
+ok: [localhost] => {
+    "msg": "Tentate: 500 - rc ldapdelete: 0 - righe con errori nel log: 0"
+}
+
+TASK [[FASE 5] Rimozione dei log e file temporanei su ubuntu24lts1.example.com] ***
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/async_load.log)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/async_load.pid)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/crash_users_to_delete.txt)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/crash_cleanup_ldapdelete.log)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/crash_cleanup_summary.txt)
+
+TASK [[FASE 5] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 5] Conferma pulizia DIT] *******************************************
+ok: [localhost] => {
+    "msg": [
+        "CLEANUP_CONVERGENCE_OK: 2s (0 record residui su tutti i 4 nodi)"
+    ]
+}
+
+TASK [[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)] ***
+changed: [localhost]
+
+PLAY RECAP *********************************************************************
+localhost                  : ok=37   changed=8    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+
