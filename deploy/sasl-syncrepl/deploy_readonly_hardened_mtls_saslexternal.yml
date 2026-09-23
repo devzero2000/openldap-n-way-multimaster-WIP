@@ -2,6 +2,29 @@
 # TITOLO:       Configurazione Replica Read-Only OpenLDAP (Hardened SASL/mTLS)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
+# VERSIONE:     1.2.3 (stesso problema di idempotenza gia' corretto nel
+#               deploy master v1.9.3: il task "Applicazione
+#               configurazione backend cn=Monitor" usa "ldapadd", che
+#               applica l'LDIF SOLO se il database non esiste ancora -
+#               su un cluster gia' deployato, il contenuto (incluso
+#               l'olcAccess corretto in v1.2.2) non veniva mai davvero
+#               applicato. Aggiunto un nuovo task idempotente
+#               (community.general.ldap_attrs, state: exact) che gira
+#               sempre dopo, garantendo che olcAccess sia quello
+#               corrente sia su creazione nuova sia su database
+#               preesistente.
+#
+# VERSIONE:     1.2.2 (stesso bug di ACL sul backend cn=Monitor gia'
+#               corretto nel deploy master v1.9.2, presente identico
+#               anche qui: mancava la regola peercred (dn.exact=
+#               "gidNumber=0+uidNumber=0,cn=peercred,cn=external,
+#               cn=auth") come prima clausola dell'olcAccess, a
+#               differenza del database dati principale (che ce l'ha,
+#               vedi riga 495). Stessa conseguenza verificata: bind SASL
+#               EXTERNAL via ldapi:/// come root falliva con "32 No such
+#               object" su cn=Monitor. Aggiunta la stessa regola (con
+#               "read", non "manage") come prima clausola.
+#
 # VERSIONE:     1.2.1 (review)
 # SCOPO:        Deploy corazzato per nodi di sola lettura sincronizzati via Syncrepl,
 #               iterando sugli host del gruppo readonlyreplica e configurando l'HA.
@@ -927,7 +950,8 @@
           changetype: add
           objectClass: olcDatabaseConfig
           olcDatabase: {2}monitor
-          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+          olcAccess: {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" read
+            by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
 
     - name: Applicazione configurazione backend cn=Monitor
       ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
@@ -938,6 +962,33 @@
         - "'Type or value exists' not in monitor_result.stderr"
         - "'only one monitor database allowed' not in monitor_result.stderr"
       changed_when: true
+
+    # Il task sopra usa "ldapadd" (changetype: add): crea il database SOLO
+    # se non esiste ancora - se esiste gia' (caso comune su un cluster
+    # deployato in precedenza), fallisce con "Already exists", il
+    # fallimento e' tollerato per idempotenza, ma il contenuto dell'LDIF
+    # (incluso l'olcAccess) NON viene mai applicato in quel caso. Bug
+    # reale scoperto cosi': una correzione all'olcAccess (v1.2.2) non
+    # aveva alcun effetto sui nodi gia' deployati, nonostante il deploy
+    # "riuscisse" senza errori. Il task seguente e' idempotente per
+    # design (community.general.ldap_attrs verifica lo stato attuale e
+    # applica la modifica solo se diverso da quello desiderato) e gira
+    # SEMPRE, sia sulla creazione iniziale (ridondante ma innocuo) sia su
+    # un database gia' esistente (dove risolve il problema sopra) -
+    # cosi' una futura modifica a questa ACL si applica correttamente al
+    # prossimo deploy, senza bisogno di intervenire a mano con
+    # ldapmodify come e' stato necessario stavolta.
+    - name: Garantisce che l'ACL del backend cn=Monitor sia quella corrente (idempotente, applica anche su database gia' esistenti)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={2}monitor,cn=config"
+        attributes:
+          olcAccess:
+            - >-
+              {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" read
+              by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+        state: exact
 
     # =========================================================================
     # CONFIGURAZIONE SYNCREPL MULTIPLA PER HA (VERSO TUTTI I MASTER)
