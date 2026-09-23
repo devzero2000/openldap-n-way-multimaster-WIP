@@ -2,6 +2,32 @@
 # TITOLO:       Configurazione Replica Read-Only OpenLDAP (Hardened SASL/mTLS)
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
+# VERSIONE:     1.2.8 (stesso cambio del deploy master v1.9.8: permessi
+#               della directory di audit stretti da 755 a 750.)
+#
+# VERSIONE:     1.2.7 (stesso errore del deploy master v1.9.7:
+#               olcAuditlogNonBlocking non esiste nella versione OpenLDAP
+#               installata (2.6.10) - aggiunto al branch di sviluppo
+#               ufficiale solo il 3 luglio 2025, dopo la diramazione
+#               della serie 2.6.x. Rimosso dall'LDIF.)
+#
+# VERSIONE:     1.2.6 (stesso bug del deploy master v1.9.6: mancava il
+#               caricamento del modulo dinamico auditlog prima di usare
+#               l'overlay - aggiunto lo stesso "cn=module{0},cn=config" +
+#               olcModuleLoad: auditlog.)
+#
+# VERSIONE:     1.2.5 (stesso prerequisito apparmor_parser aggiunto nel
+#               deploy master v1.9.5 - verifica-e-installa-se-assente
+#               prima dei task che lo usano.)
+#
+# VERSIONE:     1.2.4 (stesse due modifiche del deploy master v1.9.4:
+#               ldap:// disabilitato (solo ldapi:/// e ldaps:///, vecchia
+#               riga tracciata come commento nel file target), e
+#               slapo-auditlog abilitato come overlay {3} (dopo ppolicy
+#               {2}), stesso meccanismo (directory owner/group openldap
+#               mode 0755, AppArmor locale esteso e ricaricato solo se
+#               cambiato, logrotate weekly+maxsize 100M+copytruncate).
+#
 # VERSIONE:     1.2.3 (stesso problema di idempotenza gia' corretto nel
 #               deploy master v1.9.3: il task "Applicazione
 #               configurazione backend cn=Monitor" usa "ldapadd", che
@@ -562,11 +588,23 @@
           olcTLSCertificateKeyFile: "{{ ssl_key_path }}"
         state: exact
 
-    - name: Configurazione ascolto slapd su tutte le interfacce
+    # ldap:// (in chiaro) disabilitato deliberatamente: slapd non deve
+    # essere raggiungibile senza cifratura, solo via ldapi:/// (locale) e
+    # ldaps:/// (TLS). La vecchia riga resta come commento nel file
+    # target stesso (non solo nel changelog di questo playbook), cosi'
+    # chi ispeziona /etc/default/slapd sul nodo vede anche lei.
+    - name: Traccia nel file la vecchia configurazione di ascolto (ldap:// disabilitato deliberatamente)
+      ansible.builtin.lineinfile:
+        path: /etc/default/slapd
+        regexp: '^# SLAPD_SERVICES="ldap:///'
+        line: '# SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///" (precedente, ldap:// disabilitato)'
+        insertbefore: "^SLAPD_SERVICES="
+
+    - name: Configurazione ascolto slapd - SOLO ldapi:/// e ldaps:///, ldap:// in chiaro deliberatamente escluso
       ansible.builtin.lineinfile:
         path: /etc/default/slapd
         regexp: "^SLAPD_SERVICES="
-        line: 'SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
+        line: 'SLAPD_SERVICES="ldapi:/// ldaps:///"'
 
     ###########################################################################
     # CONFIGURAZIONE MEMBEROF NESTED GROUP REFINT
@@ -742,6 +780,100 @@
           olcPPolicyForwardUpdates: "TRUE"
           olcPPolicyHashCleartext: "TRUE"
         state: present
+
+    # --------------------------------------------------------------------
+    # AUDITLOG - aggiunto come overlay {3}, il piu' interno (dopo
+    # ppolicy), per non dover rinumerare nessuno degli overlay esistenti
+    # sopra. Stesso meccanismo del deploy master: solo olcAuditlogFile
+    # (olcAuditlogNonBlocking non esiste in questa versione OpenLDAP -
+    # vedi VERSIONE 1.2.7 piu' sopra), rotazione demandata a logrotate
+    # con copytruncate.
+    # --------------------------------------------------------------------
+
+    - name: "[AUDITLOG] Verifica presenza di apparmor_parser (pacchetto 'apparmor')"
+      ansible.builtin.command: which apparmor_parser
+      register: apparmor_parser_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[AUDITLOG] Installa il pacchetto 'apparmor' se apparmor_parser e' assente"
+      ansible.builtin.apt:
+        name: apparmor
+        state: present
+      when: apparmor_parser_check.rc != 0
+
+    - name: "[AUDITLOG] Crea la directory di destinazione del log di audit"
+      ansible.builtin.file:
+        path: /var/log/slapo-auditlog
+        state: directory
+        owner: openldap
+        group: openldap
+        mode: "0750"
+
+    - name: "[AUDITLOG] Estende il profilo AppArmor locale di slapd per consentire l'accesso alla directory di audit"
+      ansible.builtin.blockinfile:
+        path: /etc/apparmor.d/local/usr.sbin.slapd
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - slapo-auditlog"
+        block: |
+          /var/log/slapo-auditlog/ r,
+          /var/log/slapo-auditlog/* rw,
+      register: apparmor_slapd_local_audit
+
+    - name: "[AUDITLOG] Ricarica il profilo AppArmor di slapd (solo se il file locale e' cambiato)"
+      ansible.builtin.command: apparmor_parser -r /etc/apparmor.d/usr.sbin.slapd
+      when: apparmor_slapd_local_audit.changed
+      changed_when: true
+
+    - name: "[AUDITLOG] Carica il modulo dinamico auditlog (mancava - stesso schema degli altri overlay di questo file)"
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "cn=module{0},cn=config"
+        attributes:
+          olcModuleLoad: "auditlog"
+        state: present
+
+    # olcAuditlogNonBlocking NON e' qui deliberatamente: non esiste nella
+    # versione OpenLDAP installata (2.6.10). Aggiunta a monte con il
+    # commit 163da8d217 (Arran Cudbard-Bell, 3 luglio 2025, "slapo-
+    # auditlog: Add olcAuditlogNonBlocking to avoid blocking when logging
+    # to named pipes"), sul branch di sviluppo - dopo la diramazione
+    # della serie 2.6.x usata qui. Verificato leggendo direttamente
+    # servers/slapd/overlays/auditlog.c su git.openldap.org, non per
+    # supposizione.
+    - name: "[AUDITLOG] Inizializza e configura l'overlay"
+      community.general.ldap_entry:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcOverlay={3}auditlog,olcDatabase={1}mdb,cn=config"
+        objectClass:
+          - olcOverlayConfig
+          - olcAuditLogConfig
+        attributes:
+          olcOverlay: "{3}auditlog"
+          olcAuditlogFile: "/var/log/slapo-auditlog/slapo-auditlog"
+        state: present
+
+    - name: "[AUDITLOG] Configura la rotazione settimanale del log di audit (copytruncate - non richiede riavvio/segnale a slapd)"
+      ansible.builtin.copy:
+        dest: /etc/logrotate.d/slapo-auditlog
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          /var/log/slapo-auditlog/* {
+              weekly
+              maxsize 100M
+              compress
+              copytruncate
+              missingok
+              notifempty
+              rotate 12
+          }
 
     # --------------------------------------------------------------------
     # CHAIN OVERLAY - prerequisito perche' olcPPolicyForwardUpdates funzioni
