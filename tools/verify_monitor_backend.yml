@@ -1,0 +1,192 @@
+# ==============================================================================
+# TITOLO:       verify_monitor_backend.yml
+# AUTORE:       Elia Pinto
+# DATA:         23 Settembre 2026
+# VERSIONE:     1.2
+#
+# NOVITÀ v1.2 rispetto a v1.1 (osservazione dell'utente sul percorso di
+# destinazione): la directory dei dump ("monitor_dumps_dir") era relativa
+# alla directory corrente sul control node (./monitor_dumps_<timestamp>)
+# - cambiata in percorso assoluto sotto /tmp (/tmp/monitor_dumps_
+# <timestamp>), come richiesto. Nota per chi ha gia' eseguito la v1.0: 
+# quella versione scriveva in ./monitor_dumps/ (senza timestamp, percorso
+# relativo) - controllare ed eventualmente ripulire quella directory a
+# mano, dato che il nuovo percorso/nome non la sovrascrive ne' la tocca.
+# SCOPO:        Verifica su tutti i nodi del cluster se il backend monitor
+#               (cn=Monitor) e' abilitato, e in caso affermativo interroga
+#               l'intero sottoalbero per ottenere i valori mantenuti da
+#               ciascun oggetto monitorato.
+#
+# NOVITÀ v1.1 rispetto a v1.0 (osservazione dell'utente sulla forma del
+# report, non sulla sostanza dei dati):
+#   - Il riferimento al dump completo non compare piu' ripetuto in ogni
+#     report per-nodo (rumore inutile, ripetuto 4 volte con lo stesso
+#     concetto). Spostato in un riepilogo finale unico, dopo il report di
+#     tutti i nodi, con l'elenco di tutti gli LDIF prodotti e la
+#     directory condivisa in cui si trovano.
+#   - La directory di destinazione ora include un timestamp
+#     (monitor_dumps_<data>_<ora>) invece di un nome fisso
+#     (./monitor_dumps/) - cosi' run successivi non si sovrascrivono a
+#     vicenda, e si sa sempre a quale run appartiene un dato dump.
+#   - Il timestamp e' calcolato UNA SOLA VOLTA, in una play dedicata su
+#     localhost prima di toccare il cluster, e riletto da tutti gli altri
+#     host tramite hostvars['localhost'] - necessario perche' calcolarlo
+#     indipendentemente su ciascun nodo (o ripetendo la lookup piu' volte
+#     durante il run) rischierebbe, in caso di run lungo a cavallo di un
+#     cambio di secondo, di produrre directory diverse per nodi diversi
+#     nello stesso identico run.
+#   - L'elenco dei nodi con monitor abilitato, e i relativi percorsi LDIF
+#     per il riepilogo finale, sono costruiti con set_fact +
+#     "default([]) + [item]" dentro un loop (un pattern gia' collaudato
+#     in questo progetto) - non con selectattr su un percorso puntato
+#     (es. "monitor_check.rc"), mai verificato dal vivo in questo
+#     ambiente, ne' con un costrutto namespace+for dentro un'unica
+#     espressione Jinja, che in questo stesso progetto si e' visto
+#     produrre una stringa invece di una lista vera (vedi changelog v7.8
+#     di test_crash_cascading_node.yml). Scoperta anche testando: "\1"
+#     dentro una stringa letterale Jinja (per un tentativo di
+#     map('regex_replace', ...)) viene interpretato come sequenza di
+#     escape (carattere di controllo \x01), non passato al filtro come
+#     backreference - evitato del tutto sostituendo con una semplice
+#     concatenazione di stringhe (~), che non ha questo problema.
+#
+# APPROCCIO ADATTIVO (nessun elenco di oggetti codificato a mano): per
+# design, la struttura di cn=Monitor non e' garantita identica fra release
+# diverse di OpenLDAP (nuovi overlay possono aggiungere propri oggetti
+# sotto cn=Overlays,cn=Monitor, nuovi backend sotto cn=Backends,cn=Monitor,
+# ecc. - vedi la documentazione ufficiale, admin26/monitoringslapd.html,
+# sezione 20.4). Interrogare un elenco fisso di DN rischierebbe di perdere
+# silenziosamente oggetti nuovi, o fallire su oggetti rimossi in versioni
+# future. Questo playbook evita il problema alla radice: una singola
+# ricerca a scope "sub" con filtro "(objectClass=*)" sotto cn=Monitor
+# restituisce TUTTI gli oggetti che esistono davvero su quel nodo, in
+# quella specifica versione - non un sottoinsieme presunto. E' lo stesso
+# meccanismo che la documentazione ufficiale (sezione 20.3) descrive per
+# scoprire dinamicamente quali oggetti di monitoraggio sono disponibili.
+#
+# PRIVILEGI: cn=Monitor e' tipicamente ristretto agli amministratori per
+# ACL (la documentazione ufficiale raccomanda esplicitamente questa
+# restrizione). Usa SASL/EXTERNAL su ldapi:///, come il resto delle
+# interrogazioni amministrative di questo progetto - richiede che l'ACL
+# del database {2}monitor includa la regola peercred come prima clausola
+# (corretta nei deploy v1.9.3/v1.2.3, che correggono anche un problema di
+# idempotenza che impediva alla correzione precedente, v1.9.2/v1.2.2, di
+# applicarsi su cluster gia' deployati). Se questo playbook mostra "NON
+# abilitato" su un nodo dove il monitor risulta attivo con un bind admin
+# diretto, verificare che quel nodo abbia davvero la versione corretta
+# dell'ACL, non solo il backend attivo.
+# ==============================================================================
+
+---
+- name: "[SETUP] Calcola un timestamp condiviso per questo run, una sola volta"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Calcola il timestamp condiviso"
+      ansible.builtin.set_fact:
+        shared_run_timestamp: "{{ lookup('pipe', 'date +%Y%m%d_%H%M%S') }}"
+
+- name: "Verifica e Interrogazione Backend Monitor (cn=Monitor)"
+  hosts:
+    - cluster
+    - readonlyreplica
+  become: true
+  vars:
+    monitor_dump_path: "/tmp/monitor_dump_{{ inventory_hostname }}.ldif"
+    shared_timestamp: "{{ hostvars['localhost'].shared_run_timestamp }}"
+    monitor_dumps_dir: "/tmp/monitor_dumps_{{ shared_timestamp }}"
+
+  tasks:
+
+    - name: "[MONITOR] Verifica se il backend monitor (cn=Monitor) e' abilitato su questo nodo"
+      ansible.builtin.command: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=Monitor -s base "(objectClass=*)" 1.1
+      register: monitor_check
+      changed_when: false
+      failed_when: false
+
+    - name: "[MONITOR] Interroga l'intero sottoalbero cn=Monitor, se abilitato (tutti gli oggetti realmente esistenti su questa release, con tutti i valori)"
+      ansible.builtin.shell: >
+        ldapsearch -Y EXTERNAL -H ldapi:/// -b cn=Monitor -s sub "(objectClass=*)" "*" "+"
+        > {{ monitor_dump_path }}
+      args:
+        executable: /bin/bash
+      when: monitor_check.rc == 0
+      changed_when: true
+
+    - name: "[MONITOR] Conta quanti oggetti monitorati sono stati trovati su questo nodo"
+      ansible.builtin.shell: "grep -c '^dn: ' {{ monitor_dump_path }}"
+      args:
+        executable: /bin/bash
+      register: monitor_object_count
+      when: monitor_check.rc == 0
+      changed_when: false
+
+    - name: "[MONITOR] Elenca i contenitori di primo livello sotto cn=Monitor (riepilogo rapido, senza dover leggere il dump completo)"
+      ansible.builtin.shell: >
+        grep -E '^dn: cn=[^,]+,cn=Monitor$' {{ monitor_dump_path }} | sort
+      args:
+        executable: /bin/bash
+      register: monitor_top_containers
+      when: monitor_check.rc == 0
+      changed_when: false
+
+    - name: "[MONITOR] Riporta a livello locale il dump completo di questo nodo, se abilitato"
+      ansible.builtin.fetch:
+        src: "{{ monitor_dump_path }}"
+        dest: "{{ monitor_dumps_dir }}/{{ inventory_hostname }}.ldif"
+        flat: true
+      when: monitor_check.rc == 0
+
+    - name: "[MONITOR] Report per questo nodo"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['========================================================================',
+             inventory_hostname ~ ' - stato backend monitor',
+             '========================================================================']
+            +
+            (['Backend monitor: ABILITATO',
+              'Oggetti monitorati trovati (adattivo, riflette solo quello'
+              ~ ' che esiste su questa release): ' ~ monitor_object_count.stdout,
+              'Contenitori di primo livello sotto cn=Monitor:']
+             + monitor_top_containers.stdout_lines
+             if monitor_check.rc == 0
+             else ['Backend monitor: NON abilitato su questo nodo (rc='
+                   ~ monitor_check.rc ~ ') - nessun dato di monitoraggio'
+                   ~ ' disponibile. Vedi admin26/monitoringslapd.html'
+                   ~ ' sezione 20.1/20.2 per abilitarlo.'])
+            +
+            ['========================================================================']
+          }}
+
+- name: "[RIEPILOGO] Elenco consolidato dei dump prodotti in questo run"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    shared_timestamp: "{{ hostvars['localhost'].shared_run_timestamp }}"
+    monitor_dumps_dir: "/tmp/monitor_dumps_{{ shared_timestamp }}"
+  tasks:
+    - name: "Costruisce l'elenco dei nodi con monitor abilitato in questo run"
+      ansible.builtin.set_fact:
+        monitor_enabled_hosts: "{{ monitor_enabled_hosts | default([]) + [item] }}"
+      loop: "{{ groups['cluster'] + groups['readonlyreplica'] }}"
+      when: hostvars[item].monitor_check.rc | default(-1) == 0
+
+    - name: "Costruisce l'elenco dei percorsi LDIF corrispondenti, per il riepilogo"
+      ansible.builtin.set_fact:
+        monitor_dump_paths: "{{ monitor_dump_paths | default([]) + [monitor_dumps_dir ~ '/' ~ item ~ '.ldif'] }}"
+      loop: "{{ monitor_enabled_hosts | default([]) }}"
+
+    - name: "Riepilogo consolidato"
+      ansible.builtin.debug:
+        msg: >-
+          {{
+            ['Il dump completo (tutti i valori, tutti gli oggetti) sono negli'
+             ~ ' LDIF suddivisi per nodo del cluster:']
+            + (monitor_dump_paths | default([]))
+            + ['nella directory ' ~ monitor_dumps_dir]
+            if (monitor_enabled_hosts | default([]) | length) > 0
+            else ['Nessun nodo aveva il backend monitor abilitato in questo run'
+                  ~ ' - nessun dump prodotto.']
+          }}
