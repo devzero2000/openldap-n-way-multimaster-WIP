@@ -2,6 +2,49 @@
 # TITOLO:       Configurazione Cluster OpenLDAP Multi-Master dinamico a N-vie
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
+# VERSIONE:     1.9.3 (la v1.9.2 correggeva il contenuto dell'ACL, ma non
+#               il meccanismo che la applica: il task 13 usa "ldapadd"
+#               (changetype: add), che crea il database {2}monitor SOLO
+#               se non esiste ancora - su un cluster gia' deployato in
+#               precedenza (il caso comune), fallisce con "Already
+#               exists", tollerato per idempotenza, ma questo significa
+#               che il contenuto dell'LDIF non viene MAI applicato in
+#               quel caso. Scoperto perche' un utente ha rieseguito il
+#               deploy dopo la v1.9.2 e l'ACL sul nodo non risultava
+#               comunque cambiata, nonostante il deploy fosse "riuscito"
+#               senza errori - servito un ldapmodify manuale come fix
+#               immediato. Aggiunto un nuovo task 13b, idempotente per
+#               design (community.general.ldap_attrs, state: exact),
+#               che gira SEMPRE dopo il task 13 e garantisce che
+#               olcAccess sia quello corrente sia su una creazione
+#               nuova sia su un database preesistente - cosi' una
+#               futura modifica a questa ACL si applica correttamente
+#               al prossimo deploy, senza bisogno di un intervento
+#               manuale come stavolta.
+#
+# VERSIONE:     1.9.2 (bug reale nell'ACL del backend cn=Monitor, trovato
+#               testando direttamente un accesso che avrebbe dovuto
+#               funzionare e non funzionava - non per ispezione a tavolino):
+#               l'olcAccess del database {2}monitor non includeva la
+#               regola peercred (dn.exact="gidNumber=0+uidNumber=0,
+#               cn=peercred,cn=external,cn=auth") come prima clausola
+#               {0}, a differenza di TUTTI gli altri database di questo
+#               deploy (vedi C/D piu' sotto, stessa regola {0} su
+#               olcDatabase={1}mdb). Conseguenza verificata: un bind SASL
+#               EXTERNAL via ldapi:/// come root falliva con "32 No such
+#               object" su cn=Monitor - non un errore di permessi
+#               generico (quello darebbe "Insufficient access"), ma il
+#               mascheramento che OpenLDAP applica quando l'identita' non
+#               ha nemmeno il diritto di "disclose". Un bind semplice con
+#               le credenziali admin (ldap_rootdn) funzionava
+#               correttamente, confermando che il problema era
+#               specificamente l'assenza della regola peercred, non una
+#               rottura piu' ampia. Aggiunta la stessa regola (con "read",
+#               non "manage" - il monitor e' dati di sola lettura per
+#               natura) come prima clausola, riportando questo database
+#               in linea con lo schema di accesso usato ovunque altrove
+#               in questo file.
+#
 # VERSIONE:     1.9.1 (review)
 # SCOPO:        Deploy corazzato con mTLS SASL/EXTERNAL nativo, PPolicy e ACL mirate
 #
@@ -1073,7 +1116,8 @@
           changetype: add
           objectClass: olcDatabaseConfig
           olcDatabase: {2}monitor
-          olcAccess: {0}to * by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+          olcAccess: {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" read
+            by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
 
     - name: 13. Applicazione configurazione backend cn=Monitor
       ansible.builtin.command: ldapadd -Y EXTERNAL -H ldapi:/// -f /tmp/05_monitor.ldif
@@ -1084,6 +1128,33 @@
         - "'Type or value exists' not in monitor_result.stderr"
         - "'only one monitor database allowed' not in monitor_result.stderr"
       changed_when: true
+
+    # Il task sopra usa "ldapadd" (changetype: add): crea il database SOLO
+    # se non esiste ancora - se esiste gia' (caso comune su un cluster
+    # deployato in precedenza), fallisce con "Already exists", il
+    # fallimento e' tollerato per idempotenza, ma il contenuto dell'LDIF
+    # (incluso l'olcAccess) NON viene mai applicato in quel caso. Bug
+    # reale scoperto cosi': una correzione all'olcAccess (v1.9.2) non
+    # aveva alcun effetto sui nodi gia' deployati, nonostante il deploy
+    # "riuscisse" senza errori. Il task seguente e' idempotente per
+    # design (community.general.ldap_attrs verifica lo stato attuale e
+    # applica la modifica solo se diverso da quello desiderato) e gira
+    # SEMPRE, sia sulla creazione iniziale (ridondante ma innocuo) sia su
+    # un database gia' esistente (dove risolve il problema sopra) -
+    # cosi' una futura modifica a questa ACL si applica correttamente al
+    # prossimo deploy, senza bisogno di intervenire a mano con
+    # ldapmodify come e' stato necessario stavolta.
+    - name: 13b. Garantisce che l'ACL del backend cn=Monitor sia quella corrente (idempotente, applica anche su database gia' esistenti)
+      community.general.ldap_attrs:
+        server_uri: "ldapi:///"
+        sasl_class: "external"
+        dn: "olcDatabase={2}monitor,cn=config"
+        attributes:
+          olcAccess:
+            - >-
+              {0}to * by dn.exact="gidNumber=0+uidNumber=0,cn=peercred,cn=external,cn=auth" read
+              by dn.base="{{ ldap_rootdn }}" read by group.exact="{{ ldap_admin_group }}" read by * none
+        state: exact
 
     # =========================================================================
     # CONFIGURAZIONE REPLICA INTELLIGENTE VIA LDAPS (SASL / EXTERNAL) - DINAMICA
