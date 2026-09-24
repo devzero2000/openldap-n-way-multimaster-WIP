@@ -1,0 +1,703 @@
+# ==============================================================================
+# TITOLO:       test_network_partition_conflict_resolution.yml
+# AUTORE:       Elia Pinto
+# DATA:         24 Settembre 2026
+# SCOPO:        Verifica del comportamento del cluster N-Way Multi-Master
+#               sotto una VERA partizione di rete (netsplit) fra un master e
+#               gli altri due - a differenza di test_crash_cascading_node.yml
+#               (che uccide slapd con kill -9) e della WAN simulata (che
+#               degrada banda/latenza/perdita restando comunque un'unica rete
+#               connessa), qui slapd resta vivo e sano su tutti i nodi: viene
+#               tagliato il traffico sulla porta di replica LDAPS (636, la
+#               sola attiva in produzione secondo SLAPD_SERVICES="ldapi:///
+#               ldaps:///") fra {{ node1 }} e gli altri due master, per il
+#               tempo della partizione.
+#
+# NOTA SULLO SCOPE DELLA PARTIZIONE (solo porta 636, non l'intero link IP):
+# il nodo su cui gira ansible-playbook in questo cluster e' esso stesso uno
+# dei tre master (node1). Una partizione totale (incluso SSH) taglierebbe
+# fuori Ansible stesso dal canale di controllo verso node2/node3 a meta'
+# della Fase 3, impedendo sia di specchiare la regola sia, piu' avanti, di
+# sanare la partizione in Fase 9 - un blocco che si "auto-impalla" e da cui
+# solo un intervento manuale sui nodi puo' uscire. Limitando il DROP alla
+# sola porta di replica, la partizione resta genuina dal punto di vista di
+# syncrepl (che e' cio' che il test vuole verificare), mentre SSH/management
+# restano sempre raggiungibili dal nodo di controllo.
+#
+#               Il test copre tre proprietà distinte, in sequenza:
+#                 1) CONTINUITA' OPERATIVA: il nodo isolato deve continuare
+#                    ad accettare scritture in locale senza errori, come
+#                    dichiarato nella Specifica Tecnico-Architetturale
+#                    ("continuita' operativa delle scritture locali anche in
+#                    caso di isolamento... di nodi peer").
+#                 2) DIVERGENZA REALE durante la partizione: i due lati DEVONO
+#                    mostrare valori diversi mentre sono isolati - non e' un
+#                    difetto, e' la prova che la partizione e' davvero attiva
+#                    (senza questa verifica, un iptables che non ha funzionato
+#                    farebbe "passare" il test per il motivo sbagliato).
+#                 3) RICONCILIAZIONE DETERMINISTICA alla guarigione: i due
+#                    entryCSN delle scritture in conflitto vengono catturati
+#                    MENTRE la partizione e' ancora attiva (per sapere con
+#                    certezza quale CSN appartenga a quale scrittura), e
+#                    usati per calcolare a priori un'ipotesi di quale valore
+#                    "deve" vincere (il CSN lessicograficamente maggiore, dato
+#                    che il formato CSN di OpenLDAP e' interamente ordinabile
+#                    come stringa). Dopo la guarigione della partizione, si
+#                    verifica non solo che tutti i nodi convergano allo
+#                    STESSO valore, ma che quel valore sia esattamente quello
+#                    previsto dall'ipotesi - non un semplice "concordano", ma
+#                    "concordano sul valore giusto secondo il CSN".
+#
+# NOTA SULLA DIPENDENZA DAGLI OROLOGI: a differenza dello Scenario B di
+# test_concurrent_multimaster_write.yml (dove i due master restano sempre
+# raggiungibili fra loro al momento della scrittura), qui i due CSN sono
+# generati da nodi che per tutta la durata della partizione non hanno modo di
+# sincronizzarsi. Se un'ipotesi risulta smentita (FASE 10), la causa piu'
+# probabile non e' una rottura della replica ma un disallineamento fra gli
+# orologi di sistema dei nodi coinvolti: il report include percio' anche
+# l'orario di sistema letto su entrambi i lati al momento della scrittura,
+# proprio per non dover indagare alla cieca in quel caso.
+#
+# SICUREZZA: le regole iptables di partizione vengono rimosse SEMPRE in un
+# blocco "always", anche in caso di fallimento in una qualunque fase - un
+# fallimento a meta' non deve lasciare il cluster permanentemente
+# partizionato.
+#
+# VERSIONE:     1.2 (fix: partizione scoped a tcp/636 anziche' a tutto il
+#               traffico - il DROP totale tagliava fuori Ansible stesso, che
+#               gira su node1, dal controllo di node2/node3 a meta' Fase 3;
+#               fix: FASE 2 ora rimuove un'eventuale entry di baseline
+#               residua di un run precedente interrotto, prima di ricrearla -
+#               idempotenza necessaria perche' un run puo' fermarsi prima
+#               della FASE 11 di cleanup; fix: FASE 4 verifica TUTTI e
+#               quattro i leg della partizione (node2->node1, node3->node1,
+#               node1->node2, node1->node3), non solo uno - un singolo leg
+#               rimasto aperto puo' far da ponte indiretto fra i due master
+#               isolati passando per il terzo nodo, e il vecchio controllo a
+#               senso unico non se ne sarebbe accorto)
+# ==============================================================================
+
+---
+- name: "NETWORK PARTITION TEST: Riconciliazione dei Conflitti dopo una Vera Partizione di Rete"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    node1: "ubuntu24lts1.example.com"
+    node2: "ubuntu24lts2.example.com"
+    node3: "ubuntu24lts3.example.com"
+    node4: "ubuntu24lts4.example.com"
+    ldap_basedn: "dc=example,dc=com"
+    ldap_admin_dn: "cn=admin,dc=example,dc=com"
+    ldap_admin_pass: "openldap"
+
+    partition_test_dn: "cn=netsplit-conflict-test,ou=People,dc=example,dc=com"
+    partition_value_isolated: "written-during-partition-by-node1-isolated"
+    partition_value_reachable: "written-during-partition-by-node2-reachable"
+
+    # La partizione e' scoped alla sola porta LDAPS (636, l'unica attiva in
+    # produzione secondo SLAPD_SERVICES="ldapi:/// ldaps:///") anziche' a
+    # TUTTO il traffico fra i nodi. Motivo: il nodo che esegue ansible-playbook
+    # in questo cluster e' esso stesso uno dei tre master (node1) - un DROP
+    # totale (inclusa la porta 22) taglierebbe fuori Ansible stesso dal
+    # canale SSH verso node2/node3 a meta' della Fase 3, impedendo sia di
+    # specchiare la regola sia, piu' avanti, di sanare la partizione in
+    # Fase 9. Limitando il DROP alla porta di replica LDAP, la partizione
+    # resta genuina dal punto di vista di syncrepl, ma SSH/management
+    # restano sempre raggiungibili.
+    partition_ldap_port: "636"
+
+    # Tempo di attesa dopo le due scritture in conflitto, prima di sanare la
+    # partizione - margine per essere certi che entrambe le ldapmodify siano
+    # completate e visibili localmente sul rispettivo lato.
+    post_write_settle_seconds: 3
+
+    # Timeout piu' ampio del solito per la convergenza post-guarigione:
+    # qui c'e' uno storico di modifiche accumulato da riconciliare, non una
+    # singola scrittura isolata come negli altri test.
+    convergence_timeout_after_heal: 90
+
+  tasks:
+    - name: "Blocco principale del test (rimozione della partizione garantita in 'always' anche in caso di errore in una qualunque fase)"
+      block:
+
+        # ==========================================================================
+        # FASE 1: CONTROLLO PRE-VOLO
+        # ==========================================================================
+
+        - name: "[FASE 1] Verifica pre-volo che slapd sia gia' attivo sui tre master, prima di iniziare"
+          delegate_to: "{{ item }}"
+          ansible.builtin.systemd:
+            name: slapd
+          loop:
+            - "{{ node1 }}"
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: preflight_status
+          failed_when: false
+
+        - name: "[FASE 1] Blocca se uno dei tre master e' GIA' inattivo prima di iniziare (residuo di un run precedente, non causato da questo test)"
+          ansible.builtin.assert:
+            that:
+              - preflight_status.results[item].status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ preflight_status.results[item].item }} risulta
+              gia' '{{ preflight_status.results[item].status.ActiveState | default('sconosciuto') }}'
+              PRIMA che questo test tocchi qualunque cosa - verificare/riavviare
+              slapd su tutti i nodi e ripetere da un cluster pulito.
+            success_msg: "OK: slapd e' attivo su {{ preflight_status.results[item].item }} prima di iniziare."
+          loop: "{{ range(preflight_status.results | length) | list }}"
+          loop_control:
+            label: "{{ preflight_status.results[item].item }}"
+
+        # ==========================================================================
+        # FASE 2: BASELINE - entry condivisa pulita, propagata su tutto il
+        # cluster PRIMA di partizionare (il conflitto deve nascere da uno
+        # stato gia' coerente, non dalla propagazione iniziale)
+        # ==========================================================================
+
+        - name: "[FASE 2] Rimuovi un'eventuale entry residua di un run precedente interrotto (idempotenza - tollera 'non esiste')"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" "{{ partition_test_dn }}"
+          delegate_to: "{{ node1 }}"
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 2] Crea l'entry condivisa di test su {{ node1 }} (valore iniziale, prima di qualunque partizione)"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
+            dn: {{ partition_test_dn }}
+            objectClass: top
+            objectClass: organizationalRole
+            cn: netsplit-conflict-test
+            description: initial-value
+            ENTRY
+          delegate_to: "{{ node1 }}"
+          register: baseline_create
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 2] Blocca se la creazione dell'entry condivisa fallisce per un motivo diverso da 'entry residua non rimossa' (gia' gestito sopra)"
+          ansible.builtin.assert:
+            that:
+              - baseline_create.rc == 0
+            fail_msg: >-
+              ERRORE: creazione dell'entry condivisa di baseline fallita su
+              {{ node1 }} (rc={{ baseline_create.rc }}) anche dopo aver rimosso
+              un'eventuale entry residua - output non mostrato (no_log). Verificare
+              manualmente con ldapadd in chiaro su {{ node1 }} per il messaggio
+              d'errore completo.
+
+        - name: "[FASE 2] Attendi che l'entry condivisa converga su tutto il cluster prima di partizionare - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              count_on() {
+                local host="$1"
+                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null \
+                  | grep -c "^dn: "
+              }
+              START=$(date +%s)
+              TIMEOUT=60
+              while true; do
+                C1=$(count_on "{{ node1 }}"); C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}"); C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "1" ] && [ "$C2" = "1" ] && [ "$C3" = "1" ] && [ "$C4" = "1" ]; then
+                  echo "BASELINE_PROPAGATED: $(($(date +%s) - START))s"
+                  exit 0
+                fi
+                if [ $(($(date +%s) - START)) -ge $TIMEOUT ]; then
+                  echo "BASELINE_PROPAGATION_TIMEOUT: node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: baseline_wait
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 2] Blocca se la baseline non e' propagata prima di partizionare"
+          ansible.builtin.assert:
+            that:
+              - "'BASELINE_PROPAGATED' in baseline_wait.stdout"
+            fail_msg: "{{ baseline_wait.stdout }}"
+
+        # ==========================================================================
+        # FASE 3: APPLICA LA PARTIZIONE DI RETE (netsplit vero, non kill -9)
+        # Regole simmetriche su tutti e tre i nodi coinvolti, per simulare un
+        # link realmente caduto e non solo un firewall unilaterale.
+        # ==========================================================================
+
+        - name: "[FASE 3] Applica la partizione: {{ node1 }} non deve piu' raggiungere ne' essere raggiunto da {{ node2 }}/{{ node3 }}"
+          delegate_to: "{{ node1 }}"
+          become: true
+          ansible.builtin.iptables:
+            chain: "{{ item.chain }}"
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(item.peer, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(item.peer, omit) }}"
+            jump: DROP
+            comment: "netsplit-test-partition"
+          loop:
+            - { chain: "INPUT", peer: "{{ node2 }}" }
+            - { chain: "INPUT", peer: "{{ node3 }}" }
+            - { chain: "OUTPUT", peer: "{{ node2 }}" }
+            - { chain: "OUTPUT", peer: "{{ node3 }}" }
+          loop_control:
+            label: "{{ item.chain }} <-> {{ item.peer }}"
+
+        - name: "[FASE 3] Specchia la partizione sul lato di {{ node2 }} e {{ node3 }} (link caduto, non solo firewall unilaterale su {{ node1 }})"
+          delegate_to: "{{ item.host }}"
+          become: true
+          ansible.builtin.iptables:
+            chain: "{{ item.chain }}"
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(node1, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(node1, omit) }}"
+            jump: DROP
+            comment: "netsplit-test-partition"
+          loop:
+            - { host: "{{ node2 }}", chain: "INPUT" }
+            - { host: "{{ node2 }}", chain: "OUTPUT" }
+            - { host: "{{ node3 }}", chain: "INPUT" }
+            - { host: "{{ node3 }}", chain: "OUTPUT" }
+          loop_control:
+            label: "{{ item.host }} {{ item.chain }} <-> {{ node1 }}"
+
+        # ==========================================================================
+        # FASE 4: PROVA CHE LA PARTIZIONE E' REALMENTE ATTIVA (prima di
+        # fidarsi del resto del test - un iptables silenziosamente inefficace
+        # farebbe "passare" il test per il motivo sbagliato)
+        # ==========================================================================
+
+        # NOTA: la mesh N-Way MMR collega node1 SIA a node2 SIA a node3. Se anche
+        # un solo leg (una delle quattro coppie sorgente/destinazione qui sotto)
+        # restasse aperto, node3 (o node2) potrebbe fare da inconsapevole "ponte"
+        # e far arrivare a node1 una scrittura dell'altro master, pur restando il
+        # leg diretto testato bloccato - un falso positivo che invaliderebbe tutto
+        # il resto del test senza che ce ne accorgessimo. Percio' si verificano
+        # TUTTI e quattro i leg, non solo uno.
+        - name: "[FASE 4] Verifica TUTTI i leg della partizione (entrambe le direzioni, entrambi i peer) - non solo un verso"
+          delegate_to: "{{ item.from }}"
+          ansible.builtin.shell: "timeout 3 bash -c 'echo > /dev/tcp/{{ item.to }}/{{ partition_ldap_port }}' 2>/dev/null; echo $?"
+          register: connectivity_checks
+          changed_when: false
+          loop:
+            - { from: "{{ node2 }}", to: "{{ node1 }}" }
+            - { from: "{{ node3 }}", to: "{{ node1 }}" }
+            - { from: "{{ node1 }}", to: "{{ node2 }}" }
+            - { from: "{{ node1 }}", to: "{{ node3 }}" }
+          loop_control:
+            label: "{{ item.from }} -> {{ item.to }}:{{ partition_ldap_port }}"
+
+        - name: "[FASE 4] Report di tutti i leg testati (bloccato/raggiungibile)"
+          ansible.builtin.debug:
+            msg: "{{ item.item.from }} -> {{ item.item.to }}: {{ (item.stdout | trim != '0') | ternary('BLOCCATO (atteso)', 'RAGGIUNGIBILE (!) - la partizione ha una falla su questo leg') }}"
+          loop: "{{ connectivity_checks.results }}"
+          loop_control:
+            label: "{{ item.item.from }} -> {{ item.item.to }}"
+
+        - name: "[FASE 4] Blocca se ANCHE UN SOLO leg risulta ancora raggiungibile (la partizione non e' effettiva su tutti i lati - iptables non ha funzionato ovunque)"
+          ansible.builtin.assert:
+            that:
+              - item.stdout | trim != "0"
+            fail_msg: >-
+              ERRORE: il leg {{ item.item.from }} -> {{ item.item.to }}:{{ partition_ldap_port }}
+              risulta ANCORA raggiungibile dopo l'applicazione delle regole iptables -
+              la partizione non e' completa su tutti i lati (vedi il report sopra per
+              il quadro completo). Anche un solo leg aperto puo' far da ponte
+              indiretto fra i due master isolati tramite il terzo nodo, invalidando
+              il resto del test. Verificare le regole iptables applicate in Fase 3
+              per questo leg specifico.
+            success_msg: "OK: {{ item.item.from }} -> {{ item.item.to }} irraggiungibile."
+          loop: "{{ connectivity_checks.results }}"
+          loop_control:
+            label: "{{ item.item.from }} -> {{ item.item.to }}"
+
+        # ==========================================================================
+        # FASE 5: SCRITTURE IN CONFLITTO SUI DUE LATI DELLA PARTIZIONE
+        # ==========================================================================
+
+        - name: "[FASE 5] Scrivi sul lato ISOLATO ({{ node1 }}, description={{ partition_value_isolated }}) - deve avere successo nonostante l'isolamento"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
+            dn: {{ partition_test_dn }}
+            changetype: modify
+            replace: description
+            description: {{ partition_value_isolated }}
+            ENTRY
+          delegate_to: "{{ node1 }}"
+          register: write_isolated
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 5] Blocca se la scrittura sul nodo isolato NON e' andata a buon fine (violazione della continuita' operativa attesa in isolamento)"
+          ansible.builtin.assert:
+            that:
+              - write_isolated.rc == 0
+            fail_msg: >-
+              ERRORE: la scrittura locale su {{ node1 }} e' fallita mentre il nodo
+              era isolato dagli altri master - questo viola la garanzia di
+              continuita' operativa delle scritture locali dichiarata per
+              l'architettura Multi-Master.
+            success_msg: "OK: la scrittura su {{ node1 }} isolato e' riuscita (rc=0) - continuita' operativa confermata."
+
+        - name: "[FASE 5] Scrivi sul lato RAGGIUNGIBILE ({{ node2 }}, description={{ partition_value_reachable }})"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
+            dn: {{ partition_test_dn }}
+            changetype: modify
+            replace: description
+            description: {{ partition_value_reachable }}
+            ENTRY
+          delegate_to: "{{ node2 }}"
+          register: write_reachable
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 5] Blocca se la scrittura sul lato raggiungibile non e' andata a buon fine"
+          ansible.builtin.assert:
+            that:
+              - write_reachable.rc == 0
+            fail_msg: "ERRORE: la scrittura su {{ node2 }} (lato non isolato) e' fallita - non attesa in questa fase del test."
+
+        - name: "[FASE 5] Margine di attesa perche' entrambe le scritture siano pienamente visibili localmente sul rispettivo lato"
+          ansible.builtin.pause:
+            seconds: "{{ post_write_settle_seconds }}"
+
+        # ==========================================================================
+        # FASE 6: CATTURA I DUE entryCSN (MENTRE LA PARTIZIONE E' ANCORA
+        # ATTIVA - fondamentale farlo ora, per sapere con certezza quale CSN
+        # appartenga a quale scrittura, prima che la guarigione confonda tutto)
+        # ==========================================================================
+
+        - name: "[FASE 6] Cattura l'orario di sistema e l'entryCSN della scrittura sul lato isolato ({{ node1 }})"
+          ansible.builtin.shell: |
+            echo "SYSTEM_TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            sudo slapcat -b "{{ ldap_basedn }}" -a "(cn=netsplit-conflict-test)" 2>/dev/null | grep "^entryCSN:" | sed 's/^entryCSN: //'
+          delegate_to: "{{ node1 }}"
+          become: true
+          register: csn_isolated_raw
+          changed_when: false
+
+        - name: "[FASE 6] Cattura l'orario di sistema e l'entryCSN della scrittura sul lato raggiungibile ({{ node2 }})"
+          ansible.builtin.shell: |
+            echo "SYSTEM_TIME: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            sudo slapcat -b "{{ ldap_basedn }}" -a "(cn=netsplit-conflict-test)" 2>/dev/null | grep "^entryCSN:" | sed 's/^entryCSN: //'
+          delegate_to: "{{ node2 }}"
+          become: true
+          register: csn_reachable_raw
+          changed_when: false
+
+        - name: "[FASE 6] Estrai i due CSN in variabili di lavoro"
+          ansible.builtin.set_fact:
+            csn_isolated: "{{ csn_isolated_raw.stdout_lines | select('match', '^[0-9]{14}\\..*Z#.*') | list | first | default('') }}"
+            csn_reachable: "{{ csn_reachable_raw.stdout_lines | select('match', '^[0-9]{14}\\..*Z#.*') | list | first | default('') }}"
+
+        - name: "[FASE 6] Blocca se non e' stato possibile catturare entrambi i CSN mentre la partizione era attiva"
+          ansible.builtin.assert:
+            that:
+              - csn_isolated | length > 0
+              - csn_reachable | length > 0
+            fail_msg: >-
+              ERRORE: impossibile leggere l'entryCSN su uno dei due lati mentre la
+              partizione era attiva - senza questo dato non e' possibile calcolare
+              un'ipotesi verificabile sul vincitore della riconciliazione.
+              csn_isolato='{{ csn_isolated }}' csn_raggiungibile='{{ csn_reachable }}'
+
+        # ==========================================================================
+        # FASE 7: CALCOLA L'IPOTESI DEL VINCITORE (il CSN di OpenLDAP e'
+        # interamente ordinabile come stringa: timestamp, contatore, serverID
+        # e mod-counter sono tutti a larghezza fissa)
+        # ==========================================================================
+
+        - name: "[FASE 7] Calcola quale CSN e' maggiore (formato CSN OpenLDAP: comparazione lessicografica = comparazione temporale/logica)"
+          ansible.builtin.set_fact:
+            predicted_winner_value: "{{ (csn_isolated > csn_reachable) | ternary(partition_value_isolated, partition_value_reachable) }}"
+            predicted_winner_csn: "{{ (csn_isolated > csn_reachable) | ternary(csn_isolated, csn_reachable) }}"
+            predicted_winner_side: "{{ (csn_isolated > csn_reachable) | ternary(node1 + ' (isolato)', node2 + ' (raggiungibile)') }}"
+
+        - name: "[FASE 7] Report dell'ipotesi calcolata PRIMA di sanare la partizione"
+          ansible.builtin.debug:
+            msg:
+              - "========================================================================"
+              - "IPOTESI DI RICONCILIAZIONE (calcolata mentre la partizione e' ancora attiva)"
+              - "========================================================================"
+              - "{{ csn_isolated_raw.stdout_lines[0] }} (lato isolato, {{ node1 }}) - CSN={{ csn_isolated }}"
+              - "{{ csn_reachable_raw.stdout_lines[0] }} (lato raggiungibile, {{ node2 }}) - CSN={{ csn_reachable }}"
+              - "VINCITORE PREVISTO: '{{ predicted_winner_value }}' (CSN={{ predicted_winner_csn }}, scritto su {{ predicted_winner_side }})"
+              - "========================================================================"
+
+        # ==========================================================================
+        # FASE 8: VERIFICA ESPLICITA DELLA DIVERGENZA (prova che l'isolamento
+        # ha davvero prodotto stati diversi, non solo che i CSN differiscono)
+        # ==========================================================================
+
+        - name: "[FASE 8] Legge il valore attuale su tutti e 4 i nodi mentre la partizione e' ancora attiva - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              read_on() {
+                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$1" \
+                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null \
+                  | grep "^description:" | sed 's/^description: //'
+              }
+              echo "VALORE node1=$(read_on "{{ node1 }}")"
+              echo "VALORE node2=$(read_on "{{ node2 }}")"
+              echo "VALORE node3=$(read_on "{{ node3 }}")"
+              echo "VALORE node4=$(read_on "{{ node4 }}")"
+            executable: /bin/bash
+          register: divergence_check
+          changed_when: false
+
+        - name: "[FASE 8] Report dei valori durante la partizione"
+          ansible.builtin.debug:
+            msg: "{{ ['DURANTE LA PARTIZIONE:'] + divergence_check.stdout_lines }}"
+
+        - name: "[FASE 8] Blocca se i due lati NON divergono durante la partizione (la partizione non ha avuto l'effetto atteso)"
+          ansible.builtin.assert:
+            that:
+              - ("VALORE node1=" + partition_value_isolated) in divergence_check.stdout
+              - ("VALORE node2=" + partition_value_reachable) in divergence_check.stdout
+            fail_msg: >-
+              ERRORE: durante la partizione i valori NON divergono come atteso -
+              vedi il report sopra. Se sono gia' allineati, la partizione di rete
+              non ha impedito la replica come dovrebbe: il resto del test non ha
+              validita'.
+            success_msg: "OK: i due lati della partizione divergono come atteso - la partizione ha avuto l'effetto voluto."
+
+        # ==========================================================================
+        # FASE 9: SANA LA PARTIZIONE
+        # ==========================================================================
+
+        - name: "[FASE 9] Rimuovi le regole di partizione su {{ node1 }}"
+          delegate_to: "{{ node1 }}"
+          become: true
+          ansible.builtin.iptables:
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            chain: "{{ item.chain }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(item.peer, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(item.peer, omit) }}"
+            jump: DROP
+            comment: "netsplit-test-partition"
+            state: absent
+          loop:
+            - { chain: "INPUT", peer: "{{ node2 }}" }
+            - { chain: "INPUT", peer: "{{ node3 }}" }
+            - { chain: "OUTPUT", peer: "{{ node2 }}" }
+            - { chain: "OUTPUT", peer: "{{ node3 }}" }
+          loop_control:
+            label: "{{ item.chain }} <-> {{ item.peer }}"
+
+        - name: "[FASE 9] Rimuovi le regole speculari su {{ node2 }} e {{ node3 }}"
+          delegate_to: "{{ item.host }}"
+          become: true
+          ansible.builtin.iptables:
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            chain: "{{ item.chain }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(node1, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(node1, omit) }}"
+            jump: DROP
+            comment: "netsplit-test-partition"
+            state: absent
+          loop:
+            - { host: "{{ node2 }}", chain: "INPUT" }
+            - { host: "{{ node2 }}", chain: "OUTPUT" }
+            - { host: "{{ node3 }}", chain: "INPUT" }
+            - { host: "{{ node3 }}", chain: "OUTPUT" }
+          loop_control:
+            label: "{{ item.host }} {{ item.chain }} <-> {{ node1 }}"
+
+        # ==========================================================================
+        # FASE 10: ATTENDI LA CONVERGENZA POST-GUARIGIONE E CONFRONTA CON
+        # L'IPOTESI CALCOLATA IN FASE 7 - non basta che i nodi concordino fra
+        # loro, devono concordare sul valore PREVISTO dal CSN.
+        # ==========================================================================
+
+        - name: "[FASE 10] Attendi che tutti i nodi convergano allo stesso valore dopo la guarigione - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              read_on() {
+                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$1" \
+                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null \
+                  | grep "^description:" | sed 's/^description: //'
+              }
+              START=$(date +%s)
+              TIMEOUT={{ convergence_timeout_after_heal }}
+              LAST_PROGRESS_LOG=0
+              while true; do
+                V1=$(read_on "{{ node1 }}"); V2=$(read_on "{{ node2 }}")
+                V3=$(read_on "{{ node3 }}"); V4=$(read_on "{{ node4 }}")
+                if [ "$V1" = "$V2" ] && [ "$V2" = "$V3" ] && [ "$V3" = "$V4" ] && [ -n "$V1" ]; then
+                  echo "RECONCILIATION_CONVERGED: $(($(date +%s) - START))s - valore='$V1'"
+                  exit 0
+                fi
+                ELAPSED=$(($(date +%s) - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "RECONCILIATION_PROGRESS: ${ELAPSED}s - node1=$V1 node2=$V2 node3=$V3 node4=$V4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "RECONCILIATION_TIMEOUT: ${TIMEOUT}s - node1=$V1 node2=$V2 node3=$V3 node4=$V4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: reconciliation_wait
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 10] Blocca se i nodi non convergono allo stesso valore entro il timeout (split-brain persistente dopo la guarigione)"
+          ansible.builtin.assert:
+            that:
+              - "'RECONCILIATION_CONVERGED' in reconciliation_wait.stdout"
+            fail_msg: >-
+              ERRORE: i nodi non hanno raggiunto un valore comune entro
+              {{ convergence_timeout_after_heal }}s dalla guarigione della
+              partizione - vedi il report sopra. Split-brain persistente da
+              indagare manualmente.
+
+        - name: "[FASE 10] Estrai il valore effettivamente convergito"
+          ansible.builtin.set_fact:
+            actual_converged_value: "{{ reconciliation_wait.stdout | regex_search(\"valore='([^']*)'\", '\\1') | first }}"
+
+        - name: "[FASE 10] Report finale: ipotesi prevista vs. valore effettivamente convergito"
+          ansible.builtin.debug:
+            msg:
+              - "========================================================================"
+              - "RICONCILIAZIONE DOPO LA GUARIGIONE DELLA PARTIZIONE"
+              - "========================================================================"
+              - "{{ reconciliation_wait.stdout_lines | last }}"
+              - "VINCITORE PREVISTO (da CSN, calcolato mentre la partizione era attiva): '{{ predicted_winner_value }}'"
+              - "VINCITORE EFFETTIVO (dopo la guarigione): '{{ actual_converged_value }}'"
+              - "ESITO: {{ (predicted_winner_value == actual_converged_value) | ternary('IPOTESI CONFERMATA', 'IPOTESI SMENTITA - vedi nota su clock skew in testa al file') }}"
+              - "========================================================================"
+
+        - name: "[FASE 10] Blocca se il valore convergito NON corrisponde all'ipotesi calcolata dal CSN (riconciliazione non deterministica come atteso)"
+          ansible.builtin.assert:
+            that:
+              - actual_converged_value == predicted_winner_value
+            fail_msg: >-
+              ERRORE: il valore convergito ('{{ actual_converged_value }}') non
+              corrisponde al vincitore previsto dal confronto dei CSN
+              ('{{ predicted_winner_value }}', CSN={{ predicted_winner_csn }}).
+              Prima di sospettare una rottura della logica di replica,
+              verificare l'allineamento NTP fra {{ node1 }} e {{ node2 }} (vedi
+              gli orari di sistema catturati in Fase 6, sopra) - un disallineamento
+              degli orologi e' la causa piu' probabile di un'ipotesi CSN smentita.
+            success_msg: >-
+              OK: il valore convergito corrisponde esattamente al vincitore
+              previsto dal confronto dei CSN - riconciliazione deterministica
+              confermata.
+
+        # ==========================================================================
+        # FASE 11: CLEANUP FINALE
+        # ==========================================================================
+
+        - name: "[FASE 11] Cancella l'entry di test su {{ node1 }}"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" "{{ partition_test_dn }}"
+          delegate_to: "{{ node1 }}"
+          changed_when: true
+          no_log: true
+          failed_when: false
+
+        - name: "[FASE 11] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              count_on() {
+                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$1" \
+                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null \
+                  | grep -c "^dn: "
+              }
+              START=$(date +%s)
+              TIMEOUT=60
+              while true; do
+                C1=$(count_on "{{ node1 }}"); C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}"); C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "0" ] && [ "$C2" = "0" ] && [ "$C3" = "0" ] && [ "$C4" = "0" ]; then
+                  echo "CLEANUP_CONVERGENCE_OK: $(($(date +%s) - START))s"
+                  exit 0
+                fi
+                if [ $(($(date +%s) - START)) -ge $TIMEOUT ]; then
+                  echo "CLEANUP_CONVERGENCE_TIMEOUT: node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: cleanup_convergence
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 11] Report pulizia finale"
+          ansible.builtin.debug:
+            msg: "{{ cleanup_convergence.stdout_lines }}"
+
+      always:
+        # La rimozione della partizione e' gia' nel flusso normale (Fase 9),
+        # ma va ripetuta qui SEMPRE: se il test fallisce in una fase
+        # PRECEDENTE alla 9 (es. Fase 4, 5, 6, 7 o 8), le regole iptables
+        # resterebbero altrimenti applicate e il cluster permanentemente
+        # partizionato. "state: absent" su regole gia' assenti e' no-op sicuro.
+        - name: "[POST] Rimuovi SEMPRE le regole di partizione residue su {{ node1 }} (anche in caso di errore in una fase precedente)"
+          delegate_to: "{{ node1 }}"
+          become: true
+          ansible.builtin.iptables:
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            chain: "{{ item.chain }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(item.peer, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(item.peer, omit) }}"
+            jump: DROP
+            comment: "netsplit-test-partition"
+            state: absent
+          loop:
+            - { chain: "INPUT", peer: "{{ node2 }}" }
+            - { chain: "INPUT", peer: "{{ node3 }}" }
+            - { chain: "OUTPUT", peer: "{{ node2 }}" }
+            - { chain: "OUTPUT", peer: "{{ node3 }}" }
+          loop_control:
+            label: "{{ item.chain }} <-> {{ item.peer }}"
+          failed_when: false
+
+        - name: "[POST] Rimuovi SEMPRE le regole speculari residue su {{ node2 }} e {{ node3 }}"
+          delegate_to: "{{ item.host }}"
+          become: true
+          ansible.builtin.iptables:
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            chain: "{{ item.chain }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(node1, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(node1, omit) }}"
+            jump: DROP
+            comment: "netsplit-test-partition"
+            state: absent
+          loop:
+            - { host: "{{ node2 }}", chain: "INPUT" }
+            - { host: "{{ node2 }}", chain: "OUTPUT" }
+            - { host: "{{ node3 }}", chain: "INPUT" }
+            - { host: "{{ node3 }}", chain: "OUTPUT" }
+          loop_control:
+            label: "{{ item.host }} {{ item.chain }} <-> {{ node1 }}"
+          failed_when: false
