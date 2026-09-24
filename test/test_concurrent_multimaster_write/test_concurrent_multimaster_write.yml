@@ -1,0 +1,613 @@
+# ==============================================================================
+# TITOLO:       test_concurrent_multimaster_write.yml
+# AUTORE:       Elia Pinto
+# DATA:         22 Settembre 2026
+# SCOPO:        Verifica del comportamento del cluster N-Way Multi-Master
+#               sotto scritture SIMULTANEE da piu' di un master, sotto WAN
+#               simulata. Due scenari distinti:
+#                 A) Scritture concorrenti su DN INDIPENDENTI da due master
+#                    diversi - verifica che il throughput combinato converga
+#                    correttamente su tutto il cluster (nessuna scrittura
+#                    persa, nessun duplicato).
+#                 B) Scrittura concorrente sullo STESSO DN, stesso attributo,
+#                    da due master diversi, con valori diversi - verifica
+#                    che la risoluzione dei conflitti (CSN, last-writer-wins)
+#                    converga allo STESSO valore su tutti e 4 i nodi, senza
+#                    stati divergenti persistenti (split-brain).
+#
+# NOTA IMPORTANTE SUL NUMERO DI SCRITTURE: e' stato scelto deliberatamente
+# basso (default 200 per master, 400 combinate) - restiamo ben sotto la
+# soglia di 1000 scritture per singolo provider isolata nell'indagine
+# separata documentata in description_test_crash_cascading_node.md (Parte
+# 3), per non confondere un problema di scrittura CONCORRENTE con quel
+# problema distinto, gia' isolato a parte, di scrittura SEQUENZIALE rapida
+# su un singolo provider. Se in futuro si vuole esplorare se scritture
+# concorrenti abbassano ulteriormente quella soglia, e' un test a se',
+# deliberato, non un effetto collaterale accidentale di questo file.
+#
+# LEZIONI GIA' IMPARATE (dal debug esteso di test_crash_cascading_node.yml)
+# applicate qui fin dall'inizio, per non re-imparale a caro prezzo:
+#   - MAI {{ item }} nel NOME di un task in loop (si renderizza prima che
+#     il loop inizi).
+#   - MAI un set_fact con costrutto namespace+for per produrre una lista:
+#     puo' restituire una stringa invece di una lista vera, anche quando
+#     un test isolato con Jinja puro sembra indicare il contrario. Loop
+#     diretto su range(risultati | length) con accesso per indice.
+#   - no_log sulla FONTE di un dato non impedisce a un task successivo,
+#     che ci fa un loop sopra mostrando "item" per intero, di esporre
+#     comunque tutto - ridurre i dati (o usare un loop per indice, come
+#     sopra) PRIMA di quel loop, non dopo.
+#   - Convergenza/conteggio SEMPRE via slapcat su SSH, mai ldapsearch:
+#     bypassa il protocollo LDAP, il sizelimit, e soprattutto la porta
+#     636 che la WAN simulata degrada apposta (SSH passa dalla 22).
+#   - "0" non e' MAI un conteggio valido di fallback per una funzione di
+#     conteggio - e' indistinguibile da "zero risultati genuini" e
+#     falserebbe qualunque confronto con un target/attesa di convergenza
+#     a zero. Sentinella "-1" per i fallimenti di connessione/comando.
+#   - kill -9 diretto sul PID trovato con pgrep (con retry, blocco se
+#     non esattamente un processo) - non systemctl kill.
+#   - become:true su qualunque comando che tocchi file di root (slapcat,
+#     status systemd, pulizia file temporanei creati da slapcat).
+#   - LDAPTLS_REQCERT=never su ogni ldapadd/ldapmodify/ldapdelete verso
+#     ldaps://127.0.0.1:636 (certificato locale non nella catena di
+#     fiducia del client stesso).
+#   - MAI "set -o pipefail" dentro un blocco "nohup sh -c '...'": fallisce
+#     silenziosamente sotto dash, fermando lo script alla prima riga.
+#   - Report finali con liste multi-riga: la concatenazione di liste
+#     (['header'] + stdout_lines + ['footer']) deve essere l'UNICA
+#     espressione Jinja del campo msg, altrimenti Jinja la stringifica
+#     (letterali "\n" nel log invece di righe vere).
+#   - Controllo pre-volo esplicito che i nodi da usare siano gia' sani
+#     PRIMA di toccarli - un run precedente fallito puo' lasciare stato
+#     residuo che altrimenti sembra un mistero diverso.
+#   - Nessun nome di nodo hardcoded nella logica del playbook - sempre
+#     tramite le variabili di inventory (node1/node2/node3/node4).
+#
+# VERSIONE:     1.0
+# ==============================================================================
+
+---
+- name: "CONCURRENT TEST 1: Scritture Concorrenti da Piu' Master sotto Carico WAN"
+  hosts: localhost
+  gather_facts: true
+  vars:
+    node1: "ubuntu24lts1.example.com"
+    node2: "ubuntu24lts2.example.com"
+    node3: "ubuntu24lts3.example.com"
+    node4: "ubuntu24lts4.example.com"
+    ldap_basedn: "dc=example,dc=com"
+    ldap_admin_dn: "cn=admin,dc=example,dc=com"
+    ldap_admin_pass: "openldap"
+    wan_simulation_playbook: "../../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml"
+
+    # Scritture per master nello Scenario A (indipendenti) - vedi nota
+    # in testa al file sul perche' e' basso deliberatamente.
+    writes_per_node: 200
+
+    conflict_test_dn: "cn=concurrent-conflict-test,ou=People,dc=example,dc=com"
+    conflict_value_a: "written-by-master-a"
+    conflict_value_b: "written-by-master-b"
+
+    scenario_ab_temp_files:
+      - /tmp/concurrent_a.log
+      - /tmp/concurrent_a.pid
+      - /tmp/concurrent_b.log
+      - /tmp/concurrent_b.pid
+      - /tmp/concurrent_conflict_a.log
+      - /tmp/concurrent_conflict_a.pid
+      - /tmp/concurrent_conflict_b.log
+      - /tmp/concurrent_conflict_b.pid
+
+  tasks:
+    - name: "Blocco principale del test (disattivazione WAN garantita in 'always' anche in caso di errore in una qualunque fase)"
+      block:
+
+        # ==========================================================================
+        # [PRE] ABILITAZIONE WAN SIMULATA
+        # ==========================================================================
+
+        - name: "[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)"
+          ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=enabled"
+          changed_when: true
+
+        # ==========================================================================
+        # FASE 1: CONTROLLO PRE-VOLO - i tre master devono essere gia' sani
+        # PRIMA che questo test tocchi qualunque cosa (stesso principio gia'
+        # applicato in test_crash_cascading_node.yml v7.7+)
+        # ==========================================================================
+
+        - name: "[FASE 1] Verifica pre-volo che slapd sia gia' attivo sui tre master, prima di iniziare"
+          delegate_to: "{{ item }}"
+          ansible.builtin.systemd:
+            name: slapd
+          loop:
+            - "{{ node1 }}"
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: preflight_status
+          failed_when: false
+
+        - name: "[FASE 1] Blocca se uno dei tre master e' GIA' inattivo prima di iniziare (residuo di un run precedente, non causato da questo test)"
+          ansible.builtin.assert:
+            that:
+              - preflight_status.results[item].status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ preflight_status.results[item].item }} risulta
+              gia' '{{ preflight_status.results[item].status.ActiveState | default('sconosciuto') }}'
+              PRIMA che questo test tocchi qualunque cosa - verificare/riavviare
+              slapd su tutti i nodi e ripetere da un cluster pulito.
+            success_msg: "OK: slapd e' attivo su {{ preflight_status.results[item].item }} prima di iniziare."
+          loop: "{{ range(preflight_status.results | length) | list }}"
+          loop_control:
+            label: "{{ preflight_status.results[item].item }}"
+
+        # ==========================================================================
+        # FASE 2: SCENARIO A - SCRITTURE CONCORRENTI SU DN INDIPENDENTI
+        # Due iniezioni in background, avviate in sequenza ravvicinata (ciascuna
+        # ritorna quasi subito, il lavoro vero prosegue in nohup) - stesso
+        # pattern di test_crash_cascading_node.yml FASE 1, replicato su due nodi.
+        # ==========================================================================
+
+        - name: "[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su {{ node2 }} (namespace concurrent.a.*)"
+          ansible.builtin.shell: |
+            nohup sh -c '
+              export LDAPTLS_REQCERT=never
+              for i in $(seq 1 {{ writes_per_node }}); do
+                cat << ENTRY
+            dn: uid=concurrent.a.$i,ou=People,{{ ldap_basedn }}
+            objectClass: top
+            objectClass: inetOrgPerson
+            uid: concurrent.a.$i
+            cn: Concurrent Test A $i
+            sn: ConcurrentTest
+            userPassword: {SSHA}demoPass123!
+
+            ENTRY
+                sleep 0.005
+              done | ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" -c
+            ' > /tmp/concurrent_a.log 2>&1 < /dev/null &
+            echo $! > /tmp/concurrent_a.pid
+          delegate_to: "{{ node2 }}"
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su {{ node3 }} (namespace concurrent.b.*)"
+          ansible.builtin.shell: |
+            nohup sh -c '
+              export LDAPTLS_REQCERT=never
+              for i in $(seq 1 {{ writes_per_node }}); do
+                cat << ENTRY
+            dn: uid=concurrent.b.$i,ou=People,{{ ldap_basedn }}
+            objectClass: top
+            objectClass: inetOrgPerson
+            uid: concurrent.b.$i
+            cn: Concurrent Test B $i
+            sn: ConcurrentTest
+            userPassword: {SSHA}demoPass123!
+
+            ENTRY
+                sleep 0.005
+              done | ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" -c
+            ' > /tmp/concurrent_b.log 2>&1 < /dev/null &
+            echo $! > /tmp/concurrent_b.pid
+          delegate_to: "{{ node3 }}"
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 2 - SCENARIO A] Attendi il completamento della scrittura su {{ node2 }}"
+          ansible.builtin.shell: |
+            if [ -f /tmp/concurrent_a.pid ]; then
+                PID=$(cat /tmp/concurrent_a.pid)
+                while kill -0 "$PID" 2>/dev/null; do
+                    sleep 1
+                done
+            fi
+          delegate_to: "{{ node2 }}"
+          changed_when: false
+
+        - name: "[FASE 2 - SCENARIO A] Attendi il completamento della scrittura su {{ node3 }}"
+          ansible.builtin.shell: |
+            if [ -f /tmp/concurrent_b.pid ]; then
+                PID=$(cat /tmp/concurrent_b.pid)
+                while kill -0 "$PID" 2>/dev/null; do
+                    sleep 1
+                done
+            fi
+          delegate_to: "{{ node3 }}"
+          changed_when: false
+
+        # ==========================================================================
+        # FASE 3: SCENARIO A - MISURAZIONE CONVERGENZA (puro shell, slapcat via
+        # SSH - stesso pattern collaudato in test_crash_cascading_node.yml)
+        # ==========================================================================
+
+        - name: "[FASE 3 - SCENARIO A] Misura il tempo di convergenza delle scritture indipendenti su TUTTO il cluster - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              FILTER="(uid=concurrent.*)"
+              TARGET={{ (writes_per_node | int) * 2 }}
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '$FILTER' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
+              }
+
+              START=$(date +%s)
+              TIMEOUT=180
+              LAST_PROGRESS_LOG=0
+
+              while true; do
+                C1=$(count_on "{{ node1 }}")
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "$TARGET" ] && [ "$C2" = "$TARGET" ] && [ "$C3" = "$TARGET" ] && [ "$C4" = "$TARGET" ]; then
+                  NOW=$(date +%s)
+                  echo "SCENARIO_A_CONVERGENCE_OK: $((NOW - START))s (target=$TARGET record allineati su tutti i 4 nodi)"
+                  exit 0
+                fi
+                NOW=$(date +%s)
+                ELAPSED=$((NOW - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "SCENARIO_A_PROGRESS: ${ELAPSED}s - target=$TARGET node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "SCENARIO_A_TIMEOUT: ${TIMEOUT}s - target=$TARGET node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: scenario_a_metric
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 3 - SCENARIO A] Report convergenza scritture indipendenti"
+          ansible.builtin.debug:
+            msg: "{{ ['========================================================================',
+                      'SCENARIO A: SCRITTURE CONCORRENTI SU DN INDIPENDENTI',
+                      '========================================================================']
+                   + scenario_a_metric.stdout_lines +
+                   ['========================================================================'] }}"
+
+        # ==========================================================================
+        # FASE 4: SCENARIO B - CONFLITTO SULLO STESSO DN/ATTRIBUTO
+        # ==========================================================================
+
+        - name: "[FASE 4 - SCENARIO B] Crea l'entry condivisa di test su {{ node1 }} (valore iniziale)"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
+            dn: {{ conflict_test_dn }}
+            objectClass: top
+            objectClass: organizationalRole
+            cn: concurrent-conflict-test
+            description: initial-value
+            ENTRY
+          delegate_to: "{{ node1 }}"
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 4 - SCENARIO B] Attendi che l'entry condivisa converga su node2/node3/node4 prima del conflitto - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=concurrent-conflict-test)' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
+              }
+              START=$(date +%s)
+              TIMEOUT=60
+              while true; do
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$C2" = "1" ] && [ "$C3" = "1" ] && [ "$C4" = "1" ]; then
+                  echo "CONFLICT_ENTRY_PROPAGATED: $(($(date +%s) - START))s"
+                  exit 0
+                fi
+                ELAPSED=$(($(date +%s) - START))
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "CONFLICT_ENTRY_PROPAGATION_TIMEOUT: ${TIMEOUT}s - node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: conflict_entry_wait
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 4 - SCENARIO B] Blocca se l'entry condivisa non e' propagata prima del conflitto"
+          ansible.builtin.assert:
+            that:
+              - "'CONFLICT_ENTRY_PROPAGATED' in conflict_entry_wait.stdout"
+            fail_msg: "{{ conflict_entry_wait.stdout }}"
+
+        - name: "[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da {{ node2 }} (description={{ conflict_value_a }})"
+          ansible.builtin.shell: |
+            nohup sh -c '
+              export LDAPTLS_REQCERT=never
+              ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
+            dn: {{ conflict_test_dn }}
+            changetype: modify
+            replace: description
+            description: {{ conflict_value_a }}
+            ENTRY
+            ' > /tmp/concurrent_conflict_a.log 2>&1 < /dev/null &
+            echo $! > /tmp/concurrent_conflict_a.pid
+          delegate_to: "{{ node2 }}"
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da {{ node3 }} (description={{ conflict_value_b }})"
+          ansible.builtin.shell: |
+            nohup sh -c '
+              export LDAPTLS_REQCERT=never
+              ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
+            dn: {{ conflict_test_dn }}
+            changetype: modify
+            replace: description
+            description: {{ conflict_value_b }}
+            ENTRY
+            ' > /tmp/concurrent_conflict_b.log 2>&1 < /dev/null &
+            echo $! > /tmp/concurrent_conflict_b.pid
+          delegate_to: "{{ node3 }}"
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 4 - SCENARIO B] Attendi il completamento della modifica concorrente su {{ node2 }}"
+          ansible.builtin.shell: |
+            if [ -f /tmp/concurrent_conflict_a.pid ]; then
+                PID=$(cat /tmp/concurrent_conflict_a.pid)
+                while kill -0 "$PID" 2>/dev/null; do
+                    sleep 1
+                done
+            fi
+          delegate_to: "{{ node2 }}"
+          changed_when: false
+
+        - name: "[FASE 4 - SCENARIO B] Attendi il completamento della modifica concorrente su {{ node3 }}"
+          ansible.builtin.shell: |
+            if [ -f /tmp/concurrent_conflict_b.pid ]; then
+                PID=$(cat /tmp/concurrent_conflict_b.pid)
+                while kill -0 "$PID" 2>/dev/null; do
+                    sleep 1
+                done
+            fi
+          delegate_to: "{{ node3 }}"
+          changed_when: false
+
+        # ==========================================================================
+        # FASE 5: SCENARIO B - VERIFICA DELLA RISOLUZIONE DEL CONFLITTO
+        # Attesa fissa di margine dopo il completamento di entrambe le scritture
+        # (non un polling complesso su un singolo attributo - a questa scala,
+        # dati gli 1s di convergenza gia' osservati su centinaia di entry nel
+        # crash test, un margine di 10s e' ampiamente sufficiente), poi lettura
+        # UNA VOLTA su tutti e 4 i nodi.
+        # ==========================================================================
+
+        - name: "[FASE 5 - SCENARIO B] Margine di attesa per la propagazione dell'esito del conflitto"
+          ansible.builtin.pause:
+            seconds: 10
+
+        - name: "[FASE 5 - SCENARIO B] Legge il valore finale dell'attributo in conflitto su tutti e 4 i nodi - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              read_on() {
+                local host="$1"
+                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=concurrent-conflict-test)' 2>/dev/null" 2>/dev/null \
+                  | grep "^description:" | sed 's/^description: //'
+              }
+              V1=$(read_on "{{ node1 }}")
+              V2=$(read_on "{{ node2 }}")
+              V3=$(read_on "{{ node3 }}")
+              V4=$(read_on "{{ node4 }}")
+              echo "VALORE node1=$V1"
+              echo "VALORE node2=$V2"
+              echo "VALORE node3=$V3"
+              echo "VALORE node4=$V4"
+              if [ "$V1" = "$V2" ] && [ "$V2" = "$V3" ] && [ "$V3" = "$V4" ] && [ -n "$V1" ]; then
+                echo "CONFLICT_RESOLUTION_CONSISTENT: tutti i nodi concordano sul valore '$V1'"
+                exit 0
+              else
+                echo "CONFLICT_RESOLUTION_SPLIT_BRAIN: i nodi NON concordano - vedi valori sopra"
+                exit 1
+              fi
+            executable: /bin/bash
+          register: conflict_resolution
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 5 - SCENARIO B] Report risoluzione del conflitto"
+          ansible.builtin.debug:
+            msg: "{{ ['========================================================================',
+                      'SCENARIO B: CONFLITTO SULLO STESSO DN/ATTRIBUTO',
+                      '========================================================================']
+                   + conflict_resolution.stdout_lines +
+                   ['========================================================================'] }}"
+
+        - name: "[FASE 5 - SCENARIO B] Blocca se i nodi non concordano sul valore finale (split-brain genuino, da indagare manualmente)"
+          ansible.builtin.assert:
+            that:
+              - "'CONFLICT_RESOLUTION_CONSISTENT' in conflict_resolution.stdout"
+            fail_msg: >-
+              ERRORE: i quattro nodi NON concordano sul valore finale
+              dell'attributo in conflitto - vedi il report sopra per i
+              valori esatti su ciascun nodo. Questo e' un caso di
+              inconsistenza persistente (split-brain), da indagare
+              manualmente prima di considerare il cluster affidabile
+              sotto scritture concorrenti sullo stesso DN.
+
+        # ==========================================================================
+        # FASE 6: CLEANUP FINALE
+        # ==========================================================================
+
+        - name: "[FASE 6] Cancellazione delle entry di test (entrambi gli scenari) su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              export LDAPTLS_REQCERT=never
+              slapcat -b "{{ ldap_basedn }}" -a "(|(uid=concurrent.*)(cn=concurrent-conflict-test))" 2>/dev/null \
+                | grep "^dn:" | sed 's/^dn: //' > /tmp/concurrent_to_delete.txt
+              ATTEMPTED=$(wc -l < /tmp/concurrent_to_delete.txt)
+              DELETE_RC=0
+              if [ -s /tmp/concurrent_to_delete.txt ]; then
+                ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" \
+                  -f /tmp/concurrent_to_delete.txt -c > /tmp/concurrent_cleanup_ldapdelete.log 2>&1
+                DELETE_RC=$?
+              fi
+              if [ -f /tmp/concurrent_cleanup_ldapdelete.log ]; then
+                ERRORS=$(grep -ci "error\|fail" /tmp/concurrent_cleanup_ldapdelete.log 2>/dev/null)
+              else
+                ERRORS=0
+              fi
+              echo "Tentate: $ATTEMPTED - rc ldapdelete: $DELETE_RC - righe con errori nel log: $ERRORS" > /tmp/concurrent_cleanup_summary.txt
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          become: true
+          register: cleanup_objects
+          changed_when: true
+          no_log: true
+
+        - name: "[FASE 6] Mostra il riepilogo della cancellazione (nessuna password qui - file separato, vedi task precedente)"
+          delegate_to: "{{ node1 }}"
+          ansible.builtin.command: "cat /tmp/concurrent_cleanup_summary.txt"
+          register: cleanup_summary
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 6] Riepilogo cancellazione"
+          ansible.builtin.debug:
+            msg: "{{ cleanup_summary.stdout | default('Riepilogo non disponibile') }}"
+
+        - name: "[FASE 6] Rimozione dei log e file temporanei su {{ node1 }}"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          delegate_to: "{{ node1 }}"
+          become: true
+          loop:
+            - /tmp/concurrent_to_delete.txt
+            - /tmp/concurrent_cleanup_ldapdelete.log
+            - /tmp/concurrent_cleanup_summary.txt
+
+        - name: "[FASE 6] Rimozione dei file temporanei di Scenario A/B su {{ node2 }}"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          delegate_to: "{{ node2 }}"
+          become: true
+          loop: "{{ scenario_ab_temp_files }}"
+
+        - name: "[FASE 6] Rimozione dei file temporanei di Scenario A/B su {{ node3 }}"
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: absent
+          delegate_to: "{{ node3 }}"
+          become: true
+          loop: "{{ scenario_ab_temp_files }}"
+
+        - name: "[FASE 6] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              FILTER="(|(uid=concurrent.*)(cn=concurrent-conflict-test))"
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '$FILTER' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
+              }
+              START=$(date +%s)
+              TIMEOUT=180
+              LAST_PROGRESS_LOG=0
+              while true; do
+                C1=$(count_on "{{ node1 }}")
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "0" ] && [ "$C2" = "0" ] && [ "$C3" = "0" ] && [ "$C4" = "0" ]; then
+                  NOW=$(date +%s)
+                  echo "CLEANUP_CONVERGENCE_OK: $((NOW - START))s (0 record residui su tutti i 4 nodi)"
+                  exit 0
+                fi
+                NOW=$(date +%s)
+                ELAPSED=$((NOW - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "CLEANUP_PROGRESS: ${ELAPSED}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "CLEANUP_CONVERGENCE_TIMEOUT: ${TIMEOUT}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: cleanup_convergence
+          changed_when: false
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 6] Report pulizia finale"
+          ansible.builtin.debug:
+            msg: "{{ cleanup_convergence.stdout_lines }}"
+
+      always:
+        - name: "[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)"
+          ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=disabled"
+          changed_when: true

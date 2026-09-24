@@ -1,0 +1,165 @@
+
+PLAY [CONCURRENT TEST 1: Scritture Concorrenti da Piu' Master sotto Carico WAN] ***
+
+TASK [Gathering Facts] *********************************************************
+ok: [localhost]
+
+TASK [[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)] ***
+changed: [localhost]
+
+TASK [[FASE 1] Verifica pre-volo che slapd sia gia' attivo sui tre master, prima di iniziare] ***
+ok: [localhost -> ubuntu24lts1.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu24lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu24lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 1] Blocca se uno dei tre master e' GIA' inattivo prima di iniziare (residuo di un run precedente, non causato da questo test)] ***
+ok: [localhost] => (item=ubuntu24lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: slapd e' attivo su ubuntu24lts1.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu24lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: slapd e' attivo su ubuntu24lts2.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu24lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: slapd e' attivo su ubuntu24lts3.example.com prima di iniziare."
+}
+
+TASK [[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su ubuntu24lts2.example.com (namespace concurrent.a.*)] ***
+changed: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su ubuntu24lts3.example.com (namespace concurrent.b.*)] ***
+changed: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Attendi il completamento della scrittura su ubuntu24lts2.example.com] ***
+ok: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Attendi il completamento della scrittura su ubuntu24lts3.example.com] ***
+ok: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 3 - SCENARIO A] Misura il tempo di convergenza delle scritture indipendenti su TUTTO il cluster - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 3 - SCENARIO A] Report convergenza scritture indipendenti] *********
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "SCENARIO A: SCRITTURE CONCORRENTI SU DN INDIPENDENTI",
+        "========================================================================",
+        "SCENARIO_A_CONVERGENCE_OK: 4s (target=400 record allineati su tutti i 4 nodi)",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 4 - SCENARIO B] Crea l'entry condivisa di test su ubuntu24lts1.example.com (valore iniziale)] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Attendi che l'entry condivisa converga su node2/node3/node4 prima del conflitto - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 4 - SCENARIO B] Blocca se l'entry condivisa non e' propagata prima del conflitto] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da ubuntu24lts2.example.com (description=written-by-master-a)] ***
+changed: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da ubuntu24lts3.example.com (description=written-by-master-b)] ***
+changed: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Attendi il completamento della modifica concorrente su ubuntu24lts2.example.com] ***
+ok: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Attendi il completamento della modifica concorrente su ubuntu24lts3.example.com] ***
+ok: [localhost -> ubuntu24lts3.example.com]
+
+TASK [[FASE 5 - SCENARIO B] Margine di attesa per la propagazione dell'esito del conflitto] ***
+Pausing for 10 seconds
+(ctrl+C then 'C' = continue early, ctrl+C then 'A' = abort)
+ok: [localhost]
+
+TASK [[FASE 5 - SCENARIO B] Legge il valore finale dell'attributo in conflitto su tutti e 4 i nodi - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 5 - SCENARIO B] Report risoluzione del conflitto] ******************
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "SCENARIO B: CONFLITTO SULLO STESSO DN/ATTRIBUTO",
+        "========================================================================",
+        "VALORE node1=written-by-master-b",
+        "VALORE node2=written-by-master-b",
+        "VALORE node3=written-by-master-b",
+        "VALORE node4=written-by-master-b",
+        "CONFLICT_RESOLUTION_CONSISTENT: tutti i nodi concordano sul valore 'written-by-master-b'",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 5 - SCENARIO B] Blocca se i nodi non concordano sul valore finale (split-brain genuino, da indagare manualmente)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 6] Cancellazione delle entry di test (entrambi gli scenari) su ubuntu24lts1.example.com] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 6] Mostra il riepilogo della cancellazione (nessuna password qui - file separato, vedi task precedente)] ***
+ok: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 6] Riepilogo cancellazione] ****************************************
+ok: [localhost] => {
+    "msg": "Tentate: 401 - rc ldapdelete: 0 - righe con errori nel log: 0"
+}
+
+TASK [[FASE 6] Rimozione dei log e file temporanei su ubuntu24lts1.example.com] ***
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/concurrent_to_delete.txt)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/concurrent_cleanup_ldapdelete.log)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=/tmp/concurrent_cleanup_summary.txt)
+
+TASK [[FASE 6] Rimozione dei file temporanei di Scenario A/B su ubuntu24lts2.example.com] ***
+changed: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_a.log)
+changed: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_a.pid)
+ok: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_b.log)
+ok: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_b.pid)
+changed: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_conflict_a.log)
+changed: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_conflict_a.pid)
+ok: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_conflict_b.log)
+ok: [localhost -> ubuntu24lts2.example.com] => (item=/tmp/concurrent_conflict_b.pid)
+
+TASK [[FASE 6] Rimozione dei file temporanei di Scenario A/B su ubuntu24lts3.example.com] ***
+ok: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_a.log)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_a.pid)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_b.log)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_b.pid)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_conflict_a.log)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_conflict_a.pid)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_conflict_b.log)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=/tmp/concurrent_conflict_b.pid)
+
+TASK [[FASE 6] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 6] Report pulizia finale] ******************************************
+ok: [localhost] => {
+    "msg": [
+        "CLEANUP_CONVERGENCE_OK: 2s (0 record residui su tutti i 4 nodi)"
+    ]
+}
+
+TASK [[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)] ***
+changed: [localhost]
+
+PLAY RECAP *********************************************************************
+localhost                  : ok=30   changed=11   unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+
