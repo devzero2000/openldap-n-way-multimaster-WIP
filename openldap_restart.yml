@@ -1,45 +1,303 @@
 # ==============================================================================
-# TITOLO:       Riavvio Controllato del Cluster OpenLDAP (LDAP + LDAPS Check)
+# TITOLO:       Riavvio Controllato del Cluster OpenLDAP (Stop Sicuro + Verifica
+#               Dinamica e Completa delle Porte in Listening)
 # AUTORE:       Elia Pinto
-# DATA:         Luglio 2026
-# VERSIONE:     1.1
-# SCOPO:        Eseguire il restart del servizio slapd su tutti i nodi del cluster
-#               e verificarne l'effettivo stato operativo post-riavvio sia sulla
-#               porta standard 389 che sulla porta sicura 636 (LDAPS).
+# DATA:         Settembre 2026
+# VERSIONE:     2.4
+# SCOPO:        Eseguire il restart del servizio slapd su tutti i nodi del
+#               cluster garantendo:
+#                 1) che lo STOP sia realmente avvenuto - se systemd non lo
+#                    ferma entro un tempo ragionevole, il processo residuo
+#                    viene terminato forzatamente (kill -9) e solo a quel
+#                    punto si procede;
+#                 2) che la verifica post-riavvio non assuma a priori le
+#                    porte 389/636, ma le rilevi dinamicamente interrogando
+#                    il kernel (ss) sul PID reale di slapd, cosi' da
+#                    accorgersi anche di configurazioni con porte non
+#                    standard o di un servizio partito ma non in listening
+#                    su alcuna porta (es. errore di bind);
+#                 3) che il listening rilevato sia anche COMPLETO rispetto
+#                    a quanto previsto dalla configurazione del nodo (es.
+#                    slapd partito ma in ascolto solo su 636 quando la
+#                    configurazione prevede anche 389) - non solo "non
+#                    vuoto" ma coerente con le URL attese.
+#
+# NOVITA' v2.4 rispetto a v2.3 (fix bug confermato in produzione su 4/4 nodi):
+#   - Il pattern grep che estrae SLAPD_SERVICES da /etc/default/slapd
+#     ('grep -oP "(?<=SLAPD_SERVICES=)\"[^\"]*\""') non ancorava il match
+#     all'inizio riga: intercettava quindi ANCHE le righe commentate (che
+#     iniziano per #), tipiche in questo file come storico di configurazioni
+#     precedenti (es. "# SLAPD_SERVICES=\"ldap://127.0.0.1:389/ ...\""), e le
+#     concatenava con quella realmente attiva. Il parser python vedeva cosi'
+#     anche URL ldap:// provenienti da righe disattivate, facendo risultare
+#     "attesa" la porta 389 anche quando la configurazione REALE la esclude
+#     di proposito (es. SLAPD_SERVICES="ldapi:/// ldaps:///", solo LDAPS).
+#     Riprodotto identicamente su tutti e 4 i nodi, confermando un difetto
+#     del pattern di estrazione e non un guasto di bind reale.
+#   - Fix: il grep e' ora ancorato all'inizio riga
+#     ('^[[:space:]]*SLAPD_SERVICES=', che una riga commentata non soddisfa
+#     mai) e, in caso di piu' righe attive (edge case), prende solo l'ultima
+#     con "tail -n1" - lo stesso criterio con cui la shell di bash
+#     interpreterebbe assegnazioni multiple alla stessa variabile.
+#
+# NOVITA' v2.3 rispetto a v2.2 (fix bug confermato in produzione su 4/4 nodi):
+#   - Il polling delle porte in listening (Fase 2b) si fermava non appena
+#     rilevava ALMENO una porta ("length > 0"), anche se la configurazione
+#     ne prevedeva di piu'. Poiche' slapd non apre tutti i listener nello
+#     stesso identico istante, questo causava un falso positivo sistematico:
+#     appena la prima porta (tipicamente 636) compariva, il polling si
+#     interrompeva subito e la 389 - che stava ancora per essere aperta -
+#     veniva segnalata come "mancante" dal controllo di completezza (Fase
+#     3b), pur non essendoci alcun problema reale di bind. Riprodotto
+#     identicamente su tutti e 4 i nodi del cluster, il che confermava un
+#     difetto della logica di polling e non un guasto infrastrutturale.
+#   - Fix: la determinazione delle porte attese (ex Fase 3) e' stata
+#     anticipata PRIMA del polling con "ss" (ora Fase 2b), cosi' il numero
+#     di porte attese e' noto quando si interroga "ss" e il polling attende
+#     che ne compaiano ALMENO TANTE quante previste (o almeno 1 se le URL
+#     attese non sono state determinate), non piu' la sola prima porta.
+#
+# NOVITA' v2.2 rispetto a v2.1:
+#   - Semplificata la ricerca delle URL di ascolto attese: si assume come
+#     unica fonte di verita' la variabile SLAPD_SERVICES in
+#     /etc/default/slapd (pacchetto Debian/Ubuntu standard), eliminando il
+#     precedente tentativo su un ipotetico override systemd.
+#
+# NOVITA' v2.1 rispetto a v2.0:
+#   - Aggiunta la Fase 3: le porte effettivamente in listening (Fase 2)
+#     vengono confrontate con le porte attese, ricavate dalle URL di avvio
+#     configurate per slapd (-h "ldap:/// ldaps:/// ..."), non piu' solo
+#     verificate "non vuote". Se manca anche una sola porta prevista (es.
+#     389 assente mentre e' presente solo 636), il playbook si blocca
+#     segnalando esplicitamente quale porta manca. In assenza di un
+#     riscontro automatico sulle URL attese, il playbook non blocca
+#     l'esecuzione ma emette un avviso esplicito che la verifica di
+#     completezza non e' stata possibile.
+#
+# NOVITA' v2.0 rispetto a v1.1:
+#   - "state: restarted" sostituito da uno STOP esplicito seguito da uno
+#     START esplicito: con "restarted" non c'e' modo di intercettare ed
+#     eventualmente correggere un mancato arresto nel mezzo - systemd
+#     considera l'operazione conclusa e basta.
+#   - Dopo lo stop, il processo viene ri-verificato con pgrep (con retry,
+#     per dare tempo a slapd di chiudere le connessioni e flushare LMDB).
+#     Se risulta ancora vivo, viene ucciso con kill -9 e poi riverificato
+#     una seconda volta: solo l'assenza totale del processo consente di
+#     proseguire con l'avvio.
+#   - Il controllo "wait_for: port 389/636" e' stato rimosso perche'
+#     presuppone porte fisse note a priori. Al suo posto, dopo l'avvio, si
+#     interroga "ss" per scoprire su quali porte TCP il PID di slapd sia
+#     effettivamente in stato LISTEN, e si valida che l'elenco non sia
+#     vuoto - qualunque sia la configurazione di olcSuffix/urlList sul nodo.
 # ==============================================================================
 
 ---
-- name: "Gestione Cluster: Riavvio OpenLDAP"
+- name: "Gestione Cluster: Riavvio Controllato di OpenLDAP"
   hosts: ldap_all
   become: true
   gather_facts: false # Velocizza l'esecuzione saltando il recupero dei facts
 
+  vars:
+    slapd_stop_poll_retries: 10   # Numero di tentativi di polling dopo lo stop
+    slapd_stop_poll_delay: 1      # Secondi fra un tentativo e l'altro
+    slapd_start_poll_retries: 15  # Numero di tentativi di polling dopo l'avvio
+    slapd_start_poll_delay: 1
+
   tasks:
-    - name: "[RESTART] Riavvia il servizio slapd su tutti i nodi"
+    # --------------------------------------------------------------------
+    # FASE 1: STOP SICURO
+    # --------------------------------------------------------------------
+    - name: "[STOP] Richiedi l'arresto controllato del servizio slapd via systemd"
       ansible.builtin.systemd_service:
         name: slapd
-        state: restarted
+        state: stopped
+
+    - name: "[STOP] Attendi che il processo slapd termini realmente (polling con retry)"
+      ansible.builtin.command: pgrep -x slapd
+      register: slapd_pgrep_after_stop
+      changed_when: false
+      failed_when: false
+      retries: "{{ slapd_stop_poll_retries }}"
+      delay: "{{ slapd_stop_poll_delay }}"
+      until: slapd_pgrep_after_stop.rc != 0
+
+    - name: "[STOP] Se il processo e' ancora vivo dopo lo stop systemd, terminalo forzatamente (kill -9)"
+      ansible.builtin.command: "kill -9 {{ slapd_pgrep_after_stop.stdout_lines | join(' ') }}"
+      when: slapd_pgrep_after_stop.rc == 0
+      changed_when: true
+
+    - name: "[STOP] Ri-verifica (dopo l'eventuale kill -9) che non esista piu' alcun processo slapd"
+      ansible.builtin.command: pgrep -x slapd
+      register: slapd_pgrep_final
+      changed_when: false
+      failed_when: false
+      when: slapd_pgrep_after_stop.rc == 0
+
+    - name: "[STOP] Blocca se, nonostante il kill -9, slapd risulta ancora in esecuzione (situazione anomala, richiede analisi manuale)"
+      ansible.builtin.assert:
+        that:
+          - slapd_pgrep_final.rc is not defined or slapd_pgrep_final.rc != 0
+        fail_msg: >-
+          ERRORE CRITICO: slapd su {{ inventory_hostname }} non termina nemmeno
+          con kill -9 (PID residui: {{ slapd_pgrep_final.stdout_lines | default([]) | join(', ') }}).
+          Interrompo: richiede intervento manuale prima di qualunque riavvio.
+        success_msg: "OK: nessun processo slapd residuo su {{ inventory_hostname }} - stop confermato."
+
+    # --------------------------------------------------------------------
+    # FASE 2: START E VERIFICA DINAMICA DELLE PORTE
+    # --------------------------------------------------------------------
+    - name: "[START] Avvia il servizio slapd"
+      ansible.builtin.systemd_service:
+        name: slapd
+        state: started
         enabled: yes
 
-    - name: "[VERIFICA] Attendi che OpenLDAP torni in ascolto sulla porta standard 389 (LDAP)"
-      ansible.builtin.wait_for:
-        port: 389
-        delay: 1          # Aspetta 1 secondo prima del primo controllo
-        timeout: 10       # Timeout massimo di 10 secondi per nodo
-        state: started
+    - name: "[START] Attendi la comparsa del processo slapd (polling con retry, possibile blip transitorio all'avvio)"
+      ansible.builtin.command: pgrep -x slapd
+      register: slapd_pgrep_after_start
+      changed_when: false
+      failed_when: false
+      retries: "{{ slapd_start_poll_retries }}"
+      delay: "{{ slapd_start_poll_delay }}"
+      until: slapd_pgrep_after_start.rc == 0
 
-    - name: "[VERIFICA] Attendi che OpenLDAP torni in ascolto sulla porta sicura 636 (LDAPS)"
-      ansible.builtin.wait_for:
-        port: 636
-        delay: 0          # Controllo immediato sulla porta sicura
-        timeout: 10
-        state: started
+    - name: "[START] Blocca se il processo slapd non risulta avviato entro il timeout previsto"
+      ansible.builtin.assert:
+        that:
+          - slapd_pgrep_after_start.rc == 0
+        fail_msg: "ERRORE: slapd non risulta in esecuzione su {{ inventory_hostname }} dopo l'avvio (nessun processo trovato con pgrep)."
+        success_msg: "OK: processo slapd attivo su {{ inventory_hostname }} (PID: {{ slapd_pgrep_after_start.stdout_lines | join(', ') }})."
+
+    # --------------------------------------------------------------------
+    # FASE 3: DETERMINAZIONE DELLE PORTE ATTESE (da SLAPD_SERVICES)
+    # --------------------------------------------------------------------
+    # Le URL su cui slapd deve mettersi in ascolto non sono nella LDAP
+    # config tree (cn=config), ma nel parametro di avvio del processo (-h
+    # "..."), impostato sul pacchetto Debian/Ubuntu tramite la variabile
+    # SLAPD_SERVICES in /etc/default/slapd - sede assunta come fonte di
+    # verita' su questi nodi. Va fatto PRIMA di interrogare "ss" (Fase 2b
+    # piu' sotto), cosi' il polling puo' attendere che compaiano TUTTE le
+    # porte previste e non fermarsi alla prima che risulta in ascolto.
+    - name: "[VERIFICA PORTE] Determina le URL di ascolto attese da SLAPD_SERVICES in /etc/default/slapd"
+      ansible.builtin.shell: >
+        grep -E '^[[:space:]]*SLAPD_SERVICES=' /etc/default/slapd 2>/dev/null |
+        tail -n1 | sed -E 's/^[[:space:]]*SLAPD_SERVICES=//' | tr -d '"'
+      args:
+        executable: /bin/bash
+      register: slapd_expected_urls_result
+      changed_when: false
+      failed_when: false
+
+    - name: "[VERIFICA PORTE] Consolida la stringa delle URL attese"
+      ansible.builtin.set_fact:
+        slapd_expected_urls: "{{ slapd_expected_urls_result.stdout | default('') | trim }}"
+
+    - name: "[VERIFICA PORTE] Ricava dalle URL configurate le porte TCP attese (ldap://→389, ldaps://→636, porta esplicita se indicata; ldapi:/// ignorato in quanto socket Unix)"
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - |
+            import re, sys
+            urls = sys.argv[1].split()
+            ports = set()
+            for u in urls:
+                m = re.match(r'^(ldaps?|ldapi)://[^/:]*(?::(\d+))?/?$', u)
+                if not m:
+                    continue
+                scheme, port = m.groups()
+                if scheme == 'ldapi':
+                    continue
+                ports.add(int(port) if port else (389 if scheme == 'ldap' else 636))
+            print('\n'.join(str(p) for p in sorted(ports)))
+          - "{{ slapd_expected_urls }}"
+      register: slapd_expected_ports_result
+      changed_when: false
+      when: (slapd_expected_urls | length) > 0
+
+    - name: "[VERIFICA PORTE] Numero di porte attese (1 se le URL non sono state determinate, per non alterare il comportamento del polling successivo)"
+      ansible.builtin.set_fact:
+        slapd_expected_port_count: >-
+          {{ (slapd_expected_ports_result.stdout_lines | default([]) | length)
+             if ((slapd_expected_urls | length) > 0) else 1 }}
+
+    # --------------------------------------------------------------------
+    # FASE 2b: VERIFICA DINAMICA DELLE PORTE EFFETTIVAMENTE IN LISTENING
+    # --------------------------------------------------------------------
+    - name: "[VERIFICA PORTE] Rileva dinamicamente (via ss, sul PID reale di slapd) su quali porte TCP e' effettivamente in ascolto"
+      ansible.builtin.shell: >
+        ss -H -ltnp | grep -F "pid={{ slapd_pgrep_after_start.stdout_lines[0] }}," |
+        awk '{print $4}' | sed -E 's/.*:([0-9]+)$/\1/' | sort -un
+      args:
+        executable: /bin/bash
+      register: slapd_listening_ports
+      changed_when: false
+      failed_when: false
+      retries: "{{ slapd_start_poll_retries }}"
+      delay: "{{ slapd_start_poll_delay }}"
+      # ATTENZIONE: slapd non apre tutti i listener nello stesso istante, quindi
+      # una condizione "almeno una porta trovata" si soddisfa quasi sempre al
+      # primo tentativo (appena la PRIMA porta compare) e interromperebbe il
+      # polling troppo presto, facendo sembrare "mancanti" porte che in realta'
+      # stavano ancora per essere aperte (falso positivo). Si attende quindi che
+      # il numero di porte rilevate raggiunga il numero di porte ATTESE
+      # (calcolato in Fase 3, sopra); se le URL attese non sono note si usa 1
+      # come soglia minima, equivalente al vecchio comportamento "non vuoto".
+      until: (slapd_listening_ports.stdout_lines | length) >= slapd_expected_port_count
+
+    - name: "[VERIFICA PORTE] Blocca se slapd e' avviato ma non risulta in listening su alcuna porta TCP (es. errore di bind)"
+      ansible.builtin.assert:
+        that:
+          - slapd_listening_ports.stdout_lines | length > 0
+        fail_msg: >-
+          ERRORE: il processo slapd (PID {{ slapd_pgrep_after_start.stdout_lines[0] }}) e' attivo su
+          {{ inventory_hostname }} ma non risulta in ascolto su alcuna porta TCP - verificare
+          i log (journalctl -u slapd) per un possibile errore di bind o di caricamento overlay.
+        success_msg: >-
+          OK: slapd su {{ inventory_hostname }} e' in ascolto sulle porte:
+          {{ slapd_listening_ports.stdout_lines | join(', ') }}.
+
+    # --------------------------------------------------------------------
+    # FASE 3b: CONFRONTO CON LA CONFIGURAZIONE ATTESA (rileva un listening
+    # parziale, es. solo 636 quando la configurazione del nodo prevede
+    # anche 389, dopo aver atteso in Fase 2b che tutte le porte attese
+    # avessero avuto la possibilita' di comparire)
+    # --------------------------------------------------------------------
+    - name: "[VERIFICA PORTE] Blocca se una o piu' porte previste dalla configurazione non risultano in listening (es. 636 attivo ma 389 mancante)"
+      ansible.builtin.assert:
+        that:
+          - (slapd_expected_ports_result.stdout_lines | map('int') | list) | difference(slapd_listening_ports.stdout_lines | map('int') | list) | length == 0
+        fail_msg: >-
+          ERRORE: su {{ inventory_hostname }} la configurazione prevede l'ascolto sulle porte
+          {{ slapd_expected_ports_result.stdout_lines | join(', ') }}, ma slapd risulta
+          effettivamente in listening solo su {{ slapd_listening_ports.stdout_lines | join(', ') }}.
+          Porte mancanti: {{ (slapd_expected_ports_result.stdout_lines | map('int') | list) | difference(slapd_listening_ports.stdout_lines | map('int') | list) | join(', ') }}.
+          Verificare i log (journalctl -u slapd) per un bind fallito su una specifica interfaccia/porta.
+        success_msg: >-
+          OK: su {{ inventory_hostname }} tutte le porte previste dalla configurazione
+          ({{ slapd_expected_ports_result.stdout_lines | join(', ') }}) risultano in listening.
+      when: (slapd_expected_urls | length) > 0
+
+    - name: "[VERIFICA PORTE] Avviso se le URL di ascolto attese non sono state determinate automaticamente (nessun controllo di completezza possibile)"
+      ansible.builtin.debug:
+        msg: >-
+          ATTENZIONE su {{ inventory_hostname }}: non e' stato possibile determinare
+          automaticamente le URL di ascolto attese da SLAPD_SERVICES in /etc/default/slapd
+          (variabile assente o file non presente) - viene quindi validata solo la presenza
+          di almeno una porta in listening (fatto sopra), non la sua completezza rispetto
+          alla configurazione prevista.
+      when: (slapd_expected_urls | length) == 0
 
     - name: "[VERIFICA] Controlla lo stato del servizio systemd"
       ansible.builtin.command: "systemctl is-active slapd"
       register: slapd_status
       changed_when: false
 
-    - name: "[STATUS] Mostra la conferma visiva dello stato del servizio"
+    - name: "[STATUS] Mostra la conferma visiva dello stato del servizio e delle porte rilevate"
       ansible.builtin.debug:
-        msg: "Il nodo {{ inventory_hostname }} ha riavviato slapd con successo. Porte 389/636 attive. Stato: {{ slapd_status.stdout }}."
+        msg: >-
+          Il nodo {{ inventory_hostname }} ha riavviato slapd con successo (stop confermato,
+          nessun processo residuo prima del riavvio). Stato systemd: {{ slapd_status.stdout }}.
+          Porte TCP effettivamente in listening (rilevate dinamicamente, non assunte a priori):
+          {{ slapd_listening_ports.stdout_lines | join(', ') }}.
+          {% if (slapd_expected_urls | length) > 0 %}Porte attese da configurazione: {{ slapd_expected_ports_result.stdout_lines | join(', ') }}.{% endif %}
