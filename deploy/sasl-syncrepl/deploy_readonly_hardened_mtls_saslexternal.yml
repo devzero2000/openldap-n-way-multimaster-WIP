@@ -597,7 +597,7 @@
       ansible.builtin.lineinfile:
         path: /etc/default/slapd
         regexp: '^# SLAPD_SERVICES="ldap:///'
-        line: '# SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///" (precedente, ldap:// disabilitato)'
+        line: '# SLAPD_SERVICES="ldap:/// ldapi:/// ldaps:///"'
         insertbefore: "^SLAPD_SERVICES="
 
     - name: Configurazione ascolto slapd - SOLO ldapi:/// e ldaps:///, ldap:// in chiaro deliberatamente escluso
