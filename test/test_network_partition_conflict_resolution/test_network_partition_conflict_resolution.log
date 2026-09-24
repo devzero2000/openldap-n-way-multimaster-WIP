@@ -1,0 +1,348 @@
+
+PLAY [NETWORK PARTITION TEST: Riconciliazione dei Conflitti dopo una Vera Partizione di Rete] ***
+
+TASK [[FASE 1] Verifica pre-volo che slapd sia gia' attivo sui tre master, prima di iniziare] ***
+ok: [localhost -> ubuntu24lts1.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu24lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu24lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 1] Blocca se uno dei tre master e' GIA' inattivo prima di iniziare (residuo di un run precedente, non causato da questo test)] ***
+ok: [localhost] => (item=ubuntu24lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: slapd e' attivo su ubuntu24lts1.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu24lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: slapd e' attivo su ubuntu24lts2.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu24lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: slapd e' attivo su ubuntu24lts3.example.com prima di iniziare."
+}
+
+TASK [[FASE 2] Rimuovi un'eventuale entry residua di un run precedente interrotto (idempotenza - tollera 'non esiste')] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 2] Crea l'entry condivisa di test su ubuntu24lts1.example.com (valore iniziale, prima di qualunque partizione)] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 2] Blocca se la creazione dell'entry condivisa fallisce per un motivo diverso da 'entry residua non rimossa' (gia' gestito sopra)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 2] Attendi che l'entry condivisa converga su tutto il cluster prima di partizionare - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 2] Blocca se la baseline non e' propagata prima di partizionare] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 3] Applica la partizione: ubuntu24lts1.example.com non deve piu' raggiungere ne' essere raggiunto da ubuntu24lts2.example.com/ubuntu24lts3.example.com] ***
+changed: [localhost -> ubuntu24lts1.example.com] => (item=INPUT <-> ubuntu24lts2.example.com)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=INPUT <-> ubuntu24lts3.example.com)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=OUTPUT <-> ubuntu24lts2.example.com)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=OUTPUT <-> ubuntu24lts3.example.com)
+
+TASK [[FASE 3] Specchia la partizione sul lato di ubuntu24lts2.example.com e ubuntu24lts3.example.com (link caduto, non solo firewall unilaterale su ubuntu24lts1.example.com)] ***
+changed: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com INPUT <-> ubuntu24lts1.example.com)
+changed: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com OUTPUT <-> ubuntu24lts1.example.com)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com INPUT <-> ubuntu24lts1.example.com)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com OUTPUT <-> ubuntu24lts1.example.com)
+
+TASK [[FASE 4] Verifica TUTTI i leg della partizione (entrambe le direzioni, entrambi i peer) - non solo un verso] ***
+ok: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com -> ubuntu24lts1.example.com:636)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com -> ubuntu24lts1.example.com:636)
+ok: [localhost -> ubuntu24lts1.example.com] => (item=ubuntu24lts1.example.com -> ubuntu24lts2.example.com:636)
+ok: [localhost -> ubuntu24lts1.example.com] => (item=ubuntu24lts1.example.com -> ubuntu24lts3.example.com:636)
+
+TASK [[FASE 4] Report di tutti i leg testati (bloccato/raggiungibile)] *********
+ok: [localhost] => (item=ubuntu24lts2.example.com -> ubuntu24lts1.example.com) => {
+    "msg": "ubuntu24lts2.example.com -> ubuntu24lts1.example.com: BLOCCATO (atteso)"
+}
+ok: [localhost] => (item=ubuntu24lts3.example.com -> ubuntu24lts1.example.com) => {
+    "msg": "ubuntu24lts3.example.com -> ubuntu24lts1.example.com: BLOCCATO (atteso)"
+}
+ok: [localhost] => (item=ubuntu24lts1.example.com -> ubuntu24lts2.example.com) => {
+    "msg": "ubuntu24lts1.example.com -> ubuntu24lts2.example.com: BLOCCATO (atteso)"
+}
+ok: [localhost] => (item=ubuntu24lts1.example.com -> ubuntu24lts3.example.com) => {
+    "msg": "ubuntu24lts1.example.com -> ubuntu24lts3.example.com: BLOCCATO (atteso)"
+}
+
+TASK [[FASE 4] Blocca se ANCHE UN SOLO leg risulta ancora raggiungibile (la partizione non e' effettiva su tutti i lati - iptables non ha funzionato ovunque)] ***
+ok: [localhost] => (item=ubuntu24lts2.example.com -> ubuntu24lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu24lts1.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.009199",
+        "end": "2026-09-24 19:29:21.027272",
+        "failed": false,
+        "item": {
+            "from": "ubuntu24lts2.example.com",
+            "to": "ubuntu24lts1.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-24 19:29:18.018073",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ],
+        "warnings": [
+            "Host 'localhost' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered."
+        ]
+    },
+    "msg": "OK: ubuntu24lts2.example.com -> ubuntu24lts1.example.com irraggiungibile."
+}
+ok: [localhost] => (item=ubuntu24lts3.example.com -> ubuntu24lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu24lts1.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.022118",
+        "end": "2026-09-24 19:29:24.474341",
+        "failed": false,
+        "item": {
+            "from": "ubuntu24lts3.example.com",
+            "to": "ubuntu24lts1.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-24 19:29:21.452223",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ],
+        "warnings": [
+            "Host 'localhost' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered."
+        ]
+    },
+    "msg": "OK: ubuntu24lts3.example.com -> ubuntu24lts1.example.com irraggiungibile."
+}
+ok: [localhost] => (item=ubuntu24lts1.example.com -> ubuntu24lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu24lts2.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.021685",
+        "end": "2026-09-24 19:29:27.891747",
+        "failed": false,
+        "item": {
+            "from": "ubuntu24lts1.example.com",
+            "to": "ubuntu24lts2.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-24 19:29:24.870062",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ],
+        "warnings": [
+            "Host 'localhost' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered."
+        ]
+    },
+    "msg": "OK: ubuntu24lts1.example.com -> ubuntu24lts2.example.com irraggiungibile."
+}
+ok: [localhost] => (item=ubuntu24lts1.example.com -> ubuntu24lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "changed_when_result": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu24lts3.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.007867",
+        "end": "2026-09-24 19:29:31.288236",
+        "failed": false,
+        "item": {
+            "from": "ubuntu24lts1.example.com",
+            "to": "ubuntu24lts3.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-09-24 19:29:28.280369",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ],
+        "warnings": [
+            "Host 'localhost' is using the discovered Python interpreter at '/usr/bin/python3.12', but future installation of another Python interpreter could cause a different interpreter to be discovered."
+        ]
+    },
+    "msg": "OK: ubuntu24lts1.example.com -> ubuntu24lts3.example.com irraggiungibile."
+}
+
+TASK [[FASE 5] Scrivi sul lato ISOLATO (ubuntu24lts1.example.com, description=written-during-partition-by-node1-isolated) - deve avere successo nonostante l'isolamento] ***
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 5] Blocca se la scrittura sul nodo isolato NON e' andata a buon fine (violazione della continuita' operativa attesa in isolamento)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "OK: la scrittura su ubuntu24lts1.example.com isolato e' riuscita (rc=0) - continuita' operativa confermata."
+}
+
+TASK [[FASE 5] Scrivi sul lato RAGGIUNGIBILE (ubuntu24lts2.example.com, description=written-during-partition-by-node2-reachable)] ***
+changed: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 5] Blocca se la scrittura sul lato raggiungibile non e' andata a buon fine] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 5] Margine di attesa perche' entrambe le scritture siano pienamente visibili localmente sul rispettivo lato] ***
+Pausing for 3 seconds
+ok: [localhost]
+
+TASK [[FASE 6] Cattura l'orario di sistema e l'entryCSN della scrittura sul lato isolato (ubuntu24lts1.example.com)] ***
+ok: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 6] Cattura l'orario di sistema e l'entryCSN della scrittura sul lato raggiungibile (ubuntu24lts2.example.com)] ***
+ok: [localhost -> ubuntu24lts2.example.com]
+
+TASK [[FASE 6] Estrai i due CSN in variabili di lavoro] ************************
+ok: [localhost]
+
+TASK [[FASE 6] Blocca se non e' stato possibile catturare entrambi i CSN mentre la partizione era attiva] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 7] Calcola quale CSN e' maggiore (formato CSN OpenLDAP: comparazione lessicografica = comparazione temporale/logica)] ***
+ok: [localhost]
+
+TASK [[FASE 7] Report dell'ipotesi calcolata PRIMA di sanare la partizione] ****
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "IPOTESI DI RICONCILIAZIONE (calcolata mentre la partizione e' ancora attiva)",
+        "========================================================================",
+        "SYSTEM_TIME: 2026-09-24T17:29:35Z (lato isolato, ubuntu24lts1.example.com) - CSN=20260924172931.873160Z#000000#001#000000",
+        "SYSTEM_TIME: 2026-09-24T17:29:36Z (lato raggiungibile, ubuntu24lts2.example.com) - CSN=20260924172932.362473Z#000000#002#000000",
+        "VINCITORE PREVISTO: 'written-during-partition-by-node2-reachable' (CSN=20260924172932.362473Z#000000#002#000000, scritto su ubuntu24lts2.example.com (raggiungibile))",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 8] Legge il valore attuale su tutti e 4 i nodi mentre la partizione e' ancora attiva - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 8] Report dei valori durante la partizione] ************************
+ok: [localhost] => {
+    "msg": [
+        "DURANTE LA PARTIZIONE:",
+        "VALORE node1=written-during-partition-by-node1-isolated",
+        "VALORE node2=written-during-partition-by-node2-reachable",
+        "VALORE node3=written-during-partition-by-node2-reachable",
+        "VALORE node4=written-during-partition-by-node2-reachable"
+    ]
+}
+
+TASK [[FASE 8] Blocca se i due lati NON divergono durante la partizione (la partizione non ha avuto l'effetto atteso)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "OK: i due lati della partizione divergono come atteso - la partizione ha avuto l'effetto voluto."
+}
+
+TASK [[FASE 9] Rimuovi le regole di partizione su ubuntu24lts1.example.com] ****
+changed: [localhost -> ubuntu24lts1.example.com] => (item=INPUT <-> ubuntu24lts2.example.com)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=INPUT <-> ubuntu24lts3.example.com)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=OUTPUT <-> ubuntu24lts2.example.com)
+changed: [localhost -> ubuntu24lts1.example.com] => (item=OUTPUT <-> ubuntu24lts3.example.com)
+
+TASK [[FASE 9] Rimuovi le regole speculari su ubuntu24lts2.example.com e ubuntu24lts3.example.com] ***
+changed: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com INPUT <-> ubuntu24lts1.example.com)
+changed: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com OUTPUT <-> ubuntu24lts1.example.com)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com INPUT <-> ubuntu24lts1.example.com)
+changed: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com OUTPUT <-> ubuntu24lts1.example.com)
+
+TASK [[FASE 10] Attendi che tutti i nodi convergano allo stesso valore dopo la guarigione - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 10] Blocca se i nodi non convergono allo stesso valore entro il timeout (split-brain persistente dopo la guarigione)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 10] Estrai il valore effettivamente convergito] ********************
+ok: [localhost]
+
+TASK [[FASE 10] Report finale: ipotesi prevista vs. valore effettivamente convergito] ***
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "RICONCILIAZIONE DOPO LA GUARIGIONE DELLA PARTIZIONE",
+        "========================================================================",
+        "RECONCILIATION_CONVERGED: 4s - valore='written-during-partition-by-node2-reachable'",
+        "VINCITORE PREVISTO (da CSN, calcolato mentre la partizione era attiva): 'written-during-partition-by-node2-reachable'",
+        "VINCITORE EFFETTIVO (dopo la guarigione): 'written-during-partition-by-node2-reachable'",
+        "ESITO: IPOTESI CONFERMATA",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 10] Blocca se il valore convergito NON corrisponde all'ipotesi calcolata dal CSN (riconciliazione non deterministica come atteso)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "OK: il valore convergito corrisponde esattamente al vincitore previsto dal confronto dei CSN - riconciliazione deterministica confermata."
+}
+
+TASK [[FASE 11] Cancella l'entry di test su ubuntu24lts1.example.com] **********
+changed: [localhost -> ubuntu24lts1.example.com]
+
+TASK [[FASE 11] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 11] Report pulizia finale] *****************************************
+ok: [localhost] => {
+    "msg": [
+        "CLEANUP_CONVERGENCE_OK: 2s"
+    ]
+}
+
+TASK [[POST] Rimuovi SEMPRE le regole di partizione residue su ubuntu24lts1.example.com (anche in caso di errore in una fase precedente)] ***
+ok: [localhost -> ubuntu24lts1.example.com] => (item=INPUT <-> ubuntu24lts2.example.com)
+ok: [localhost -> ubuntu24lts1.example.com] => (item=INPUT <-> ubuntu24lts3.example.com)
+ok: [localhost -> ubuntu24lts1.example.com] => (item=OUTPUT <-> ubuntu24lts2.example.com)
+ok: [localhost -> ubuntu24lts1.example.com] => (item=OUTPUT <-> ubuntu24lts3.example.com)
+
+TASK [[POST] Rimuovi SEMPRE le regole speculari residue su ubuntu24lts2.example.com e ubuntu24lts3.example.com] ***
+ok: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com INPUT <-> ubuntu24lts1.example.com)
+ok: [localhost -> ubuntu24lts2.example.com] => (item=ubuntu24lts2.example.com OUTPUT <-> ubuntu24lts1.example.com)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com INPUT <-> ubuntu24lts1.example.com)
+ok: [localhost -> ubuntu24lts3.example.com] => (item=ubuntu24lts3.example.com OUTPUT <-> ubuntu24lts1.example.com)
+
+PLAY RECAP *********************************************************************
+localhost                  : ok=38   changed=9    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+
