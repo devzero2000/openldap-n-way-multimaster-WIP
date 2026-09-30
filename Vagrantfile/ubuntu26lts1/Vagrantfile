@@ -1,0 +1,283 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "bento/ubuntu-26.04"
+  config.vm.box_version = "202606.01.0"
+
+  # Mappatura dei nodi con i rispettivi IP
+  nodes = {
+    "ubuntu26lts1" => "192.168.1.20",
+    "ubuntu26lts2" => "192.168.1.21",
+    "ubuntu26lts3" => "192.168.1.22",
+    "ubuntu26lts4" => "192.168.1.23"
+  }
+
+  # Nodo di controllo Ansible: unico nodo con Ansible installato e con la
+  # chiave SSH privata dell'utente "ansible"
+  master = "ubuntu26lts1"
+
+  nodes.each_with_index do |(hostname, ip), index|
+    config.vm.define hostname do |node|
+      
+      node.vm.hostname = "#{hostname}.example.com"
+      node.vm.provider "vmware_desktop" do |v|
+        v.gui = false
+        v.vmx["memsize"] = "4096"
+        v.vmx["numvcpus"] = "2"
+      end
+
+      # Rete Bridged
+      node.vm.network "public_network", ip: ip, bridge: "eth0"
+
+      # Provisioning iniziale (eseguito solo alla prima creazione)
+      node.vm.provision "shell", inline: <<-SHELL
+        export DEBIAN_FRONTEND=noninteractive
+
+        # --- FIX IPv6 / mirror APT (diagnosticato in sessione di lavoro,
+        # settembre 2026): il router di casa non fornisce IPv6 (ne' RA ne'
+        # DHCPv6 rispondono - verificato fino in fondo alla catena: Windows
+        # configurato correttamente, VMware con IPv6 abilitato, router muto).
+        # Senza questo fix, qualunque comando apt che risolva un host con
+        # record AAAA (com'era us.archive.ubuntu.com/security.ubuntu.com di
+        # default) resta bloccato fino al timeout prima di ripiegare su
+        # IPv4 - capitato concretamente gia' su questo stesso apt-get update
+        # qui sotto, alla primissima creazione della VM. Applicato PRIMA di
+        # qualunque altra cosa, cosi' anche questo primo apt-get ne
+        # beneficia, non solo i provisioning successivi.
+        sysctl -w net.ipv6.conf.all.disable_ipv6=1
+        sysctl -w net.ipv6.conf.default.disable_ipv6=1
+        cat << 'EOF' > /etc/sysctl.d/99-disable-ipv6.conf
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+
+        # Ubuntu 26.04 LTS = codename "resolute" (era "noble" su 24.04)
+        cat << 'EOF' > /etc/apt/sources.list.d/ubuntu.sources
+Types: deb
+URIs: http://ubuntu.mirror.garr.it/ubuntu-archive/
+Suites: resolute resolute-updates resolute-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://ubuntu.mirror.garr.it/ubuntu-archive/
+Suites: resolute-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+        # --- fine fix IPv6 / mirror APT ---
+
+        # Primo update (tutti i nodi): aggiornamento completo dei pacchetti
+        # + pulizia di quelli non piu' necessari (es. kernel vecchi).
+        # force-confdef/confold: nessun prompt sui file di configurazione
+        # modificati (si tiene la versione locale); NEEDRESTART_MODE=a evita
+        # il prompt di needrestart sui servizi da riavviare.
+        export NEEDRESTART_MODE=a
+        apt-get update -y
+        apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
+        apt-get autoremove -y --purge
+        apt-get autoclean -y
+
+        timedatectl set-timezone Europe/Rome
+        timedatectl set-ntp true
+        systemctl restart systemd-timesyncd
+        
+        echo "vagrant ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-vagrant
+        chmod 440 /etc/sudoers.d/90-vagrant
+
+        if [ ! -f /home/vagrant/.ssh/id_rsa ]; then
+          sudo -u vagrant ssh-keygen -t rsa -N "" -f /home/vagrant/.ssh/id_rsa
+        fi
+
+        mkdir -p /vagrant/.cluster_keys
+        cp /home/vagrant/.ssh/id_rsa.pub /vagrant/.cluster_keys/#{hostname}.pub
+        chown vagrant:vagrant /vagrant/.cluster_keys/#{hostname}.pub
+
+        # --- Utente "ansible" (tutti i nodi) ---
+        # Utente dedicato con sudo senza password: dal master Ansible si
+        # collega come "ansible" e diventa root con become.
+        if ! id ansible >/dev/null 2>&1; then
+          useradd -m -s /bin/bash ansible
+        fi
+        echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/91-ansible
+        chmod 440 /etc/sudoers.d/91-ansible
+        visudo -cf /etc/sudoers.d/91-ansible
+        install -d -m 700 -o ansible -g ansible /home/ansible/.ssh
+
+        # --- Solo sul master: Ansible + chiave SSH dell'utente ansible ---
+        if [ "#{hostname}" = "#{master}" ]; then
+          # Ansible dai repository ufficiali di Ubuntu 26.04 (universe).
+          # Il PPA ppa:ansible/ansible non pubblica pacchetti per "resolute"
+          # (verificato settembre 2026: ultime build per questing/noble):
+          # aggiungerlo farebbe fallire apt-add-repository e il provisioning.
+          # (apt-get update gia' eseguito all'inizio del provisioning)
+          apt-get install -y ansible
+
+          # Strumenti di sviluppo Ansible (tutti da universe di 26.04):
+          # - ansible-lint: lint dei playbook; "ansible-lint --fix" fa anche
+          #   da reformatter dei file YAML nello stile atteso da ansible-lint
+          # - yamllint: verifica sintassi e stile YAML
+          # - vim + vim-ale: lint in tempo reale dentro Vim (ALE si carica da
+          #   solo da /usr/share/vim/vimfiles/pack/dist-bundle/start/ale)
+          apt-get install -y ansible-lint yamllint vim vim-ale
+
+          # Configurazione yamllint compatibile con ansible-lint
+          # (letta da yamllint e da ansible-lint quando il progetto non ha
+          # un proprio file .yamllint)
+          install -d -m 755 -o ansible -g ansible /home/ansible/.config /home/ansible/.config/yamllint
+          cat << 'EOF' > /home/ansible/.config/yamllint/config
+extends: default
+
+rules:
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+  truthy:
+    allowed-values: ["true", "false"]
+  line-length:
+    max: 160
+    level: warning
+EOF
+          chown ansible:ansible /home/ansible/.config/yamllint/config
+
+          # Configurazione Vim di sistema per YAML/Ansible
+          # (/etc/vim/vimrc.local viene letto da /etc/vim/vimrc su Ubuntu)
+          cat << 'EOF' > /etc/vim/vimrc.local
+" --- YAML / Ansible ---
+filetype plugin indent on
+syntax on
+set encoding=utf-8
+
+augroup ansible_yaml
+  autocmd!
+  " File Ansible riconosciuti dal percorso -> filetype yaml.ansible
+  " (ALE lancia sia yamllint sia ansible-lint)
+  autocmd BufRead,BufNewFile */playbooks/*.yml,*/playbooks/*.yaml set filetype=yaml.ansible
+  autocmd BufRead,BufNewFile */roles/*.yml,*/roles/*.yaml set filetype=yaml.ansible
+  autocmd BufRead,BufNewFile */group_vars/*,*/host_vars/* set filetype=yaml.ansible
+  autocmd BufRead,BufNewFile site.yml,site.yaml,playbook*.yml,playbook*.yaml set filetype=yaml.ansible
+  " Indentazione YAML: 2 spazi, mai tab
+  autocmd FileType yaml,yaml.ansible setlocal tabstop=2 softtabstop=2 shiftwidth=2 expandtab autoindent
+  " Colonna del cursore e caratteri invisibili per vedere l'indentazione
+  autocmd FileType yaml,yaml.ansible setlocal cursorcolumn list listchars=tab:>-,trail:-
+augroup END
+
+" ALE: quali linter usare e quando
+let g:ale_linters = {'yaml': ['yamllint'], 'ansible': ['ansible_lint']}
+let g:ale_lint_on_text_changed = 'never'
+let g:ale_lint_on_insert_leave = 0
+let g:ale_lint_on_enter = 1
+let g:ale_lint_on_save = 1
+let g:ale_sign_column_always = 1
+
+" :AnsibleFix -> salva, riformatta/corregge con ansible-lint --fix e ricarica
+command! AnsibleFix write | execute '!ansible-lint --fix ' . shellescape(expand('%')) | edit!
+EOF
+
+          if [ ! -f /home/ansible/.ssh/id_ed25519 ]; then
+            sudo -u ansible ssh-keygen -t ed25519 -N "" -C "ansible@#{master}" -f /home/ansible/.ssh/id_ed25519
+          fi
+
+          # Chiave pubblica condivisa in una cartella separata da
+          # .cluster_keys, cosi' non finisce nelle authorized_keys di vagrant
+          mkdir -p /vagrant/.ansible_key
+          cp /home/ansible/.ssh/id_ed25519.pub /vagrant/.ansible_key/id_ed25519.pub
+        fi
+      SHELL
+    end
+  end
+
+  # Secondo stage / Boot provisioning: eseguito SEMPRE ad ogni avvio (run: "always") 
+  nodes.each do |hostname, ip|
+    config.vm.define hostname do |node|
+      node.vm.provision "shell", run: "always", inline: <<-SHELL
+        export DEBIAN_FRONTEND=noninteractive
+
+        # 1) Configurazione hosts
+        sed -i '/# Configurazione Cluster Ansible/,$d' /etc/hosts
+        echo -e "\n# Configurazione Cluster Ansible" >> /etc/hosts
+        echo "192.168.1.20 ubuntu26lts1.example.com ubuntu26lts1" >> /etc/hosts
+        echo "192.168.1.21 ubuntu26lts2.example.com ubuntu26lts2" >> /etc/hosts
+        echo "192.168.1.22 ubuntu26lts3.example.com ubuntu26lts3" >> /etc/hosts
+        echo "192.168.1.23 ubuntu26lts4.example.com ubuntu26lts4" >> /etc/hosts
+
+        # 2) Inventory Ansible (solo sul master)
+        if [ "#{hostname}" = "#{master}" ]; then
+          mkdir -p /etc/ansible
+          cat << 'EOF' > /etc/ansible/hosts
+[cluster]
+ubuntu26lts1.example.com
+ubuntu26lts2.example.com
+ubuntu26lts3.example.com
+
+[readonlyreplica]
+ubuntu26lts4.example.com
+
+[ldap_all:children]
+cluster
+readonlyreplica
+
+[all:vars]
+ansible_user=ansible
+ansible_become=true
+EOF
+
+          # SSH dell'utente ansible verso i nodi: niente prompt sulle host key
+          echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" > /home/ansible/.ssh/config
+          echo -e "Host *.example.com\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/ansible/.ssh/config
+          chown ansible:ansible /home/ansible/.ssh/config
+          chmod 600 /home/ansible/.ssh/config
+        fi
+
+        # 3) Unattended Upgrades
+        apt-get update -y
+        apt-get install -y unattended-upgrades apt-listchanges
+
+        cat << 'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+
+        cat << 'EOF' > /etc/apt/apt.conf.d/50unattended-upgrades-local
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}";
+    "${distro_id}ESM:${distro_codename}";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+EOF
+
+        # 4) Gestione chiavi SSH (APPEND invece di SOVRASCRITTURA)
+        if [ -d /vagrant/.cluster_keys ]; then
+          cat /vagrant/.cluster_keys/*.pub >> /home/vagrant/.ssh/authorized_keys
+          sort -u /home/vagrant/.ssh/authorized_keys -o /home/vagrant/.ssh/authorized_keys
+          chown vagrant:vagrant /home/vagrant/.ssh/authorized_keys
+          chmod 600 /home/vagrant/.ssh/authorized_keys
+        fi
+
+        # 5) Accesso dell'utente ansible dal master (tutti i nodi, master incluso)
+        # Sovrascrittura voluta: l'unica chiave autorizzata e' quella del master.
+        if [ -f /vagrant/.ansible_key/id_ed25519.pub ]; then
+          install -m 600 -o ansible -g ansible /vagrant/.ansible_key/id_ed25519.pub /home/ansible/.ssh/authorized_keys
+        else
+          echo "ATTENZIONE: chiave del master non ancora disponibile; avviare prima #{master}"
+        fi
+
+        # Configurazione SSH
+        echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" > /home/vagrant/.ssh/config
+        echo -e "Host *.example.com\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/vagrant/.ssh/config
+        chown vagrant:vagrant /home/vagrant/.ssh/config
+        chmod 600 /home/vagrant/.ssh/config
+      SHELL
+    end
+  end
+end
