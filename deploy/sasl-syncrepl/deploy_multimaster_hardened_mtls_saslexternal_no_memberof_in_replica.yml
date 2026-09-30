@@ -379,6 +379,11 @@
           - slapd
           - ldap-utils
           - python-is-python3
+          # Richiesto sui nodi dai moduli community.general.ldap_attrs /
+          # ldap_entry (python-ldap). Su 24.04 arrivava come dipendenza di
+          # Ansible installato su tutti i nodi; su 26.04 Ansible e' solo sul
+          # master, quindi va dichiarato esplicitamente.
+          - python3-ldap
         state: present
         update_cache: true
 
