@@ -212,6 +212,7 @@ readonlyreplica
 [all:vars]
 ansible_user=vagrant
 ansible_become=true
+ansible_python_interpreter=/usr/bin/python3
 EOF
         fi
 
