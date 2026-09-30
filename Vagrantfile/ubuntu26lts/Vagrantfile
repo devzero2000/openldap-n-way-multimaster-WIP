@@ -208,6 +208,10 @@ ubuntu26lts4.example.com
 [ldap_all:children]
 cluster
 readonlyreplica
+
+[all:vars]
+ansible_user=vagrant
+ansible_become=true
 EOF
         fi
 
