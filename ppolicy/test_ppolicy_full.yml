@@ -2,7 +2,7 @@
 # TITOLO:       Test Completo Password Policy e Replicazione Multi-Master
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     2.3 (review)
+# VERSIONE:     2.4 (review)
 # SCOPO:        1. Cleanup e creazione utente su Node1.
 #               2. Test del confine ESATTO di pwdMinLength (rifiuto a
 #                  min-1, accettazione a esattamente min).
@@ -168,6 +168,17 @@
 #     ricerca su questo argomento). Senza questo precheck, un domani con
 #     una versione/pacchetto OpenLDAP diverso, un fallimento della Fase 5
 #     sarebbe stato difficile da distinguere da un vero problema di ACL.
+#
+# NOVITÀ v2.4 rispetto a v2.3 (primo run sul cluster Ubuntu 26.04, prima del
+# deploy della replica read-only):
+#   - VERIFICA 2b segnalava "ha riaccettato P0 troppo presto" anche per una
+#     replica NON raggiungibile in LDAPS ("Can't contact LDAP server",
+#     errno 107): l'assert considerava qualunque esito diverso da
+#     "Constraint violation" come un riaccettamento, compreso un errore di
+#     connessione. Il fail_msg ora distingue quattro casi: nodo
+#     irraggiungibile, bind fallito (cambio password non replicato), altro
+#     errore LDAP, riaccettamento vero di P0. La condizione dell'assert e'
+#     invariata: cambia solo la diagnosi riportata.
 #
 # NOVITÀ v2.3 rispetto a v2.2 (tre correzioni portate da un file di test
 # parallelo/piu' vecchio - "verifica_ppolicy.yml" - caricato per un controllo
@@ -549,11 +560,30 @@
         no_log: true
 
       - name: "[VERIFICA 2b] Valida che TUTTI i nodi secondari rifiutino P0 per violazione di cronologia (dentro la finestra esatta)"
+        # Il messaggio di errore distingue la CAUSA del mancato rifiuto: un
+        # nodo irraggiungibile in LDAPS o un bind fallito non sono un
+        # riaccettamento di P0, e non vanno segnalati come tale (v2.4).
         ansible.builtin.assert:
           that:
             - item.details is defined
             - "'Constraint violation' in item.details or 'Password is in history' in item.details"
-          fail_msg: "ERRORE: Il nodo {{ item.item }} ha riaccettato P0 troppo presto - pwdInHistory={{ ppolicy_in_history }} non sta trattenendo abbastanza voci, oppure pwdHistory non si e' replicato."
+          fail_msg: >-
+            {% set d = item.details | default('') | string %}
+            {% if "Can't contact LDAP server" in d %}
+            ERRORE DI CONNESSIONE: impossibile contattare {{ item.item }} in LDAPS - il test non ha potuto
+            verificare la cronologia su questo nodo. NON e' un esito della password policy: controlla che
+            slapd giri e ascolti su ldaps:/// e che il certificato sia valido (per una read-only: il suo
+            deploy e' stato eseguito?). Dettagli: {{ d }}
+            {% elif 'Invalid credentials' in d %}
+            ERRORE DI BIND su {{ item.item }}: la password corrente di testuser non viene accettata - il
+            cambio password eseguito su node1 non si e' replicato su questo nodo. Dettagli: {{ d }}
+            {% elif d %}
+            ERRORE LDAP INATTESO su {{ item.item }}: il cambio a P0 e' stato rifiutato, ma non per
+            violazione di cronologia. Dettagli: {{ d }}
+            {% else %}
+            ERRORE: Il nodo {{ item.item }} ha riaccettato P0 troppo presto - pwdInHistory={{ ppolicy_in_history }}
+            non sta trattenendo abbastanza voci, oppure pwdHistory non si e' replicato.
+            {% endif %}
           success_msg: "OK: Il nodo {{ item.item }} rifiuta correttamente P0 per violazione di cronologia - e' ancora dentro la finestra di pwdInHistory={{ ppolicy_in_history }}."
         loop: "{{ history_reject_test.results }}"
         loop_control:
