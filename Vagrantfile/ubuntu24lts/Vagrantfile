@@ -91,6 +91,16 @@ EOF
         apt-get install -y software-properties-common
         apt-add-repository --yes --update ppa:ansible/ansible
         apt-get install -y ansible
+
+        # Aggiornamento completo dei pacchetti (resta su 24.04: le suite sono
+        # fissate su noble) + pulizia di quelli non piu' necessari.
+        # force-confdef/confold: nessun prompt sui file di configurazione
+        # modificati (si tiene la versione locale); NEEDRESTART_MODE=a evita
+        # il prompt di needrestart sui servizi da riavviare.
+        export NEEDRESTART_MODE=a
+        apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
+        apt-get autoremove -y --purge
+        apt-get autoclean -y
       SHELL
     end
   end
@@ -121,6 +131,11 @@ EOF
         echo "192.168.1.17 ubuntu24lts2.example.com ubuntu24lts2" >> /etc/hosts
         echo "192.168.1.18 ubuntu24lts3.example.com ubuntu24lts3" >> /etc/hosts
         echo "192.168.1.19 ubuntu24lts4.example.com ubuntu24lts4" >> /etc/hosts
+        # Nuovo cluster Ubuntu 26.04
+        echo "192.168.1.20 ubuntu26lts1.example.com ubuntu26lts1" >> /etc/hosts
+        echo "192.168.1.21 ubuntu26lts2.example.com ubuntu26lts2" >> /etc/hosts
+        echo "192.168.1.22 ubuntu26lts3.example.com ubuntu26lts3" >> /etc/hosts
+        echo "192.168.1.23 ubuntu26lts4.example.com ubuntu26lts4" >> /etc/hosts
 
         # 2) Inventory Ansible
         mkdir -p /etc/ansible
