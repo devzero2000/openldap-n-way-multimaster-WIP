@@ -13,8 +13,8 @@ Vagrant.configure("2") do |config|
     "ubuntu26lts4" => "192.168.1.23"
   }
 
-  # Nodo di controllo Ansible: unico nodo con Ansible installato e con la
-  # chiave SSH privata dell'utente "ansible"
+  # Nodo di controllo Ansible: unico nodo con Ansible installato.
+  # Ansible si usa come utente "vagrant" (come nel cluster 24.04).
   master = "ubuntu26lts1"
 
   nodes.each_with_index do |(hostname, ip), index|
@@ -25,6 +25,12 @@ Vagrant.configure("2") do |config|
         v.gui = false
         v.vmx["memsize"] = "4096"
         v.vmx["numvcpus"] = "2"
+        # Slot PCI delle schede di rete presenti nel VMX del box bento:
+        # dichiarati esplicitamente come richiesto dal warning di Vagrant
+        # (vmx-allowlisting), cosi' la rete resta configurata correttamente
+        # anche quando Vagrant smettera' di sovrascriverli.
+        v.vmx["ethernet0.pcislotnumber"] = "160"
+        v.vmx["ethernet1.pcislotnumber"] = "256"
       end
 
       # Rete Bridged
@@ -94,18 +100,7 @@ EOF
         cp /home/vagrant/.ssh/id_rsa.pub /vagrant/.cluster_keys/#{hostname}.pub
         chown vagrant:vagrant /vagrant/.cluster_keys/#{hostname}.pub
 
-        # --- Utente "ansible" (tutti i nodi) ---
-        # Utente dedicato con sudo senza password: dal master Ansible si
-        # collega come "ansible" e diventa root con become.
-        if ! id ansible >/dev/null 2>&1; then
-          useradd -m -s /bin/bash ansible
-        fi
-        echo "ansible ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/91-ansible
-        chmod 440 /etc/sudoers.d/91-ansible
-        visudo -cf /etc/sudoers.d/91-ansible
-        install -d -m 700 -o ansible -g ansible /home/ansible/.ssh
-
-        # --- Solo sul master: Ansible + chiave SSH dell'utente ansible ---
+        # --- Solo sul master: Ansible e strumenti di sviluppo ---
         if [ "#{hostname}" = "#{master}" ]; then
           # Ansible dai repository ufficiali di Ubuntu 26.04 (universe).
           # Il PPA ppa:ansible/ansible non pubblica pacchetti per "resolute"
@@ -125,8 +120,8 @@ EOF
           # Configurazione yamllint compatibile con ansible-lint
           # (letta da yamllint e da ansible-lint quando il progetto non ha
           # un proprio file .yamllint)
-          install -d -m 755 -o ansible -g ansible /home/ansible/.config /home/ansible/.config/yamllint
-          cat << 'EOF' > /home/ansible/.config/yamllint/config
+          install -d -m 755 -o vagrant -g vagrant /home/vagrant/.config /home/vagrant/.config/yamllint
+          cat << 'EOF' > /home/vagrant/.config/yamllint/config
 extends: default
 
 rules:
@@ -144,7 +139,7 @@ rules:
     max: 160
     level: warning
 EOF
-          chown ansible:ansible /home/ansible/.config/yamllint/config
+          chown vagrant:vagrant /home/vagrant/.config/yamllint/config
 
           # Configurazione Vim di sistema per YAML/Ansible
           # (/etc/vim/vimrc.local viene letto da /etc/vim/vimrc su Ubuntu)
@@ -179,15 +174,6 @@ let g:ale_sign_column_always = 1
 " :AnsibleFix -> salva, riformatta/corregge con ansible-lint --fix e ricarica
 command! AnsibleFix write | execute '!ansible-lint --fix ' . shellescape(expand('%')) | edit!
 EOF
-
-          if [ ! -f /home/ansible/.ssh/id_ed25519 ]; then
-            sudo -u ansible ssh-keygen -t ed25519 -N "" -C "ansible@#{master}" -f /home/ansible/.ssh/id_ed25519
-          fi
-
-          # Chiave pubblica condivisa in una cartella separata da
-          # .cluster_keys, cosi' non finisce nelle authorized_keys di vagrant
-          mkdir -p /vagrant/.ansible_key
-          cp /home/ansible/.ssh/id_ed25519.pub /vagrant/.ansible_key/id_ed25519.pub
         fi
       SHELL
     end
@@ -222,17 +208,7 @@ ubuntu26lts4.example.com
 [ldap_all:children]
 cluster
 readonlyreplica
-
-[all:vars]
-ansible_user=ansible
-ansible_become=true
 EOF
-
-          # SSH dell'utente ansible verso i nodi: niente prompt sulle host key
-          echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" > /home/ansible/.ssh/config
-          echo -e "Host *.example.com\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/ansible/.ssh/config
-          chown ansible:ansible /home/ansible/.ssh/config
-          chmod 600 /home/ansible/.ssh/config
         fi
 
         # 3) Unattended Upgrades
@@ -262,14 +238,6 @@ EOF
           sort -u /home/vagrant/.ssh/authorized_keys -o /home/vagrant/.ssh/authorized_keys
           chown vagrant:vagrant /home/vagrant/.ssh/authorized_keys
           chmod 600 /home/vagrant/.ssh/authorized_keys
-        fi
-
-        # 5) Accesso dell'utente ansible dal master (tutti i nodi, master incluso)
-        # Sovrascrittura voluta: l'unica chiave autorizzata e' quella del master.
-        if [ -f /vagrant/.ansible_key/id_ed25519.pub ]; then
-          install -m 600 -o ansible -g ansible /vagrant/.ansible_key/id_ed25519.pub /home/ansible/.ssh/authorized_keys
-        else
-          echo "ATTENZIONE: chiave del master non ancora disponibile; avviare prima #{master}"
         fi
 
         # Configurazione SSH
