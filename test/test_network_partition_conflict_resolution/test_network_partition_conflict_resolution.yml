@@ -82,10 +82,15 @@
   hosts: localhost
   gather_facts: false
   vars:
-    node1: "ubuntu24lts1.example.com"
-    node2: "ubuntu24lts2.example.com"
-    node3: "ubuntu24lts3.example.com"
-    node4: "ubuntu24lts4.example.com"
+    # Risolti dinamicamente dall'inventory (gruppi 'cluster' e
+    # 'readonlyreplica'), non hardcoded - stessa convenzione di
+    # test_resilienza_multimaster.yml. node1/2/3 sono i tre master in
+    # ordine alfabetico, node4 e' la prima (e unica, in questo cluster)
+    # replica read-only.
+    node1: "{{ (groups['cluster'] | sort)[0] }}"
+    node2: "{{ (groups['cluster'] | sort)[1] }}"
+    node3: "{{ (groups['cluster'] | sort)[2] }}"
+    node4: "{{ (groups['readonlyreplica'] | sort)[0] }}"
     ldap_basedn: "dc=example,dc=com"
     ldap_admin_dn: "cn=admin,dc=example,dc=com"
     ldap_admin_pass: "openldap"
