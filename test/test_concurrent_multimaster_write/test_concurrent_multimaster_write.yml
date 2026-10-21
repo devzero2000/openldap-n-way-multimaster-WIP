@@ -298,6 +298,21 @@
         # FASE 4: SCENARIO B - CONFLITTO SULLO STESSO DN/ATTRIBUTO
         # ==========================================================================
 
+        # FIX: la FASE 6 di cleanup finale e' dentro il "block" principale, non
+        # in "always" - se un run precedente e' terminato con un fallimento
+        # PRIMA di arrivare alla FASE 6 (es. lo split-brain genuino rilevato in
+        # FASE 5), l'entry condivisa resta sul cluster e la ldapadd successiva
+        # fallisce perche' l'entry esiste gia'. Idempotenza: rimuovi
+        # un'eventuale entry residua PRIMA di crearla, tollerando "non esiste".
+        - name: "[FASE 4 - SCENARIO B] Rimuovi un'eventuale entry residua di un run precedente interrotto (idempotenza - tollera 'non esiste')"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" "{{ conflict_test_dn }}"
+          delegate_to: "{{ node1 }}"
+          changed_when: true
+          failed_when: false
+          no_log: true
+
         - name: "[FASE 4 - SCENARIO B] Crea l'entry condivisa di test su {{ node1 }} (valore iniziale)"
           ansible.builtin.shell: |
             export LDAPTLS_REQCERT=never
@@ -309,8 +324,20 @@
             description: initial-value
             ENTRY
           delegate_to: "{{ node1 }}"
+          register: conflict_entry_create
           changed_when: true
           no_log: true
+
+        - name: "[FASE 4 - SCENARIO B] Blocca se la creazione dell'entry condivisa fallisce per un motivo diverso da 'entry residua non rimossa' (gia' gestito sopra)"
+          ansible.builtin.assert:
+            that:
+              - conflict_entry_create.rc == 0
+            fail_msg: >-
+              ERRORE: creazione dell'entry condivisa di conflitto fallita su
+              {{ node1 }} (rc={{ conflict_entry_create.rc }}) anche dopo aver
+              rimosso un'eventuale entry residua - output non mostrato
+              (no_log). Verificare manualmente con ldapadd in chiaro su
+              {{ node1 }} per il messaggio d'errore completo.
 
         - name: "[FASE 4 - SCENARIO B] Attendi che l'entry condivisa converga su node2/node3/node4 prima del conflitto - puro shell"
           ansible.builtin.shell:
@@ -420,43 +447,70 @@
 
         # ==========================================================================
         # FASE 5: SCENARIO B - VERIFICA DELLA RISOLUZIONE DEL CONFLITTO
-        # Attesa fissa di margine dopo il completamento di entrambe le scritture
-        # (non un polling complesso su un singolo attributo - a questa scala,
-        # dati gli 1s di convergenza gia' osservati su centinaia di entry nel
-        # crash test, un margine di 10s e' ampiamente sufficiente), poi lettura
-        # UNA VOLTA su tutti e 4 i nodi.
+        # FIX: l'attesa fissa (10s) + lettura UNA VOLTA e' stata rimossa - sotto
+        # simulazione WAN (latenza/jitter/perdita attivi durante questo test,
+        # vedi il cleanup "Disabilita simulazione WAN" a fine playbook) i 10s
+        # non sono garantiti sufficienti, specie se un retry di syncrepl su un
+        # leg degradato si inserisce nel mezzo. Si fa invece polling con lo
+        # stesso pattern gia' usato in FASE 4 (propagazione pre-conflitto):
+        # retry fino a convergenza o timeout, con progress log periodico.
         # ==========================================================================
 
-        - name: "[FASE 5 - SCENARIO B] Margine di attesa per la propagazione dell'esito del conflitto"
-          ansible.builtin.pause:
-            seconds: 10
-
-        - name: "[FASE 5 - SCENARIO B] Legge il valore finale dell'attributo in conflitto su tutti e 4 i nodi - puro shell"
+        - name: "[FASE 5 - SCENARIO B] Attendi la convergenza dell'attributo in conflitto su tutti e 4 i nodi - puro shell"
           ansible.builtin.shell:
             cmd: |
               set -u
               set -o pipefail
               read_on() {
                 local host="$1"
-                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
-                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=concurrent-conflict-test)' 2>/dev/null" 2>/dev/null \
-                  | grep "^description:" | sed 's/^description: //'
+                local attempt=0
+                local max_attempts=3
+                local result
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=concurrent-conflict-test)' 2>/dev/null" 2>/dev/null \
+                    | grep "^description:" | sed 's/^description: //')
+                  if [ -n "$result" ]; then
+                    echo "$result"
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo ""
+                return 1
               }
-              V1=$(read_on "{{ node1 }}")
-              V2=$(read_on "{{ node2 }}")
-              V3=$(read_on "{{ node3 }}")
-              V4=$(read_on "{{ node4 }}")
-              echo "VALORE node1=$V1"
-              echo "VALORE node2=$V2"
-              echo "VALORE node3=$V3"
-              echo "VALORE node4=$V4"
-              if [ "$V1" = "$V2" ] && [ "$V2" = "$V3" ] && [ "$V3" = "$V4" ] && [ -n "$V1" ]; then
-                echo "CONFLICT_RESOLUTION_CONSISTENT: tutti i nodi concordano sul valore '$V1'"
-                exit 0
-              else
-                echo "CONFLICT_RESOLUTION_SPLIT_BRAIN: i nodi NON concordano - vedi valori sopra"
-                exit 1
-              fi
+              START=$(date +%s)
+              TIMEOUT=60
+              LAST_PROGRESS_LOG=0
+              while true; do
+                V1=$(read_on "{{ node1 }}")
+                V2=$(read_on "{{ node2 }}")
+                V3=$(read_on "{{ node3 }}")
+                V4=$(read_on "{{ node4 }}")
+                if [ "$V1" = "$V2" ] && [ "$V2" = "$V3" ] && [ "$V3" = "$V4" ] && [ -n "$V1" ]; then
+                  echo "VALORE node1=$V1"
+                  echo "VALORE node2=$V2"
+                  echo "VALORE node3=$V3"
+                  echo "VALORE node4=$V4"
+                  echo "CONFLICT_RESOLUTION_CONSISTENT: tutti i nodi concordano sul valore '$V1' (dopo $(($(date +%s) - START))s)"
+                  exit 0
+                fi
+                ELAPSED=$(($(date +%s) - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "CONFLICT_RESOLUTION_PROGRESS: ${ELAPSED}s - node1=$V1 node2=$V2 node3=$V3 node4=$V4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "VALORE node1=$V1"
+                  echo "VALORE node2=$V2"
+                  echo "VALORE node3=$V3"
+                  echo "VALORE node4=$V4"
+                  echo "CONFLICT_RESOLUTION_SPLIT_BRAIN: i nodi NON concordano dopo ${TIMEOUT}s - vedi valori sopra"
+                  exit 1
+                fi
+                sleep 1
+              done
             executable: /bin/bash
           register: conflict_resolution
           changed_when: false
@@ -613,6 +667,25 @@
             msg: "{{ cleanup_convergence.stdout_lines }}"
 
       always:
+        # Rete di sicurezza oltre alla FASE 6 normale: se il test fallisce in
+        # una fase PRECEDENTE alla 6 (es. lo split-brain di Scenario B
+        # rilevato in FASE 5), la FASE 6 - che e' dentro il blocco principale,
+        # non qui - non viene mai eseguita e l'entry condivisa di conflitto
+        # resterebbe sul cluster, facendo fallire a sua volta la ldapadd del
+        # prossimo run (bug gia' visto e corretto in FASE 4 con il delete
+        # idempotente prima della create - questo e' lo stesso principio
+        # applicato qui come seconda rete di sicurezza). "failed_when: false"
+        # perche' l'entry potrebbe legittimamente non esistere (test riuscito,
+        # gia' pulita dalla FASE 6 normale).
+        - name: "[POST] Rimuovi SEMPRE l'entry condivisa di Scenario B (anche in caso di errore in una fase precedente alla FASE 6)"
+          ansible.builtin.shell: |
+            export LDAPTLS_REQCERT=never
+            ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" "{{ conflict_test_dn }}"
+          delegate_to: "{{ node1 }}"
+          changed_when: true
+          failed_when: false
+          no_log: true
+
         - name: "[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)"
           ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=disabled"
           changed_when: true
