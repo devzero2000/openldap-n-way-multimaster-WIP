@@ -76,8 +76,16 @@
 # fallimento a meta' non deve lasciare il cluster permanentemente
 # partizionato.
 #
-# VERSIONE:     1.5
+# VERSIONE:     1.6
 # CHANGELOG:
+#   1.6 - 2026-10-26 - Intervallo esplicito fra le due scritture in conflitto
+#                      di FASE 5 (conflict_write_gap_ms, 500ms: node2 scrive
+#                      dopo node1) e soglia del pre-flight sugli orologi
+#                      derivata da questo (meta', 250ms) invece di 50ms fissi:
+#                      su 24.04 con systemd-timesyncd (default) lo scarto fra
+#                      i nodi e' di decine di ms (misurati fino a 46ms),
+#                      innocuo ma vicino ai 50ms. Stesso criterio della v1.5
+#                      di test_concurrent_multimaster_write.yml.
 #   1.5 - 2026-10-26 - FASE 11: esito del cleanup ora verificato con un
 #                      assert (prima failed_when: false e nessun assert:
 #                      residui dopo la cancellazione finivano con failed=0).
@@ -181,10 +189,16 @@
     # Pre-flight sullo scarto degli orologi fra i nodi (assert_clock_skew.yml):
     # i CSN contengono l'orario del master che scrive, quindi con orologi
     # sfasati piu' dell'intervallo fra due scritture in conflitto l'ordine dei
-    # CSN si inverte rispetto all'ordine reale. 50ms: molto sopra l'errore di
-    # misura (pochi ms), molto sotto lo sfasamento che ha rotto il test.
+    # CSN si inverte rispetto all'ordine reale. L'intervallo e' quindi
+    # esplicito (conflict_write_gap_ms: node2 scrive almeno tanto dopo node1)
+    # e la soglia ne e' la meta': il margine copre l'errore di misura e la
+    # deriva durante il test. 500/250ms: sopra lo scarto normale di
+    # systemd-timesyncd (default su 24.04, decine di ms fra i nodi), molto
+    # sotto lo sfasamento di secondi visto il 2026-10-26 (VMware Tools contro
+    # l'NTP). Stesso criterio di test_concurrent_multimaster_write.yml.
     clock_skew_tasks: "{{ playbook_dir }}/../assert_clock_skew.yml"
-    max_clock_skew_ms: 50
+    conflict_write_gap_ms: 500
+    max_clock_skew_ms: "{{ (conflict_write_gap_ms | int) // 2 }}"
 
   tasks:
     - name: "Blocco principale del test (rimozione di partizione e WAN garantita in 'always' anche in caso di errore in una qualunque fase)"
@@ -240,6 +254,18 @@
           loop: "{{ range(preflight_status.results | length) | list }}"
           loop_control:
             label: "{{ preflight_status.results[item].item }}"
+
+        - name: "[FASE 1] Controlla che la soglia sullo scarto degli orologi sia minore dell'intervallo fra le scritture in conflitto"
+          ansible.builtin.assert:
+            that:
+              - (max_clock_skew_ms | int) > 0
+              - (max_clock_skew_ms | int) < (conflict_write_gap_ms | int)
+            fail_msg: >-
+              ERRORE di configurazione del test: max_clock_skew_ms
+              ({{ max_clock_skew_ms }}) deve essere > 0 e minore di
+              conflict_write_gap_ms ({{ conflict_write_gap_ms }}), altrimenti
+              il vincitore previsto dai CSN puo' non essere l'ultima scrittura reale.
+            quiet: true
 
         - name: "[FASE 1] Verifica che gli orologi dei nodi siano allineati prima del conflitto sui CSN"
           ansible.builtin.include_tasks: "{{ clock_skew_tasks }}"
@@ -493,8 +519,14 @@
               l'architettura Multi-Master.
             success_msg: "OK: la scrittura su {{ node1 }} isolato e' riuscita (rc=0) - continuita' operativa confermata."
 
-        - name: "[FASE 5] Scrivi sul lato RAGGIUNGIBILE ({{ node2 }}, description={{ partition_value_reachable }})"
+        # node2 scrive almeno conflict_write_gap_ms dopo node1 (la scrittura
+        # di node1 e' gia' conclusa): con uno scarto fra gli orologi minore di
+        # questo intervallo (pre-flight di FASE 1) il CSN piu' alto e' quello
+        # della scrittura avvenuta per ultima. Senza, l'intervallo era solo
+        # l'overhead di Ansible.
+        - name: "[FASE 5] Scrivi sul lato RAGGIUNGIBILE ({{ node2 }}, description={{ partition_value_reachable }}, dopo {{ conflict_write_gap_ms }}ms)"
           ansible.builtin.shell: |
+            sleep {{ '%.3f' | format((conflict_write_gap_ms | int) / 1000) }}
             export LDAPTLS_REQCERT=never
             ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
             dn: {{ partition_test_dn }}

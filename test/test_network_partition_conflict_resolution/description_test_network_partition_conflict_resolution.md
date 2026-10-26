@@ -1,11 +1,11 @@
 # Test: Partizione di Rete (Netsplit) e Riconciliazione Deterministica dei Conflitti
 
 **File playbook:** `test_network_partition_conflict_resolution.yml`
-**Versione playbook:** 1.5
+**Versione playbook:** 1.6
 **Autore:** Elia Pinto
 **Data:** 24 settembre 2026 (ultimo aggiornamento: 26 ottobre 2026)
-**Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 26.04, sotto WAN simulata)
-**Esito ultima esecuzione:** ✅ Superato (`ok=56 changed=11 unreachable=0 failed=0`)
+**Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 24.04, playbook v1.6, sotto WAN simulata)
+**Esito ultima esecuzione:** ✅ 3 run consecutivi superati (`ok=57 changed=11 unreachable=0 failed=0`) con `systemd-timesyncd` e scarto orologi 23–34 ms — vedi §4.3
 
 ---
 
@@ -65,7 +65,9 @@ Il test copre tre proprietà distinte, verificate in sequenza:
 - Controllo pre-volo esplicito (Fase 1): il test si rifiuta di partire se
   anche uno solo dei tre master non risulta già `active` su systemd.
 - **Orologi dei nodi allineati** (Fase 1, dalla v1.4): lo scarto massimo
-  fra i 4 nodi deve essere ≤ 50 ms (`test/assert_clock_skew.yml`). L'ipotesi
+  fra i 4 nodi deve essere ≤ `max_clock_skew_ms` (`test/assert_clock_skew.yml`);
+  dalla v1.6 è metà di `conflict_write_gap_ms` (500 ms → 250 ms) invece di
+  50 ms fissi. L'ipotesi
   sul vincitore (Fase 7) si basa sull'ordine dei CSN, che contengono l'ora
   del master che scrive: vedi la nota sugli orologi in §3.
 - **La partizione è volutamente scoped alla sola porta LDAPS (636)**, l'unica
@@ -164,13 +166,22 @@ letto su entrambi i lati al momento della scrittura.
 
 Dalla v1.4 lo sfasamento si esclude **prima** di partire, invece di
 indagarlo a posteriori: il pre-volo di Fase 1 misura lo scarto fra gli
-orologi dei 4 nodi e si ferma oltre 50 ms. Il 26 ottobre 2026 sulle VM 26.04
+orologi dei 4 nodi e si ferma oltre la soglia. Il 26 ottobre 2026 sulle VM 26.04
 gli orologi oscillavano di ~4,5s per un conflitto fra VMware Tools e chrony,
 e nello Scenario B di `test_concurrent_multimaster_write.yml` questo ha
 prodotto una divergenza permanente (analisi completa nella §5 di
 `description_test_concurrent_multimaster_write.md`). Qui le due scritture in
 conflitto sono a ~0,5s l'una dall'altra (`node1` prima, `node2` dopo): con
 secondi di scarto il vincitore poteva invertirsi rispetto all'ordine reale.
+
+Dalla v1.6 il vincolo è esplicito: `node2` scrive almeno
+`conflict_write_gap_ms` (500 ms) dopo la fine della scrittura di `node1`, e
+il pre-volo accetta uno scarto fino a metà di quell'intervallo (250 ms); un
+`assert` in Fase 1 blocca il test se la soglia non è minore dell'intervallo.
+La soglia fissa di 50 ms era scollegata dall'intervallo reale e, sul 24.04
+con `systemd-timesyncd` (default, decine di ms fra i nodi), poteva fermare il
+test per uno scarto innocuo. Stesso criterio di
+`test_concurrent_multimaster_write.yml` (v1.5).
 
 ## 4. Risultati ottenuti
 
@@ -237,6 +248,20 @@ secondi di scarto il vincitore poteva invertirsi rispetto all'ordine reale.
 
 La riconciliazione resta deterministica anche sotto WAN simulata: stessi
 esiti del 24 settembre, con convergenza in 3s invece di 4s.
+
+### 4.3 Esecuzioni del 26 ottobre 2026 (ambiente ubuntu 24.04, `systemd-timesyncd`, playbook v1.6, sotto WAN simulata)
+
+**3 run consecutivi superati** (`ok=57 changed=11 failed=0`):
+
+| Run | Scarto orologi (soglia 250 ms) | CSN `node1` → `node2` | Vincitore previsto = effettivo | Riconciliazione | Cleanup |
+|---|---|---|---|---|---|
+| 1 | 22,7 ms | `…154023.576978Z#…#001` → `…154024.740453Z#…#002` | ✅ `written-during-partition-by-node2-reachable` | 3s | 2s |
+| 2 | 28,1 ms | `…154214.998842Z#…#001` → `…154216.232679Z#…#002` | ✅ idem | 2s | 2s |
+| 3 | 33,8 ms | `…154404.987513Z#…#001` → `…154406.131222Z#…#002` | ✅ idem | 2s | 2s |
+
+Con l'intervallo esplicito i due CSN distano ~1,2 s (scrittura di `node1`,
+`assert`, 500 ms di attesa, scrittura di `node2`), contro uno scarto fra gli
+orologi di poche decine di ms.
 
 ## 5. Conclusioni
 

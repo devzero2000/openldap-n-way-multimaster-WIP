@@ -74,8 +74,17 @@
 # CHECK MODE: NON usare --check: il playbook orchestra un altro
 # ansible-playbook (WAN, tc/iptables) che in check mode verrebbe saltato.
 #
-# VERSIONE:     1.4
+# VERSIONE:     1.5
 # CHANGELOG:
+#   1.5 - 2026-10-26 - Scenario B: intervallo esplicito fra le due scritture in
+#                      conflitto (conflict_write_gap_ms, 500ms: node3 scrive
+#                      dopo node2) e soglia del pre-flight sugli orologi
+#                      derivata da questo (meta', 250ms) invece di 50ms fissi.
+#                      Il requisito reale e' scarto < intervallo fra le
+#                      scritture; prima l'intervallo era solo l'overhead di
+#                      Ansible e la soglia non vi era legata. Su 24.04 con
+#                      systemd-timesyncd (default) lo scarto fra i nodi e' di
+#                      decine di ms (misurati 43ms): innocuo, ma vicino ai 50ms.
 #   1.4 - 2026-10-26 - Esito finale VERIFICATO in una nuova FASE 7, dopo il
 #                      cleanup: lo Scenario A (convergenza delle 400 entry) e
 #                      il cleanup di FASE 6 avevano failed_when: false e nessun
@@ -153,10 +162,16 @@
     # Pre-flight sullo scarto degli orologi fra i nodi (assert_clock_skew.yml):
     # i CSN contengono l'orario del master che scrive, quindi con orologi
     # sfasati piu' dell'intervallo fra due scritture in conflitto l'ordine dei
-    # CSN si inverte rispetto all'ordine reale. 50ms: molto sopra l'errore di
-    # misura (pochi ms), molto sotto lo sfasamento che ha rotto il test.
+    # CSN si inverte rispetto all'ordine reale e un master puo' restare
+    # divergente. L'intervallo e' quindi esplicito (conflict_write_gap_ms:
+    # node3 scrive almeno tanto dopo node2) e la soglia ne e' la meta': il
+    # margine copre l'errore di misura e la deriva durante il test.
+    # 500/250ms: sopra lo scarto normale di systemd-timesyncd (default su
+    # 24.04, decine di ms fra i nodi), molto sotto lo sfasamento di secondi
+    # che ha rotto il test (VMware Tools contro l'NTP).
     clock_skew_tasks: "{{ playbook_dir }}/../assert_clock_skew.yml"
-    max_clock_skew_ms: 50
+    conflict_write_gap_ms: 500
+    max_clock_skew_ms: "{{ (conflict_write_gap_ms | int) // 2 }}"
 
     conflict_test_dn: "cn=concurrent-conflict-test,ou=People,dc=example,dc=com"
     conflict_value_a: "written-by-master-a"
@@ -228,6 +243,18 @@
           loop: "{{ range(preflight_status.results | length) | list }}"
           loop_control:
             label: "{{ preflight_status.results[item].item }}"
+
+        - name: "[FASE 1] Controlla che la soglia sullo scarto degli orologi sia minore dell'intervallo fra le scritture in conflitto"
+          ansible.builtin.assert:
+            that:
+              - (max_clock_skew_ms | int) > 0
+              - (max_clock_skew_ms | int) < (conflict_write_gap_ms | int)
+            fail_msg: >-
+              ERRORE di configurazione del test: max_clock_skew_ms
+              ({{ max_clock_skew_ms }}) deve essere > 0 e minore di
+              conflict_write_gap_ms ({{ conflict_write_gap_ms }}), altrimenti
+              lo Scenario B puo' dare un falso split-brain con orologi "in soglia".
+            quiet: true
 
         - name: "[FASE 1] Verifica che gli orologi dei nodi siano allineati prima del conflitto sui CSN"
           ansible.builtin.include_tasks: "{{ clock_skew_tasks }}"
@@ -598,9 +625,15 @@
           changed_when: true
           no_log: true
 
-        - name: "[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da {{ node3 }} (description={{ conflict_value_b }})"
+        # node3 scrive almeno conflict_write_gap_ms dopo node2 (l'attesa parte
+        # quando la scrittura di node2 e' gia' avviata): con uno scarto fra gli
+        # orologi minore di questo intervallo (pre-flight di FASE 1) il CSN di
+        # node3 e' sempre il piu' alto, qualunque sia l'ordine di arrivo delle
+        # repliche. Senza, l'intervallo era solo l'overhead di Ansible.
+        - name: "[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da {{ node3 }} (description={{ conflict_value_b }}, dopo {{ conflict_write_gap_ms }}ms)"
           ansible.builtin.shell: |
             nohup sh -c '
+              sleep {{ '%.3f' | format((conflict_write_gap_ms | int) / 1000) }}
               export LDAPTLS_REQCERT=never
               ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<ENTRY
             dn: {{ conflict_test_dn }}

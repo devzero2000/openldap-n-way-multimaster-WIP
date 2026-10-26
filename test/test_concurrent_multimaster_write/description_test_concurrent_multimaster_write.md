@@ -1,11 +1,11 @@
 # Test: Scritture Concorrenti da Più Master sotto Carico WAN
 
 **File playbook:** `test_concurrent_multimaster_write.yml`
-**Versione playbook:** 1.4
+**Versione playbook:** 1.5
 **Autore:** Elia Pinto
 **Data:** 22 settembre 2026 (ultimo aggiornamento: 26 ottobre 2026)
-**Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 26.04)
-**Esito ultima esecuzione:** ✅ 6 run consecutivi superati (`ok=49 changed=14 unreachable=0 failed=0`), dopo un primo run fallito per orologi dei nodi sfasati — vedi §4 e §5
+**Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 24.04, playbook v1.5)
+**Esito ultima esecuzione:** ✅ 3 run consecutivi superati (`ok=52 changed=14 unreachable=0 failed=0`) con `systemd-timesyncd` e scarto orologi 15–46 ms — vedi §4.3 e §5
 
 ---
 
@@ -61,8 +61,10 @@ secondo fenomeno (saturazione di un singolo provider) già isolato altrove.
   distinguendo un guasto residuo di un run precedente da un problema
   effettivamente causato da questo test.
 - **Orologi dei nodi allineati** (Fase 1, dalla v1.3): lo scarto massimo fra
-  gli orologi dei 4 nodi deve essere ≤ `max_clock_skew_ms` (default 50 ms),
-  misurato con `test/assert_clock_skew.yml`. È una **precondizione** dello
+  gli orologi dei 4 nodi deve essere ≤ `max_clock_skew_ms`, misurato con
+  `test/assert_clock_skew.yml`. Dalla v1.5 la soglia non è fissa (era 50 ms)
+  ma è metà di `conflict_write_gap_ms` (default 500 ms → 250 ms), l'intervallo
+  esplicito fra le due scritture in conflitto dello Scenario B. È una **precondizione** dello
   Scenario B, non un dettaglio: il motivo è spiegato in §5.
 - Tutte le scritture/letture di verifica passano da `ldaps://127.0.0.1:636`
   con `LDAPTLS_REQCERT=never` (certificato locale non in catena di fiducia
@@ -107,10 +109,12 @@ della concorrenza fra master, non un effetto collaterale di saturazione.
    `node2`, `node3` e `node4` **prima** di introdurre il conflitto — un
    controllo esplicito, non un'attesa fissa: il conflitto deve avvenire su
    uno stato già coerente, non durante la propagazione iniziale.
-3. `node2` e `node3` eseguono, **in parallelo e in background**, una
-   `ldapmodify` sullo stesso DN e lo stesso attributo `description`, con
-   valori diversi e riconoscibili (`written-by-master-a` da `node2`,
-   `written-by-master-b` da `node3`).
+3. `node2` e `node3` eseguono, **in background**, una `ldapmodify` sullo
+   stesso DN e lo stesso attributo `description`, con valori diversi e
+   riconoscibili (`written-by-master-a` da `node2`, `written-by-master-b` da
+   `node3`). Dalla v1.5 `node3` scrive almeno `conflict_write_gap_ms`
+   (500 ms) dopo `node2`; prima l'intervallo era solo l'overhead di Ansible
+   (vedi §5.2).
 4. Il playbook attende il completamento di entrambe le modifiche, poi fa
    **polling** (timeout 60s, progresso ogni 10s) del valore dell'attributo
    su tutti e 4 i nodi via `slapcat`. Nella v1.0 c'era invece un margine
@@ -222,6 +226,22 @@ I 6 run coprono circa 10 minuti: dimostrano la stabilità degli orologi nel
 breve periodo, non per ore o dopo una sospensione delle VM — per questo il
 controllo dello scarto resta come pre-volo a ogni esecuzione.
 
+### 4.3 Esecuzioni del 26 ottobre 2026 (ambiente ubuntu 24.04, `systemd-timesyncd`)
+
+**Playbook v1.4:** ✅ `failed=0`, ma con scarto orologi **42,8 ms** contro la
+soglia fissa di 50 ms: sul 24.04 `systemd-timesyncd` (client SNTP, poll fino
+a 34 min) tiene i nodi a decine di ms l'uno dall'altro, quindi il pre-volo
+poteva fallire per uno scarto innocuo rispetto all'intervallo reale fra le
+scritture in conflitto. Da qui la v1.5 (§5.2).
+
+**Playbook v1.5 — ✅ 3 run consecutivi superati:**
+
+| Run | Scarto orologi (soglia 250 ms) | Scenario A | Scenario B | Cleanup | Play recap |
+|---|---|---|---|---|---|
+| 1 | 43,0 ms | ✅ 7s | ✅ tutti `written-by-master-b` in 4s | ✅ 3s | `ok=52 failed=0` |
+| 2 | 46,4 ms | ✅ 2s | ✅ tutti `written-by-master-b` in 3s | ✅ 2s | `ok=52 failed=0` |
+| 3 | 15,6 ms | ✅ 4s | ✅ tutti `written-by-master-b` in 2s | ✅ 3s | `ok=52 failed=0` |
+
 ## 5. Dipendenza dagli orologi dei nodi (perché lo Scenario B può fallire)
 
 ### 5.1 Come si risolve un conflitto
@@ -256,12 +276,21 @@ Uno scarto fra i master può produrre due effetti diversi:
      o non si fa un refresh completo.
 
 Il caso 2 richiede uno scarto **maggiore dell'intervallo fra le due scritture
-in conflitto**. Nello Scenario B le due `ldapmodify` partono una dopo l'altra
-a pochi decimi di secondo di distanza: con secondi di scarto l'intreccio è
-probabile, con l'1–2 ms misurato dopo la correzione richiederebbe due
-scritture a meno di 1–2 ms l'una dall'altra. La soglia del pre-volo (50 ms)
-sta molto sopra l'errore di misura (pochi ms) e molto sotto lo sfasamento che
-ha rotto il test.
+in conflitto**. Fino alla v1.4 quell'intervallo non era controllato (solo
+l'overhead di Ansible fra due task, pochi decimi di secondo) e la soglia del
+pre-volo era fissa a 50 ms, scollegata da esso. Dalla v1.5 il vincolo è
+esplicito:
+
+- `node3` scrive almeno `conflict_write_gap_ms` (500 ms) dopo `node2`;
+- il pre-volo accetta uno scarto fino a metà di quell'intervallo (250 ms): il
+  margine copre l'errore di misura e la deriva durante il test;
+- un `assert` in Fase 1 blocca il test se `max_clock_skew_ms` non è minore di
+  `conflict_write_gap_ms` (errore di configurazione).
+
+Così con uno scarto in soglia il CSN di `node3` è sempre il più alto e il caso
+2 non può verificarsi. 250 ms sta sopra lo scarto normale di
+`systemd-timesyncd` (default su 24.04, decine di ms fra i nodi: §4.3) e molto
+sotto lo sfasamento di secondi che ha rotto il test.
 
 **È normale che il test fallisca con secondi di scarto?** Sì: il test ha
 rilevato un'incoerenza **reale** del cluster, non un falso allarme. In
@@ -316,8 +345,11 @@ potevano differire di secondi.
   gli orologi derivavano fino a -5s al minuto per le frequenze falsate;
 - risultato: scarto fra i nodi stabile a 0,3–1,4 ms.
 
-Da fare ancora: la stessa correzione sulle VM ubuntu 24.04; l'orologio
-dell'host VMware resta ~4,5s avanti rispetto all'NTP.
+Sulle VM ubuntu 24.04 il timesync periodico di VMware Tools risulta
+`Disabled` (provisioning `run: "always"` del Vagrantfile) e l'NTP resta il
+default `systemd-timesyncd`, con frequenze sane (−30…+10 ppm) e tick 10000:
+lo scarto residuo, decine di ms, è coperto dalla soglia della v1.5 (§4.3).
+L'orologio dell'host VMware resta ~4,5s avanti rispetto all'NTP.
 
 ### 5.5 Perché il 24 settembre il test passava
 
