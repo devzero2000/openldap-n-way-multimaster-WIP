@@ -101,6 +101,19 @@ EOF
       node.vm.provision "shell", run: "always", inline: <<-SHELL
         export DEBIAN_FRONTEND=noninteractive
 
+        # 0) Niente sincronizzazione PERIODICA dell'orologio da VMware Tools,
+        #    a ogni avvio (non solo alla creazione): affianca
+        #    v.vmx["tools.syncTime"] = "FALSE" e vale anche per le VM gia'
+        #    esistenti. L'ora la gestisce solo il servizio NTP. Con entrambi
+        #    attivi gli orologi dei master oscillavano di ~4,5s e i CSN finivano
+        #    fuori ordine (vedi description_test_concurrent_multimaster_write.md).
+        if command -v vmware-toolbox-cmd >/dev/null 2>&1; then
+          vmware-toolbox-cmd timesync disable
+          echo "VMware Tools timesync: $(vmware-toolbox-cmd timesync status)"
+        else
+          echo "vmware-toolbox-cmd non presente: timesync di VMware Tools non modificato" >&2
+        fi
+
         # 1) Configurazione hosts
         sed -i '/# Configurazione Cluster Ansible/,$d' /etc/hosts
         echo -e "\n# Configurazione Cluster Ansible" >> /etc/hosts
