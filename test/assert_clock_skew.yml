@@ -1,0 +1,126 @@
+# ==============================================================================
+# TITOLO:       assert_clock_skew.yml
+# AUTORE:       Elia Pinto
+# DATA:         26 Ottobre 2026
+# SCOPO:        Task file (da includere con ansible.builtin.include_tasks, NON
+#               un playbook) che misura DIRETTAMENTE lo scarto fra gli orologi
+#               dei nodi del cluster e blocca il test se supera una soglia.
+#
+# PERCHE' SERVE: la risoluzione dei conflitti MMR si basa sul CSN, che contiene
+# l'orario del master che scrive. Con orologi sfasati un master puo' generare
+# per una scrittura LOCALE un CSN piu' basso di quello appena ricevuto da un
+# altro master sulla stessa entry: lui tiene il proprio valore, gli altri lo
+# scartano come piu' vecchio, e la divergenza resta permanente. Visto il
+# 2026-10-26 nello Scenario B di test_concurrent_multimaster_write.yml
+# (node3 bloccato su "written-by-master-b"): la causa era VMware Tools che
+# riallineava periodicamente l'orologio delle VM a quello dell'host (~4,5s
+# avanti) mentre chrony lo riportava all'ora NTP. Senza questo controllo il
+# test segnala uno "split-brain" che in realta' e' un problema di orologi.
+#
+# COME MISURA: non si fida di chrony (che misura lo scarto verso l'NTP, non
+# fra i nodi, e non vede le correzioni esterne di VMware Tools). Per ogni nodo
+# apre UNA connessione SSH persistente (coproc) e chiede l'ora 5 volte:
+# offset = ora_remota - punto_medio(t_invio, t_risposta). Si tiene il campione
+# con il round trip minimo: l'errore della misura e' al massimo meta' di quel
+# round trip (pochi ms, perche' il setup della connessione SSH resta fuori).
+# Il riferimento e' l'orologio del nodo di controllo; lo scarto valutato e'
+# max(offset) - min(offset) fra i nodi verificati.
+# SSH (porta 22) non e' toccato dalla WAN simulata (solo 389/636).
+#
+# LIMITE: e' una fotografia all'inizio del test, non un monitoraggio continuo.
+#
+# VARIABILI IN INGRESSO:
+#   clock_verify_nodes  (obbligatoria) lista dei nodi da confrontare
+#   max_clock_skew_ms   (default 50)   soglia massima di scarto fra i nodi
+#
+# VERSIONE:     1.0
+# CHANGELOG:
+#   1.0 - 2026-10-26 - prima versione: pre-flight sullo scarto degli orologi
+#                      per i test che dipendono dall'ordinamento dei CSN
+#                      (split-brain falso nello Scenario B dovuto a ~4,5s di
+#                      oscillazione degli orologi delle VM).
+# ==============================================================================
+
+---
+- name: "[CLOCK] Controlla i parametri passati alla verifica dello scarto degli orologi"
+  ansible.builtin.assert:
+    that:
+      - clock_verify_nodes is defined
+      - clock_verify_nodes | length > 1
+    fail_msg: >-
+      ERRORE: assert_clock_skew.yml richiede una lista clock_verify_nodes con
+      almeno due nodi - errore nel playbook chiamante, non nel cluster.
+    quiet: true
+
+- name: "[CLOCK] Misura lo scarto degli orologi fra i nodi via SSH persistente - puro shell"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      MAX_SKEW_US=$(( {{ max_clock_skew_ms | default(50) | int }} * 1000 ))
+      SAMPLES=5
+      FAILED=0
+      MIN_OFF=""
+      MAX_OFF=""
+      measure() {
+        local host="$1" best_rtt="" best_off="" t0 t1 remote rtt off i
+        coproc SSHC { ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
+          "$host" 'while read -r _; do date +%s%N; done' 2>/dev/null; }
+        for i in $(seq 1 $SAMPLES); do
+          t0=$(date +%s%N)
+          echo x >&"${SSHC[1]}" 2>/dev/null || break
+          read -r -t 10 remote <&"${SSHC[0]}" || break
+          t1=$(date +%s%N)
+          rtt=$((t1 - t0))
+          off=$((remote - (t0 + t1) / 2))
+          if [ -z "$best_rtt" ] || [ "$rtt" -lt "$best_rtt" ]; then
+            best_rtt=$rtt
+            best_off=$off
+          fi
+        done
+        kill "$SSHC_PID" 2>/dev/null
+        wait "$SSHC_PID" 2>/dev/null
+        if [ -z "$best_off" ]; then
+          echo "CLOCK_ERROR: $host - nessun campione (SSH non riuscito)"
+          return 1
+        fi
+        echo "CLOCK $host offset_us=$((best_off / 1000)) rtt_us=$((best_rtt / 1000))"
+        BEST_OFF_US=$((best_off / 1000))
+        return 0
+      }
+      for host in {{ clock_verify_nodes | map('quote') | join(' ') }}; do
+        if measure "$host"; then
+          if [ -z "$MIN_OFF" ] || [ "$BEST_OFF_US" -lt "$MIN_OFF" ]; then MIN_OFF=$BEST_OFF_US; fi
+          if [ -z "$MAX_OFF" ] || [ "$BEST_OFF_US" -gt "$MAX_OFF" ]; then MAX_OFF=$BEST_OFF_US; fi
+        else
+          FAILED=1
+        fi
+      done
+      if [ "$FAILED" -ne 0 ] || [ -z "$MIN_OFF" ]; then
+        echo "CLOCK_SKEW_UNKNOWN: misura non riuscita su almeno un nodo"
+        exit 1
+      fi
+      SKEW_US=$((MAX_OFF - MIN_OFF))
+      if [ "$SKEW_US" -le "$MAX_SKEW_US" ]; then
+        echo "CLOCK_SKEW_OK: scarto massimo fra i nodi ${SKEW_US}us (soglia ${MAX_SKEW_US}us)"
+        exit 0
+      fi
+      echo "CLOCK_SKEW_TOO_HIGH: scarto massimo fra i nodi ${SKEW_US}us (soglia ${MAX_SKEW_US}us)"
+      exit 1
+    executable: /bin/bash
+  register: clock_skew
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: "[CLOCK] Blocca se lo scarto fra gli orologi dei nodi supera la soglia"
+  ansible.builtin.assert:
+    that:
+      - "'CLOCK_SKEW_OK' in clock_skew.stdout"
+    fail_msg: "{{ [clock_skew_hint] + clock_skew.stdout_lines }}"
+    success_msg: "{{ clock_skew.stdout_lines }}"
+  vars:
+    clock_skew_hint: >-
+      ERRORE: orologi dei nodi non allineati (o non misurabili) - un conflitto
+      sui CSN darebbe un falso split-brain. Controllare chronyc tracking su
+      ogni nodo e che la sincronizzazione periodica di VMware Tools sia
+      disattivata (vmware-toolbox-cmd timesync status = Disabled).

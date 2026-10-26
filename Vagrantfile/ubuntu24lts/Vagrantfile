@@ -20,6 +20,16 @@ Vagrant.configure("2") do |config|
         v.gui = false
         v.vmx["memsize"] = "4096"
         v.vmx["numvcpus"] = "2"
+        # Niente sincronizzazione PERIODICA dell'orologio da VMware Tools:
+        # l'ora la gestisce solo chrony (NTP). Con entrambi attivi l'orologio
+        # delle VM oscillava di ~4,5s (VMware Tools lo riportava all'ora
+        # dell'host, chrony all'ora NTP) e il kernel finiva con frequenze
+        # assurde (tick 9000 = -10% su una VM): orologi dei master sfasati
+        # di secondi -> CSN fuori ordine -> divergenza permanente sui
+        # conflitti MMR (Scenario B di test_concurrent_multimaster_write.yml,
+        # 2026-10-26). Le sincronizzazioni una tantum (resume/snapshot)
+        # restano attive.
+        v.vmx["tools.syncTime"] = "FALSE"
       end
 
       # Rete Bridged
