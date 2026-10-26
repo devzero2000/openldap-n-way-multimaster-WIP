@@ -153,7 +153,7 @@ cluster
 readonlyreplica
 EOF
 
-        # 3) Unattended Upgrades
+        # 3) Unattended Upgrades & Configurazione completa
         apt-get update -y
         apt-get install -y unattended-upgrades apt-listchanges
 
@@ -165,6 +165,7 @@ EOF
         cat << 'EOF' > /etc/apt/apt.conf.d/50unattended-upgrades-local
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-updates";
     "${distro_id}:${distro_codename}-security";
     "${distro_id}ESMApps:${distro_codename}";
     "${distro_id}ESM:${distro_codename}";
@@ -172,7 +173,18 @@ Unattended-Upgrade::Allowed-Origins {
 Unattended-Upgrade::AutoFixInterruptedDpkg "true";
 Unattended-Upgrade::MinimalSteps "true";
 Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Clean-Installed-Packages "true";
 EOF
+
+        # FORZA L'AGGIORNAMENTO TOTALE E LA PULIZIA AD OGNI AVVIO
+        # (resta su 24.04: le suite sono fissate su noble)
+        export NEEDRESTART_MODE=a
+        apt-get update -y
+        apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
+        apt-get autoremove -y --purge
+        apt-get autoclean -y
 
         # 4) Gestione chiavi SSH (APPEND invece di SOVRASCRITTURA)
         if [ -d /vagrant/.cluster_keys ]; then
