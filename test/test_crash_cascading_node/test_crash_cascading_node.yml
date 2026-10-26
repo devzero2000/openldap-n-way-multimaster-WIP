@@ -3,8 +3,9 @@
 # AUTORE:       Elia Pinto
 # DATA:         15 Settembre 2026
 # SCOPO:        Simulazione di crash NON pulito (kill -9, non uno stop
-#               ordinato) a cascata (nodo2 -> +4s nodo3) durante scritture
-#               su nodo1, con verifica di integrita' LMDB post-crash
+#               ordinato) a cascata (nodo2, poi nodo3) DURANTE scritture
+#               su nodo1 - i due crash sono agganciati all'avanzamento reale
+#               dell'iniezione, non a pause fisse - con verifica di integrita' LMDB post-crash
 #               (mdb_stat), verifica che slapd riparta davvero, misurazione
 #               della convergenza su TUTTO il cluster (master + read-only),
 #               e pulizia automatica del dataset di test.
@@ -18,8 +19,46 @@
 # CHECK MODE: NON usare --check (orchestra un altro ansible-playbook, kill -9,
 # restart di slapd: nulla di questo e' simulabile).
 #
-# VERSIONE:     8.1
+# VERSIONE:     8.2
 # CHANGELOG:
+#   8.2 - 2026-10-26 - FASE 0 nuova: pre-volo su TUTTI e tre i master prima
+#                      di toccare qualunque cosa (prima node2/node3 erano
+#                      verificati solo dopo l'avvio dell'iniezione su node1)
+#                      e rimozione idempotente dei residui crash.user.* con
+#                      attesa del conteggio a 0 su tutti e 4 i nodi: dopo un
+#                      run interrotto prima della FASE 5, "ldapadd -c"
+#                      saltava in silenzio le entry gia' presenti e il target
+#                      tornava comunque 500 (falso positivo). Esito finale
+#                      ora VERIFICATO (FASE 6): prima convergenza e cleanup
+#                      avevano failed_when: false e nessun assert, quindi un
+#                      CONVERGENCE_TIMEOUT finiva comunque con failed=0;
+#                      verificato anche che node1 abbia esattamente
+#                      crash_users entry. Gli assert stanno dopo il cleanup,
+#                      cosi' il cluster resta pulito anche quando il test
+#                      fallisce. "always": slapd riavviato su node2/node3 se il
+#                      test si ferma fra il kill -9 e il ripristino di FASE 4
+#                      (gia' successo, vedi v7.7). Numero di utenti in una
+#                      variabile (crash_users) invece del 500 nel codice.
+#                      FASE 2: i due crash erano a pause fisse (2s e 4s) e
+#                      nel run del 26/10 il Crash 2 e' caduto DOPO la fine
+#                      dell'iniezione (~9,3s per 500 entry): node3 aveva gia'
+#                      ricevuto tutto e il test non provava cio' che dichiara.
+#                      Ora ogni crash parte quando node1 ha inviato una quota
+#                      delle entry (crash1_at_pct/crash2_at_pct, lette dal log
+#                      di ldapadd, scritto riga per riga con stdbuf -oL) e dopo
+#                      ogni kill -9 si verifica che l'iniezione fosse ancora in
+#                      corso, altrimenti il test si ferma. lmdb-utils spostato
+#                      in FASE 0, prima dell'iniezione: apt impiega secondi.
+#                      Pausa fra le entry da 5ms a inject_sleep (20ms): 500
+#                      entry duravano ~8-9s, meno dei ~5s di task Ansible fra
+#                      i due kill piu' la soglia del primo - in un run il Crash
+#                      2 e' arrivato a 500/500 (rilevato dal nuovo controllo).
+#                      La Parte 3 della documentazione mostra che il ritmo
+#                      (5ms o 50ms) non cambia il comportamento della replica.
+#                      "always": lo stato di slapd si rilegge con un task
+#                      separato dopo l'avvio (il modulo systemd con state:
+#                      started restituisce lo stato di PRIMA dell'avvio, e
+#                      dopo un kill -9 segnalava 'failed' a slapd gia' su).
 #   8.1 - 2026-10-26 - WAN: l'accensione era FUORI dal block/always - se
 #                      falliva a meta' (es. un nodo irraggiungibile) la
 #                      disattivazione nell'"always" non partiva e la WAN
@@ -554,6 +593,26 @@
     ldap_basedn: "dc=example,dc=com"
     ldap_admin_dn: "cn=admin,dc=example,dc=com"
     ldap_admin_pass: "openldap"
+    # Utenti iniettati in FASE 1 (namespace crash.user.*). 500 e non 2000:
+    # vedi v7.9 e la Parte 3 della documentazione (bug di replica #10604).
+    crash_users: 500
+    # I due crash partono quando node1 ha inviato questa percentuale delle
+    # entry (righe "adding new entry" di ldapadd in /tmp/async_load.log), non
+    # dopo pause fisse: la durata dell'iniezione cambia fra ambienti (~9,3s su
+    # 26.04 sotto WAN) e una pausa fissa puo' far cadere un crash a scritture
+    # gia' finite. Fra la soglia e il kill passano ~2s di task Ansible, e fra
+    # i due kill ~5s: con la pausa di 5ms (iniezione di ~8-9s) il Crash 2 e'
+    # arrivato a 450/500 in un run e a scritture finite in un altro. Con
+    # inject_sleep 20ms il primo kill cade verso il 15-20%, il secondo verso
+    # il 45-50%.
+    crash1_at_pct: 10
+    crash2_at_pct: 40
+    # Pausa fra un'entry e l'altra dell'iniezione (secondi). Con ~16ms per
+    # ldapadd, 20ms danno ~18s per 500 entry: margine ampio per i ~5s di task
+    # fra i due crash. Il ritmo non incide sul bug di replica (Parte 3 doc).
+    inject_sleep: 0.02
+    # Attesa massima perche' l'iniezione raggiunga una soglia.
+    crash_progress_timeout: 120
     # Simulazione WAN: playbook dedicato + task file di verifica dello stato
     # reale. playbook_dir esplicito: il path non dipende da dove si lancia.
     wan_simulation_playbook: "{{ playbook_dir }}/../../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml"
@@ -593,6 +652,154 @@
             wan_verify_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}", "{{ node4 }}"]
 
         # ==========================================================================
+        # FASE 0: PRE-VOLO E PULIZIA DEI RESIDUI (prima di toccare qualunque cosa)
+        # I tre master devono essere gia' attivi: un kill -9 di un run
+        # precedente mai seguito dal ripristino si distingue cosi' da un
+        # problema causato da questo run (vedi v7.7). Poi i residui
+        # crash.user.* di un run interrotto vengono cancellati e si attende il
+        # conteggio a 0 su TUTTI i nodi: senza, "ldapadd -c" salterebbe in
+        # silenzio le entry gia' presenti e il target di FASE 4 tornerebbe
+        # comunque a crash_users senza che l'iniezione abbia scritto nulla.
+        # ==========================================================================
+
+        - name: "[FASE 0] Verifica pre-volo che slapd sia gia' attivo sui tre master, prima di iniziare"
+          delegate_to: "{{ item }}"
+          ansible.builtin.systemd:
+            name: slapd
+          loop:
+            - "{{ node1 }}"
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: preflight_status
+          failed_when: false
+
+        - name: "[FASE 0] Blocca se uno dei tre master e' GIA' inattivo prima di iniziare (residuo di un run precedente, non causato da questo test)"
+          ansible.builtin.assert:
+            that:
+              - preflight_status.results[item].status.ActiveState == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ preflight_status.results[item].item }} risulta gia'
+              '{{ preflight_status.results[item].status.ActiveState | default('sconosciuto') }}'
+              PRIMA che questo test tocchi qualunque cosa - non e' un problema
+              causato da questo run, ma uno stato residuo (quasi certamente un
+              kill -9 di un run precedente, mai seguito dal ripristino perche'
+              quel run e' fallito prima di arrivarci). Riavviare slapd su tutti
+              i nodi e ripetere il test da un cluster pulito, invece di
+              proseguire su un bersaglio gia' compromesso.
+            success_msg: "OK: slapd e' attivo su {{ preflight_status.results[item].item }} prima di iniziare."
+          loop: "{{ range(preflight_status.results | length) | list }}"
+          loop_control:
+            label: "{{ preflight_status.results[item].item }}"
+
+        - name: "[FASE 0] Rimuovi eventuali utenti crash.user.* residui di un run precedente interrotto (idempotenza)"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              export LDAPTLS_REQCERT=never
+              slapcat -b "{{ ldap_basedn }}" -a "(uid=crash.user.*)" 2>/dev/null \
+                | grep "^dn:" | sed 's/^dn: //' > /tmp/crash_residui.txt
+              DELETE_RC=0
+              if [ -s /tmp/crash_residui.txt ]; then
+                ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" \
+                  -c -f /tmp/crash_residui.txt > /dev/null 2>&1
+                DELETE_RC=$?
+              fi
+              rm -f /tmp/crash_residui.txt
+              exit $DELETE_RC
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          become: true
+          register: residual_cleanup
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 0] Blocca se la rimozione dei residui crash.user.* e' fallita"
+          ansible.builtin.assert:
+            that:
+              - residual_cleanup.rc == 0
+            fail_msg: >-
+              ERRORE: rimozione dei residui crash.user.* fallita su {{ node1 }}
+              (rc={{ residual_cleanup.rc }}) - output non mostrato (no_log).
+              Verificare a mano con slapcat -a '(uid=crash.user.*)' e ldapdelete
+              in chiaro: senza questa pulizia il test darebbe un falso positivo.
+            quiet: true
+
+        - name: "[FASE 0] Attendi che la rimozione dei residui converga a 0 su TUTTO il cluster prima di iniettare - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              FILTER="(uid=crash.user.*)"
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '$FILTER' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
+              }
+              START=$(date +%s)
+              TIMEOUT=300
+              LAST_PROGRESS_LOG=0
+              while true; do
+                C1=$(count_on "{{ node1 }}")
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "0" ] && [ "$C2" = "0" ] && [ "$C3" = "0" ] && [ "$C4" = "0" ]; then
+                  echo "PRECLEAN_OK: $(($(date +%s) - START))s (0 residui su tutti i 4 nodi)"
+                  exit 0
+                fi
+                ELAPSED=$(($(date +%s) - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "PRECLEAN_PROGRESS: ${ELAPSED}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "PRECLEAN_TIMEOUT: ${TIMEOUT}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: preclean_convergence
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 0] Blocca se i residui crash.user.* non sono spariti da tutti i nodi prima di iniettare"
+          ansible.builtin.assert:
+            that:
+              - "'PRECLEAN_OK' in preclean_convergence.stdout"
+            fail_msg: "{{ preclean_convergence.stdout_lines }}"
+            success_msg: "{{ preclean_convergence.stdout_lines | last }}"
+
+        - name: "[FASE 0] Installa lmdb-utils, per mdb_stat, non bloccante, sui nodi da crashare (prima dell'iniezione: apt impiega secondi)"
+          delegate_to: "{{ item }}"
+          become: true
+          ansible.builtin.apt:
+            name: lmdb-utils
+            state: present
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          register: lmdb_utils_install
+          failed_when: false
+
+        # ==========================================================================
         # FASE 1: SCRITTURA AD ALTA FREQUENZA SU NODO 1 (DELEGATA SU NODE1)
         # Una sola invocazione di "ldapadd -c" che legge da uno stream generato
         # da un ciclo shell con sleep fra un'entry e l'altra: una connessione
@@ -604,7 +811,7 @@
           ansible.builtin.shell: |
             nohup sh -c '
               export LDAPTLS_REQCERT=never
-              for i in $(seq 1 500); do
+              for i in $(seq 1 {{ crash_users }}); do
                 cat << ENTRY
             dn: uid=crash.user.$i,ou=People,{{ ldap_basedn }}
             objectClass: top
@@ -615,8 +822,8 @@
             userPassword: {SSHA}demoPass123!
 
             ENTRY
-                sleep 0.005
-              done | ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" -c
+                sleep {{ inject_sleep }}
+              done | stdbuf -oL ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" -c
             ' > /tmp/async_load.log 2>&1 < /dev/null &
             echo $! > /tmp/async_load.pid
           delegate_to: "{{ node1 }}"
@@ -648,50 +855,44 @@
         # dell'ambiente LMDB al riavvio, non solo il tempo di convergenza)
         # ==========================================================================
 
-        - name: "[FASE 2] Installa lmdb-utils, per mdb_stat, non bloccante, sui nodi da crashare"
-          delegate_to: "{{ item }}"
-          become: true
-          ansible.builtin.apt:
-            name: lmdb-utils
-            state: present
-          loop:
-            - "{{ node2 }}"
-            - "{{ node3 }}"
-          register: lmdb_utils_install
+        - name: "[FASE 2 - CRASH 1] Attendi che l'iniezione raggiunga la soglia di avanzamento (crash1_at_pct) prima del crash, su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              SOGLIA=$(( {{ crash_users }} * {{ crash1_at_pct }} / 100 ))
+              START=$(date +%s)
+              while true; do
+                N=$(grep -c 'adding new entry' /tmp/async_load.log 2>/dev/null) || N=0
+                if [ "$N" -ge "$SOGLIA" ]; then
+                  echo "PROGRESS_OK: $N/{{ crash_users }} entry inviate (soglia $SOGLIA)"
+                  exit 0
+                fi
+                if ! { [ -f /tmp/async_load.pid ] && kill -0 "$(cat /tmp/async_load.pid)" 2>/dev/null; }; then
+                  echo "INJECTION_ENDED: iniezione terminata a $N/{{ crash_users }} prima della soglia $SOGLIA"
+                  exit 1
+                fi
+                if [ $(( $(date +%s) - START )) -ge {{ crash_progress_timeout }} ]; then
+                  echo "PROGRESS_TIMEOUT: {{ crash_progress_timeout }}s - $N/{{ crash_users }} entry inviate (soglia $SOGLIA)"
+                  exit 1
+                fi
+                sleep 0.2
+              done
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          register: crash1_progress
+          changed_when: false
           failed_when: false
 
-        - name: "[FASE 2] Verifica pre-volo che slapd sia gia' attivo su entrambi i nodi da crashare, prima di toccarli"
-          delegate_to: "{{ item }}"
-          ansible.builtin.systemd:
-            name: slapd
-          loop:
-            - "{{ node2 }}"
-            - "{{ node3 }}"
-          no_log: true
-          register: preflight_status
-          failed_when: false
-
-        - name: "[FASE 2] Blocca se node2 o node3 sono GIA' inattivi prima di iniziare (residuo di un run precedente, non causato da questo test)"
+        - name: "[FASE 2 - CRASH 1] Blocca se l'iniezione non ha raggiunto la soglia del crash"
           ansible.builtin.assert:
             that:
-              - preflight_status.results[item].status.ActiveState == "active"
+              - "'PROGRESS_OK' in crash1_progress.stdout"
             fail_msg: >-
-              ERRORE: slapd su {{ preflight_status.results[item].item }} risulta gia'
-              '{{ preflight_status.results[item].status.ActiveState | default('sconosciuto') }}'
-              PRIMA che questo test tocchi qualunque cosa - non e' un problema
-              causato da questo run, ma uno stato residuo (quasi certamente un
-              kill -9 di un run precedente, mai seguito dal ripristino perche'
-              quel run e' fallito prima di arrivarci). Riavviare slapd su tutti
-              i nodi e ripetere il test da un cluster pulito, invece di
-              proseguire su un bersaglio gia' compromesso.
-            success_msg: "OK: slapd e' attivo su {{ preflight_status.results[item].item }} prima di iniziare."
-          loop: "{{ range(preflight_status.results | length) | list }}"
-          loop_control:
-            label: "{{ preflight_status.results[item].item }}"
-
-        - name: "[FASE 2] Attendi 2 secondi prima del primo crash"
-          ansible.builtin.pause:
-            seconds: 2
+              ERRORE: {{ crash1_progress.stdout | default('nessun output') }} -
+              il crash 1 non avverrebbe durante le scritture. Controllare
+              /tmp/async_load.log su {{ node1 }} (ldapadd fallito subito?) o
+              abbassare crash1_at_pct.
+            success_msg: "{{ crash1_progress.stdout }}"
 
         - name: "[FASE 2 - CRASH 1] Trova il PID reale di slapd (pgrep con retry, possibile blip transitorio) su {{ node2 }}"
           delegate_to: "{{ node2 }}"
@@ -719,6 +920,34 @@
           ansible.builtin.command: "kill -9 {{ node2_slapd_pid.stdout | trim }}"
           changed_when: true
 
+        - name: "[FASE 2 - CRASH 1] Verifica che l'iniezione fosse ancora in corso al momento del kill -9, su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              N=$(grep -c 'adding new entry' /tmp/async_load.log 2>/dev/null) || N=0
+              if [ -f /tmp/async_load.pid ] && kill -0 "$(cat /tmp/async_load.pid)" 2>/dev/null; then
+                echo "INJECTION_RUNNING: $N/{{ crash_users }} entry inviate dopo il kill"
+              else
+                echo "INJECTION_FINISHED: $N/{{ crash_users }} entry inviate, iniezione gia' terminata"
+              fi
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          register: crash1_during_writes
+          changed_when: false
+
+        - name: "[FASE 2 - CRASH 1] Blocca se il crash 1 e' avvenuto a scritture gia' finite (il test non proverebbe un crash durante le scritture)"
+          ansible.builtin.assert:
+            that:
+              - "'INJECTION_RUNNING' in crash1_during_writes.stdout"
+            fail_msg: >-
+              ERRORE: {{ crash1_during_writes.stdout }} - il kill -9 su
+              {{ node2 }} e' arrivato dopo la fine dell'iniezione, quindi il
+              nodo non ha scritture in corso da recuperare. Abbassare
+              crash1_at_pct/crash2_at_pct o aumentare crash_users (attenzione
+              alla soglia del bug di replica, Parte 3 della documentazione).
+              slapd viene comunque riavviato nell'always.
+            success_msg: "{{ crash1_during_writes.stdout }}"
+
         - name: "[FASE 2 - CRASH 1] Verifica lo stato del servizio dopo il kill (informativo - segnala se systemd lo ha gia' riavviato da solo)"
           delegate_to: "{{ node2 }}"
           ansible.builtin.systemd:
@@ -742,9 +971,44 @@
               - "Stato slapd dopo kill -9: {{ node2_status_after_crash.status.ActiveState | default('n/d') }}"
               - "mdb_stat: {{ 'OK' if node2_mdb_stat_after_crash.rc | default(1) == 0 else 'FALLITO: ' + (node2_mdb_stat_after_crash.stderr|default('n/d')) }}"
 
-        - name: "[FASE 2] Attendi 4 secondi prima del secondo crash"
-          ansible.builtin.pause:
-            seconds: 4
+        - name: "[FASE 2 - CRASH 2] Attendi che l'iniezione raggiunga la soglia di avanzamento (crash2_at_pct) prima del crash, su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              SOGLIA=$(( {{ crash_users }} * {{ crash2_at_pct }} / 100 ))
+              START=$(date +%s)
+              while true; do
+                N=$(grep -c 'adding new entry' /tmp/async_load.log 2>/dev/null) || N=0
+                if [ "$N" -ge "$SOGLIA" ]; then
+                  echo "PROGRESS_OK: $N/{{ crash_users }} entry inviate (soglia $SOGLIA)"
+                  exit 0
+                fi
+                if ! { [ -f /tmp/async_load.pid ] && kill -0 "$(cat /tmp/async_load.pid)" 2>/dev/null; }; then
+                  echo "INJECTION_ENDED: iniezione terminata a $N/{{ crash_users }} prima della soglia $SOGLIA"
+                  exit 1
+                fi
+                if [ $(( $(date +%s) - START )) -ge {{ crash_progress_timeout }} ]; then
+                  echo "PROGRESS_TIMEOUT: {{ crash_progress_timeout }}s - $N/{{ crash_users }} entry inviate (soglia $SOGLIA)"
+                  exit 1
+                fi
+                sleep 0.2
+              done
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          register: crash2_progress
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 2 - CRASH 2] Blocca se l'iniezione non ha raggiunto la soglia del crash"
+          ansible.builtin.assert:
+            that:
+              - "'PROGRESS_OK' in crash2_progress.stdout"
+            fail_msg: >-
+              ERRORE: {{ crash2_progress.stdout | default('nessun output') }} -
+              il crash 2 non avverrebbe durante le scritture. Controllare
+              /tmp/async_load.log su {{ node1 }} (ldapadd fallito subito?) o
+              abbassare crash2_at_pct.
+            success_msg: "{{ crash2_progress.stdout }}"
 
         - name: "[FASE 2 - CRASH 2] Trova il PID reale di slapd (pgrep con retry, gia' visto un blip qui) su {{ node3 }}"
           delegate_to: "{{ node3 }}"
@@ -771,6 +1035,34 @@
           become: true
           ansible.builtin.command: "kill -9 {{ node3_slapd_pid.stdout | trim }}"
           changed_when: true
+
+        - name: "[FASE 2 - CRASH 2] Verifica che l'iniezione fosse ancora in corso al momento del kill -9, su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              N=$(grep -c 'adding new entry' /tmp/async_load.log 2>/dev/null) || N=0
+              if [ -f /tmp/async_load.pid ] && kill -0 "$(cat /tmp/async_load.pid)" 2>/dev/null; then
+                echo "INJECTION_RUNNING: $N/{{ crash_users }} entry inviate dopo il kill"
+              else
+                echo "INJECTION_FINISHED: $N/{{ crash_users }} entry inviate, iniezione gia' terminata"
+              fi
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          register: crash2_during_writes
+          changed_when: false
+
+        - name: "[FASE 2 - CRASH 2] Blocca se il crash 2 e' avvenuto a scritture gia' finite (il test non proverebbe un crash durante le scritture)"
+          ansible.builtin.assert:
+            that:
+              - "'INJECTION_RUNNING' in crash2_during_writes.stdout"
+            fail_msg: >-
+              ERRORE: {{ crash2_during_writes.stdout }} - il kill -9 su
+              {{ node3 }} e' arrivato dopo la fine dell'iniezione, quindi il
+              nodo non ha scritture in corso da recuperare. Abbassare
+              crash1_at_pct/crash2_at_pct o aumentare crash_users (attenzione
+              alla soglia del bug di replica, Parte 3 della documentazione).
+              slapd viene comunque riavviato nell'always.
+            success_msg: "{{ crash2_during_writes.stdout }}"
 
         - name: "[FASE 2 - CRASH 2] Verifica lo stato del servizio dopo il kill (informativo)"
           delegate_to: "{{ node3 }}"
@@ -932,6 +1224,9 @@
               if [ "$TARGET" -le 0 ]; then
                 echo "TARGET_WARNING: dopo 60s, target su node1 e' ancora $TARGET - mai normale qui, verificare slapcat/SSH su node1"
               fi
+              # Letto dall'assert di FASE 6: con la pulizia di FASE 0, node1
+              # deve avere esattamente crash_users entry.
+              echo "CONVERGENCE_TARGET: $TARGET (attese {{ crash_users }})"
               START=$(date +%s)
               TIMEOUT=800
               LAST_PROGRESS_LOG=0
@@ -1123,6 +1418,51 @@
           ansible.builtin.debug:
             msg: "{{ cleanup_convergence.stdout_lines }}"
 
+        # ==========================================================================
+        # FASE 6: ESITO FINALE
+        # Gli assert stanno DOPO il cleanup di FASE 5: cosi' il cluster resta
+        # pulito anche quando il test fallisce (i conteggi per nodo restano nei
+        # report CONVERGENCE_PROGRESS/CLEANUP_PROGRESS sopra). Fino alla v8.1
+        # non c'era alcun assert: un CONVERGENCE_TIMEOUT finiva con failed=0.
+        # ==========================================================================
+
+        - name: "[FASE 6] Blocca se node1 non ha esattamente le entry iniettate"
+          ansible.builtin.assert:
+            that:
+              - "('CONVERGENCE_TARGET: ' ~ crash_users ~ ' ') in convergence_metric.stdout"
+            fail_msg: >-
+              ERRORE: dopo l'iniezione {{ node1 }} non ha esattamente
+              {{ crash_users }} entry crash.user.* - vedi la riga
+              CONVERGENCE_TARGET nel report di FASE 4. Con la pulizia di FASE 0
+              un valore diverso significa che una parte delle ldapadd su
+              {{ node1 }} e' fallita (il log /tmp/async_load.log viene rimosso
+              in FASE 5: rilanciare con no_log disattivato per il dettaglio).
+            success_msg: "OK: {{ node1 }} ha tutte le {{ crash_users }} entry iniettate."
+
+        - name: "[FASE 6] Blocca se il cluster non e' converso entro il timeout dopo il crash"
+          ansible.builtin.assert:
+            that:
+              - "'CONVERGENCE_OK' in convergence_metric.stdout"
+            fail_msg: >-
+              ERRORE: i 4 nodi non hanno raggiunto le {{ crash_users }} entry di
+              {{ node1 }} entro il timeout di FASE 4 - vedi le righe
+              CONVERGENCE_PROGRESS. Conteggi in crescita fino alla fine = solo
+              lento; un nodo fermo allo stesso valore con un blocco contiguo di
+              entry mancanti = il buco silenzioso di replica gia' noto
+              (ITS#10604, Parte 3 della documentazione), non necessariamente un
+              effetto del kill -9. Confermare con check_full_cluster_sync.sh.
+            success_msg: "{{ (convergence_metric.stdout_lines | select('match', '^CONVERGENCE_OK') | list | first) | default('OK') }}"
+
+        - name: "[FASE 6] Blocca se la cancellazione degli utenti di test non e' conversa a 0 su tutti i nodi"
+          ansible.builtin.assert:
+            that:
+              - "'CLEANUP_CONVERGENCE_OK' in cleanup_convergence.stdout"
+            fail_msg: >-
+              ERRORE: dopo la FASE 5 restano utenti crash.user.* su almeno un
+              nodo - vedi le righe CLEANUP_PROGRESS e il riepilogo di
+              ldapdelete. Il prossimo run li rimuove comunque in FASE 0.
+            success_msg: "{{ cleanup_convergence.stdout_lines | last }}"
+
       always:
         # failed_when: false + assert in fondo: l'esito vero si verifica sullo
         # stato reale dei nodi (assert_wan_state.yml) e sul rc, cosi' un
@@ -1140,6 +1480,37 @@
           changed_when: true
           failed_when: false
 
+        # Se il test si ferma fra il kill -9 di FASE 2 e il ripristino di
+        # FASE 4, node2/node3 resterebbero giu' (gia' successo, vedi v7.7).
+        # state: started su un nodo gia' attivo non fa nulla. Dopo lo
+        # spegnimento della WAN: un nodo irraggiungibile qui interromperebbe
+        # i task successivi dell'always, ma la WAN e' gia' stata spenta.
+        - name: "[POST] Assicura che slapd sia di nuovo attivo sui nodi crashati (anche se il test si e' fermato prima del ripristino di FASE 4)"
+          delegate_to: "{{ item }}"
+          become: true
+          ansible.builtin.systemd:
+            name: slapd
+            state: started
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: post_slapd_start
+          failed_when: false
+
+        # Il modulo systemd con state: started restituisce lo stato di PRIMA
+        # dell'avvio (dopo un kill -9: 'failed'): lo stato reale si rilegge qui.
+        - name: "[POST] Rileva lo stato di slapd sui nodi crashati dopo il riavvio"
+          delegate_to: "{{ item }}"
+          ansible.builtin.systemd:
+            name: slapd
+          loop:
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          no_log: true
+          register: post_slapd_status
+          failed_when: false
+
         - name: "[POST] Verifica che la simulazione WAN sia REALMENTE rimossa dai 4 nodi"
           ansible.builtin.include_tasks: "{{ wan_assert_tasks }}"
           vars:
@@ -1155,3 +1526,18 @@
               con rc={{ wan_disable.rc }} - ultime righe:
               {{ (wan_disable.stdout_lines | default([]))[-8:] | join(' | ') }}
             quiet: true
+
+        - name: "[POST] Blocca se slapd non risulta attivo sui nodi crashati a fine test"
+          ansible.builtin.assert:
+            that:
+              - (post_slapd_status.results[item].status.ActiveState | default('sconosciuto')) == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ post_slapd_status.results[item].item }} non e'
+              attivo a fine test (stato:
+              {{ post_slapd_status.results[item].status.ActiveState | default('sconosciuto') }}).
+              Controllare 'journalctl -u slapd' e 'mdb_stat -e /var/lib/ldap'
+              su quel nodo prima di qualunque altro test.
+            success_msg: "OK: slapd attivo su {{ post_slapd_status.results[item].item }} a fine test."
+          loop: "{{ range(post_slapd_status.results | length) | list }}"
+          loop_control:
+            label: "{{ post_slapd_status.results[item].item }}"

@@ -9,8 +9,13 @@ cluster OpenLDAP N-Way Multi-Master soggetto a partizionamenti di rete e
 consumer, con verifica di integrità dell'ambiente LMDB e misurazione della
 convergenza estesa a **tutto il cluster, inclusa la replica read-only**.
 
-*Versione documentata: 7.9. Storico completo delle versioni precedenti nel
+*Versione documentata: 8.2. Storico completo delle versioni precedenti nel
 changelog in testa al file `.yml`.*
+
+I nomi dei nodi (`node1`…`node4`) non sono scritti nel playbook: derivano
+dall'inventory (`groups['cluster'] | sort` per i tre master,
+`groups['readonlyreplica']` per la replica), quindi lo stesso playbook gira
+senza modifiche sugli ambienti 24.04 e 26.04.
 
 ```text
                 +-----------------------------------------+
@@ -21,47 +26,81 @@ changelog in testa al file `.yml`.*
                                      v
 +-----------------------+   +-----------------------+   +-----------------------+
 |        NODE 3         |   |        NODE 1         |   |        NODE 2         |
-| ubuntu24lts3           |   | ubuntu24lts1           |   | ubuntu24lts2           |
 | (Master -> Crash 2)   |   | (Write Target & MDB)   |   | (Master -> Crash 1)   |
 +-----------------------+   +-----------------------+   +-----------------------+
             |                           |                           |
-            +======== WAN (Netem: 50ms Latency / 0.1% Loss) ========+
+            +== WAN (netem: 25ms one-way, ~50ms RTT / 0.1% loss) ==+
                                      |
                           +-----------------------+
                           |        NODE 4          |
-                          | ubuntu24lts4            |
                           | (Read-Only Replica)    |
                           +-----------------------+
 ```
 
 ### Flusso Logico delle Fasi
 
+0. **WAN simulata, pre-volo e pulizia dei residui ([PRE] e Fase 0):**
+
+   * **WAN accesa e verificata ([PRE]):** il test richiama
+     `simulate_wan_mpls_ipsec.yml -e stato=enabled` passandogli il proprio
+     inventory (`-i`), poi verifica lo **stato reale** su tutti e 4 i nodi
+     (qdisc `netem` e regole mangle sulla 636) con `assert_wan_state.yml`:
+     il solo `rc=0` del playbook WAN non basta, perché se l'inventory non
+     contiene il gruppo `ldap_all` esce con successo senza toccare nessun
+     host. L'accensione sta dentro il `block`: se fallisce a metà, l'`always`
+     spegne comunque la WAN.
+   * **Pre-volo su tutti e tre i master:** prima di toccare qualunque cosa,
+     `slapd` deve risultare già attivo su `node1`, `node2` e `node3`. Se uno
+     è inattivo il test si ferma subito, segnalandolo come stato residuo
+     (quasi certamente un `kill -9` di un run precedente mai seguito dal
+     ripristino) invece di proseguire su un bersaglio già compromesso e
+     fallire più avanti in un modo che sembra un mistero diverso. Fino alla
+     v8.1 `node2` e `node3` venivano verificati solo dopo l'avvio
+     dell'iniezione.
+   * **Pulizia dei residui (dalla v8.2):** gli utenti `crash.user.*` rimasti
+     da un run interrotto vengono cancellati e il test attende che il
+     conteggio sia 0 su tutti e 4 i nodi. Senza questo passo `ldapadd -c`
+     salterebbe in silenzio le entry già presenti e il conteggio di
+     riferimento tornerebbe comunque 500: il test passerebbe senza aver
+     scritto nulla.
+   * **Prerequisiti:** `lmdb-utils` (per `mdb_stat`) viene installato su
+     `node2`/`node3` qui, prima dell'iniezione e non durante: `apt` impiega
+     secondi, e lanciato a scritture in corso consumerebbe buona parte
+     dell'iniezione prima del primo crash.
+
 1. **Iniezione Asincrona ad Alta Frequenza (Fase 1):** Viene eseguito **uno
    script shell** (nessuna dipendenza da `python-ldap`, mai installata sul
    cluster) direttamente su `node1` (`delegate_to: "{{ node1 }}"`), avviato
    con `nohup` per sopravvivere alla chiusura della sessione SSH. Un ciclo
-   genera 500 entry LDAP (`uid=crash.user.X`) con una pausa di 5ms fra
-   l'una e l'altra, tutte incanalate in **una sola invocazione di
+   genera 500 entry LDAP (`uid=crash.user.X`) con una pausa di 20ms fra
+   l'una e l'altra (`inject_sleep`; 5ms fino alla v8.1), tutte incanalate in **una sola invocazione di
    `ldapadd -c`** — una sola connessione riusata per tutte le scritture,
    esattamente come farebbe una connessione persistente, senza bisogno di
    librerie aggiuntive. Il numero di utenti è stato deliberatamente
    ridotto da 2.000 a 500 - vedi la nota sul bug di replica isolato più
-   sotto, nella Sintesi Finale, per il motivo. Prima di procedere, il
-   playbook verifica che `slapd` su `node1` sia attivo fin dall'inizio
-   (baseline di riferimento): il test non ha senso se il write target è
-   già giù in partenza.
+   sotto, nella Parte 3, per il motivo (il numero è nella variabile
+   `crash_users`). Subito dopo l'avvio, il playbook riverifica che `slapd`
+   su `node1` sia attivo (baseline di riferimento): il test non ha senso se
+   il write target è giù.
 
 2. **Simulazione dei Crash a Cascata, NON gestiti (Fase 2):**
    
-   * **Controllo pre-volo:** prima di toccare qualunque cosa, il playbook
-     verifica che `slapd` su `node2` E `node3` sia GIÀ attivo su entrambi.
-     Se uno dei due risulta già inattivo, il test si ferma immediatamente
-     con un errore che lo segnala esplicitamente come uno stato residuo
-     (quasi certamente un `kill -9` di un run precedente mai seguito dal
-     ripristino, non un problema causato da questo run) — invece di
-     proseguire su un bersaglio già compromesso e fallire più avanti in un
-     modo che sembra un mistero diverso.
-   * **Crash 1 (T+2s):** il PID reale di `slapd` su `node2` viene
+   * **Quando partono i crash (dalla v8.2):** non dopo pause fisse, ma
+     quando `node1` ha inviato una quota delle entry: `crash1_at_pct` (10%)
+     per il primo, `crash2_at_pct` (40%) per il secondo. Con la pausa di
+     20ms l'iniezione dura circa 18s: c'è margine per i circa 5s di task
+     Ansible fra i due kill (con 5ms durava 8–9s e in un run il secondo kill
+     è arrivato a scritture già finite). L'avanzamento si
+     legge dalle righe `adding new entry` che `ldapadd` scrive nel proprio
+     log, riga per riga grazie a `stdbuf -oL` (senza, verso un file l'output
+     sarebbe bufferizzato a blocchi e il conteggio arriverebbe in ritardo).
+     Subito **dopo** ogni `kill -9` il test verifica che l'iniezione fosse
+     ancora in corso: se era già finita si ferma, perché il nodo non avrebbe
+     scritture in corso da recuperare e il test non proverebbe ciò che
+     dichiara. Fino alla v8.1 le pause erano fisse (2s e 4s): nel run del
+     26/10 il secondo crash è caduto dopo la fine dell'iniezione (vedi i
+     risultati in fondo).
+   * **Crash 1:** il PID reale di `slapd` su `node2` viene
      individuato con `pgrep -x slapd` (con retry fino a 5 tentativi, un
      secondo di pausa fra l'uno e l'altro, per assorbire un eventuale blip
      transitorio); il test si blocca se non ne trova esattamente uno (0 =
@@ -76,7 +115,7 @@ changelog in testa al file `.yml`.*
      installato come prerequisito, non bloccante) come controllo di
      integrità di base — non una verifica di corruzione approfondita, ma
      un segnale concreto se l'ambiente non è più leggibile.
-   * **Crash 2 (T+6s):** stessa sequenza (pgrep con retry, blocco se non
+   * **Crash 2:** stessa sequenza (pgrep con retry, blocco se non
      esattamente un processo, kill -9 diretto sul PID, verifica stato,
      `mdb_stat`) su `node3`.
 
@@ -105,11 +144,45 @@ changelog in testa al file `.yml`.*
    grazie a questo.
 
 5. **Cleanup e Ripristino DIT (Fase 5):** Tutti i 500 utenti di test
-   vengono cancellati (via `ldapsearch`+`ldapdelete`, stesso pattern degli
-   script `crash_cascading_node_*_test.sh`). La verifica che la cancellazione
-   sia effettivamente conversa a zero residui su tutti e quattro i nodi usa
-   lo stesso meccanismo di polling via `slapcat` via SSH descritto al punto
-   4 (non un'attesa fissa, e non `ldapsearch`), per le stesse ragioni.
+   vengono cancellati da `node1`: l'elenco dei DN viene letto con `slapcat`
+   locale (nessun sizelimit) e passato a `ldapdelete -c`. Il riepilogo
+   (entry tentate, rc di `ldapdelete`, righe di errore) viene scritto su un
+   file separato, così resta leggibile nonostante il `no_log` imposto dalla
+   password. La verifica che la cancellazione sia effettivamente conversa a
+   zero residui su tutti e quattro i nodi usa lo stesso polling via
+   `slapcat` su SSH descritto al punto 4 (non un'attesa fissa, e non
+   `ldapsearch`), per le stesse ragioni.
+
+6. **Esito finale (Fase 6, dalla v8.2):** tre `assert` bloccanti:
+   * `node1` deve avere **esattamente** `crash_users` entry dopo
+     l'iniezione: con la pulizia di Fase 0, un valore diverso significa che
+     una parte delle `ldapadd` è fallita;
+   * i 4 nodi devono essere convergenti entro il timeout di Fase 4
+     (`CONVERGENCE_OK`). Un timeout con un nodo fermo su un blocco contiguo
+     di entry mancanti è il buco silenzioso di replica già noto (Parte 3),
+     non necessariamente un effetto del `kill -9`;
+   * la cancellazione deve essere conversa a 0 su tutti i nodi.
+
+   Fino alla v8.1 convergenza e cleanup avevano `failed_when: false` senza
+   alcun `assert`: un `CONVERGENCE_TIMEOUT` finiva comunque con `failed=0`.
+   Gli `assert` stanno **dopo** il cleanup, così il cluster resta pulito
+   anche quando il test fallisce; i conteggi per nodo restano nei report
+   `CONVERGENCE_PROGRESS`/`CLEANUP_PROGRESS`.
+
+7. **Chiusura garantita (`always`):** eseguita sempre, anche se una fase
+   qualunque fallisce:
+   * spegnimento della WAN (`-e stato=disabled`) come primo task, con
+     `failed_when: false`: un task fallito o un host irraggiungibile in un
+     `always` interrompono i task successivi;
+   * `slapd` riavviato su `node2` e `node3` se non è attivo: se il test si
+     ferma fra il `kill -9` e il ripristino di Fase 4, i nodi crashati
+     resterebbero altrimenti giù (è successo, vedi changelog v7.7);
+   * verifica dello stato reale della WAN su tutti e 4 i nodi, del rc del
+     playbook WAN e di `slapd` attivo sui nodi crashati.
+
+   Un'interruzione con Ctrl-C non esegue l'`always`: in quel caso spegnere
+   la WAN a mano e verificare `slapd` su `node2`/`node3`. Il playbook non
+   va lanciato con `--check`.
 
 ---
 
@@ -119,10 +192,12 @@ changelog in testa al file `.yml`.*
 
 L'output dell'audit conferma che la simulazione di rete WAN (MPLS + IPSec)
 è attiva, corretta e conforme su **tutti e quattro i nodi del cluster**
-(`ubuntu24lts1`, `ubuntu24lts2`, `ubuntu24lts3`, **e `ubuntu24lts4`, la
-replica read-only**) — entrambi i playbook girano su `hosts: ldap_all`,
-che nell'inventory di questo progetto comprende l'unione di `cluster` e
-`readonlyreplica`. 
+(i tre master **e la replica read-only**) — entrambi i playbook girano su
+`hosts: ldap_all`, che nell'inventory di questo progetto comprende l'unione
+di `cluster` e `readonlyreplica`. Se l'inventory non contiene `ldap_all`,
+i due playbook escono con successo senza toccare alcun host: per questo il
+crash test non si fida del loro `rc` e verifica lo stato reale con
+`assert_wan_state.yml` (vedi Fase 0 e Fase 7 sopra).
 
 ### 1. Validazione della Rete e di Traffic Control (`tc`)
 
@@ -338,3 +413,38 @@ run successivi - vedi "Aggiornamento" qui sopra.
   100% (0 errori, convergenza della cancellazione in 2 secondi, su tutti
   e 4 i nodi). `PLAY RECAP`: `ok=37 changed=8 failed=0` - run pulito al
   100%.
+
+* **Run del 26/10/2026 (ambiente ubuntu 26.04, WAN simulata attiva).**
+  Tre esecuzioni durante lo sviluppo della v8.2, ognuna ha mostrato qualcosa:
+
+  1. **Pause fisse 2s/4s, pausa fra le entry 5ms — ✅ superato, ma per metà
+     per il motivo sbagliato.** Dal journal di `slapd`: l'iniezione su `node1`
+     è durata ~9,3s (~54 scritture/s); `node2` aveva ricevuto fino a
+     `crash.user.447` quando è stato ucciso (Crash 1 durante le scritture),
+     ma `node3` aveva già ricevuto `crash.user.500` prima del proprio kill
+     (Crash 2 **dopo** la fine delle scritture: nulla da recuperare). Da qui
+     i crash agganciati all'avanzamento e la verifica dopo ogni kill.
+  2. **Crash agganciati all'avanzamento, pausa 5ms — ❌ fermato
+     correttamente dal nuovo controllo.** L'iniezione è stata più veloce
+     (~60/s): il Crash 1 è avvenuto a 205/500, ma fra i due kill ci sono
+     ~5s di task Ansible e il Crash 2 è arrivato a 500/500
+     (`INJECTION_FINISHED`). Da qui la pausa fra le entry a 20ms
+     (`inject_sleep`). Lo stesso run ha mostrato un falso allarme
+     nell'`always` ("slapd non attivo", con `slapd` in realtà già ripartito):
+     il modulo `systemd` con `state: started` restituisce lo stato di prima
+     dell'avvio; ora lo stato si rilegge con un task separato. Il run, fermo
+     in Fase 2, ha lasciato 500 `crash.user.*` sul cluster.
+  3. **Versione finale v8.2 — ✅ `PLAY RECAP`: `ok=62 changed=9 failed=0`.**
+
+  | Fase | Esito (run 3) |
+  |---|---|
+  | WAN accesa e verificata su tutti e 4 i nodi | ✅ |
+  | Pre-volo su `node1`/`node2`/`node3` | ✅ tutti `active` |
+  | Pulizia residui `crash.user.*` (i 500 lasciati dal run 2) | ✅ 0 residui su tutti e 4 i nodi in 1s |
+  | Crash 1 (`node2`): soglia 50, kill a scritture in corso | ✅ 107/500 inviate dopo il kill |
+  | Crash 2 (`node3`): soglia 200, kill a scritture in corso | ✅ 251/500 inviate dopo il kill |
+  | `mdb_stat` dopo i due `kill -9` | ✅ OK su entrambi |
+  | Entry su `node1` dopo l'iniezione | ✅ 500/500 |
+  | Convergenza su tutti e 4 i nodi | ✅ **1 secondo** |
+  | Cleanup | ✅ 0 residui su tutti e 4 i nodi in 2s |
+  | WAN spenta e verificata; `slapd` attivo su `node2`/`node3` a fine test | ✅ |
