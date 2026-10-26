@@ -74,8 +74,18 @@
 # CHECK MODE: NON usare --check: il playbook orchestra un altro
 # ansible-playbook (WAN, tc/iptables) che in check mode verrebbe saltato.
 #
-# VERSIONE:     1.1
+# VERSIONE:     1.2
 # CHANGELOG:
+#   1.2 - 2026-10-26 - FASE 2: rimozione idempotente dei residui
+#                      concurrent.a.* / concurrent.b.* di un run precedente
+#                      interrotto, con attesa (polling) che la cancellazione
+#                      converga a 0 su tutti e 4 i nodi PRIMA delle nuove
+#                      scritture. Senza, dopo un run fallito in FASE 5 (la
+#                      FASE 6 di cleanup non parte) restavano 400 entry sul
+#                      cluster: al run successivo "ldapadd -c" falliva in
+#                      silenzio sulle entry gia' presenti, ma il conteggio
+#                      tornava comunque 400 = target - Scenario A passava
+#                      senza aver scritto nulla (falso positivo).
 #   1.1 - 2026-10-26 - WAN: inventory del test passato esplicitamente al
 #                      playbook WAN annidato (senza "-i" usava l'inventory di
 #                      default, quindi con -i su un altro ambiente la WAN
@@ -199,6 +209,110 @@
         # ritorna quasi subito, il lavoro vero prosegue in nohup) - stesso
         # pattern di test_crash_cascading_node.yml FASE 1, replicato su due nodi.
         # ==========================================================================
+
+        # Idempotenza: se un run precedente si e' fermato prima della FASE 6
+        # (es. split-brain in FASE 5), le entry concurrent.* sono ancora sul
+        # cluster. "ldapadd -c" salterebbe in silenzio quelle gia' presenti e
+        # il conteggio di FASE 3 tornerebbe comunque al target: Scenario A
+        # passerebbe senza aver scritto nulla. Si cancellano quindi i residui
+        # e si attende che la cancellazione converga a 0 su TUTTI i nodi prima
+        # di scrivere (altrimenti delete in replica e nuove add si
+        # sovrapporrebbero).
+        - name: "[FASE 2 - SCENARIO A] Rimuovi eventuali entry concurrent.* residue di un run precedente interrotto (idempotenza)"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              export LDAPTLS_REQCERT=never
+              slapcat -b "{{ ldap_basedn }}" -a "(uid=concurrent.*)" 2>/dev/null \
+                | grep "^dn:" | sed 's/^dn: //' > /tmp/concurrent_residui.txt
+              DELETE_RC=0
+              if [ -s /tmp/concurrent_residui.txt ]; then
+                ldapdelete -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" \
+                  -c -f /tmp/concurrent_residui.txt > /dev/null 2>&1
+                DELETE_RC=$?
+              fi
+              rm -f /tmp/concurrent_residui.txt
+              exit $DELETE_RC
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          become: true
+          register: residual_cleanup
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 2 - SCENARIO A] Blocca se la rimozione dei residui concurrent.* e' fallita"
+          ansible.builtin.assert:
+            that:
+              - residual_cleanup.rc == 0
+            fail_msg: >-
+              ERRORE: rimozione dei residui concurrent.* fallita su {{ node1 }}
+              (rc={{ residual_cleanup.rc }}) - output non mostrato (no_log).
+              Verificare a mano con slapcat -a '(uid=concurrent.*)' e ldapdelete
+              in chiaro: senza questa pulizia lo Scenario A darebbe un falso
+              positivo.
+            quiet: true
+
+        - name: "[FASE 2 - SCENARIO A] Attendi che la rimozione dei residui converga a 0 su TUTTO il cluster prima di scrivere - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              FILTER="(uid=concurrent.*)"
+              count_on() {
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '$FILTER' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
+              }
+              START=$(date +%s)
+              TIMEOUT=180
+              LAST_PROGRESS_LOG=0
+              while true; do
+                C1=$(count_on "{{ node1 }}")
+                C2=$(count_on "{{ node2 }}")
+                C3=$(count_on "{{ node3 }}")
+                C4=$(count_on "{{ node4 }}")
+                if [ "$C1" = "0" ] && [ "$C2" = "0" ] && [ "$C3" = "0" ] && [ "$C4" = "0" ]; then
+                  echo "PRECLEAN_OK: $(($(date +%s) - START))s (0 residui su tutti i 4 nodi)"
+                  exit 0
+                fi
+                ELAPSED=$(($(date +%s) - START))
+                if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+                  echo "PRECLEAN_PROGRESS: ${ELAPSED}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  LAST_PROGRESS_LOG=$ELAPSED
+                fi
+                if [ $ELAPSED -ge $TIMEOUT ]; then
+                  echo "PRECLEAN_TIMEOUT: ${TIMEOUT}s - residui node1=$C1 node2=$C2 node3=$C3 node4=$C4"
+                  exit 1
+                fi
+                sleep 1
+              done
+            executable: /bin/bash
+          register: preclean_convergence
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 2 - SCENARIO A] Blocca se i residui concurrent.* non sono spariti da tutti i nodi prima di scrivere"
+          ansible.builtin.assert:
+            that:
+              - "'PRECLEAN_OK' in preclean_convergence.stdout"
+            fail_msg: "{{ preclean_convergence.stdout_lines }}"
+            success_msg: "{{ preclean_convergence.stdout_lines | last }}"
 
         - name: "[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su {{ node2 }} (namespace concurrent.a.*)"
           ansible.builtin.shell: |
