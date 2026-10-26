@@ -194,11 +194,40 @@ EOF
           chmod 600 /home/vagrant/.ssh/authorized_keys
         fi
 
-        # Configurazione SSH
-        echo -e "Host 192.168.1.*\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" > /home/vagrant/.ssh/config
-        echo -e "Host *.example.com\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null" >> /home/vagrant/.ssh/config
-        chown vagrant:vagrant /home/vagrant/.ssh/config
-        chmod 600 /home/vagrant/.ssh/config
+        # Configurazione SSH: blocco gestito tra marcatori, riscritto a ogni
+        # avvio senza toccare il resto del file. Prima il file veniva
+        # sovrascritto con ">", cancellando ogni aggiunta manuale (es. il
+        # blocco Host github.com, sparito -> git push "Permission denied").
+        SSH_CFG=/home/vagrant/.ssh/config
+        BEGIN_MARK="# BEGIN cluster Vagrant (gestito dal provisioning, non modificare)"
+        END_MARK="# END cluster Vagrant"
+        touch "$SSH_CFG"
+        # Migrazione: file scritto per intero dalla vecchia versione (nessun
+        # marcatore e solo le vecchie righe) -> si riparte da file vuoto
+        if ! grep -qF "$BEGIN_MARK" "$SSH_CFG" && \
+           ! grep -qvxF -e 'Host 192.168.1.*' -e 'Host *.example.com' \
+               -e '  StrictHostKeyChecking no' -e '  UserKnownHostsFile=/dev/null' -e '' "$SSH_CFG"; then
+          : > "$SSH_CFG"
+        fi
+        sed -i "/^$BEGIN_MARK/,/^$END_MARK/d" "$SSH_CFG"
+        {
+          echo "$BEGIN_MARK"
+          echo "Host 192.168.1.*"
+          echo "  StrictHostKeyChecking no"
+          echo "  UserKnownHostsFile=/dev/null"
+          echo "Host *.example.com"
+          echo "  StrictHostKeyChecking no"
+          echo "  UserKnownHostsFile=/dev/null"
+          # Chiave per GitHub (solo sui nodi dove e' presente)
+          if [ -f /home/vagrant/.ssh/id_ed25519_github ]; then
+            echo "Host github.com"
+            echo "  IdentityFile ~/.ssh/id_ed25519_github"
+            echo "  IdentitiesOnly yes"
+          fi
+          echo "$END_MARK"
+        } >> "$SSH_CFG"
+        chown vagrant:vagrant "$SSH_CFG"
+        chmod 600 "$SSH_CFG"
       SHELL
     end
   end
