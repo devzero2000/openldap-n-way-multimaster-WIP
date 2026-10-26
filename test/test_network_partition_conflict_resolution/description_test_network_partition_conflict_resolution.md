@@ -21,7 +21,8 @@ differenza degli altri test di questa campagna:
   comunque un'unica rete connessa;
 - qui `slapd` resta vivo e sano su tutti i nodi: viene tagliato solo il
   traffico sulla porta di replica LDAPS (636), per il tempo della
-  partizione, mentre i processi non vengono mai toccati.
+  partizione, mentre i processi non vengono mai toccati. La partizione si
+  applica sopra la WAN simulata, che resta attiva per tutto il test.
 
 Il test copre tre proprietà distinte, verificate in sequenza:
 

@@ -8,8 +8,8 @@ scenario simulato, e cosa ciascuno verifica.
 ## `test_crash_cascading_node.yml`
 
 **Scenario simulato:** crash di processo (`kill -9`) su uno o più nodi del
-cluster — a differenza degli altri due test, qui `slapd` smette proprio di
-esistere, non semplicemente di essere raggiungibile.
+cluster, sotto WAN simulata — a differenza degli altri due test, qui `slapd`
+smette proprio di esistere, non semplicemente di essere raggiungibile.
 
 **Cosa verifica:** la capacità del cluster di sopravvivere alla perdita
 improvvisa di un master (e di master in cascata), il corretto riavvio e
@@ -41,9 +41,10 @@ in modo deterministico verso un unico valore identico su tutti i nodi
 ## `test_network_partition_conflict_resolution.yml`
 
 **Scenario simulato:** una vera partizione di rete (netsplit) fra un master
-e gli altri due — a differenza del crash test, `slapd` resta vivo e sano su
-tutti i nodi; viene tagliato solo il traffico sulla porta di replica LDAPS
-(636) fra i lati della partizione, per il tempo del test.
+e gli altri due, applicata sopra la WAN simulata — a differenza del crash
+test, `slapd` resta vivo e sano su tutti i nodi; viene tagliato solo il
+traffico sulla porta di replica LDAPS (636) fra i lati della partizione, per
+il tempo del test.
 
 **Cosa verifica:** tre proprietà in sequenza. (1) Continuità operativa: il
 nodo isolato deve continuare ad accettare scritture locali senza errori.
@@ -67,6 +68,17 @@ I tre test isolano tre modalità di guasto distinte e non sovrapposte:
 
 | Test | Cosa fallisce | Rete | Processo `slapd` |
 |---|---|---|---|
-| `test_crash_cascading_node.yml` | il processo | intatta | terminato (`kill -9`) |
+| `test_crash_cascading_node.yml` | il processo | degradata (WAN simulata), ma connessa | terminato (`kill -9`) |
 | `test_concurrent_multimaster_write.yml` | niente (solo concorrenza) | degradata (WAN simulata), ma connessa | sempre vivo |
-| `test_network_partition_conflict_resolution.yml` | il collegamento fra nodi | interrotta (netsplit) su una porta specifica | sempre vivo |
+| `test_network_partition_conflict_resolution.yml` | il collegamento fra nodi | WAN simulata, interrotta (netsplit) su una porta specifica | sempre vivo |
+
+## Simulazione WAN
+
+Tutti e tre i test girano sotto la WAN simulata
+(`stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml`): la
+accendono come primo passo del `block` e la spengono sempre nell'`always`,
+anche in caso di errore. Dopo l'accensione e dopo lo spegnimento lo stato
+reale (qdisc `netem` e regole mangle sulla 636) viene verificato su tutti e 4
+i nodi con `assert_wan_state.yml`. Un'interruzione con Ctrl-C non esegue
+l'`always`: in quel caso spegnere la WAN a mano con `-e stato=disabled`.
+I test non vanno lanciati con `--check`.

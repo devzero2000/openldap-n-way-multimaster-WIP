@@ -8,6 +8,33 @@
 #               (mdb_stat), verifica che slapd riparta davvero, misurazione
 #               della convergenza su TUTTO il cluster (master + read-only),
 #               e pulizia automatica del dataset di test.
+#
+# SIMULAZIONE WAN: accesa come PRIMO task del "block" con
+# simulate_wan_mpls_ipsec.yml (-e stato=enabled) e spenta SEMPRE nell'"always"
+# (-e stato=disabled); in entrambi i casi lo stato REALE su tc/iptables dei 4
+# nodi viene verificato con assert_wan_state.yml. Ctrl-C non esegue l'"always":
+# in quel caso spegnere la WAN a mano.
+#
+# CHECK MODE: NON usare --check (orchestra un altro ansible-playbook, kill -9,
+# restart di slapd: nulla di questo e' simulabile).
+#
+# VERSIONE:     8.1
+# CHANGELOG:
+#   8.1 - 2026-10-26 - WAN: l'accensione era FUORI dal block/always - se
+#                      falliva a meta' (es. un nodo irraggiungibile) la
+#                      disattivazione nell'"always" non partiva e la WAN
+#                      restava accesa sui nodi gia' configurati: spostata
+#                      dentro il block. Inventory del test passato
+#                      esplicitamente al playbook WAN annidato (senza "-i"
+#                      usava quello di default: con -i su un altro ambiente
+#                      la WAN finiva sul cluster sbagliato senza errori).
+#                      Verifica dello stato REALE della WAN dopo accensione e
+#                      spegnimento (assert_wan_state.yml): un playbook WAN che
+#                      non trova host esce con rc=0, ed e' gia' successo che il
+#                      test girasse a velocita' LAN credendo di essere sotto
+#                      WAN (v5.2). Disattivazione con failed_when: false + assert
+#                      finale sul rc; path WAN ancorati a playbook_dir.
+#
 # VERSIONE:     8.0 (node1/node2/node3/node4 non sono piu' hostname
 #               scritti a mano in "vars:" - derivati dai gruppi REALI
 #               dell'inventory, "groups['cluster'] | sort" e
@@ -527,23 +554,43 @@
     ldap_basedn: "dc=example,dc=com"
     ldap_admin_dn: "cn=admin,dc=example,dc=com"
     ldap_admin_pass: "openldap"
-    wan_simulation_playbook: "../../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml"
+    # Simulazione WAN: playbook dedicato + task file di verifica dello stato
+    # reale. playbook_dir esplicito: il path non dipende da dove si lancia.
+    wan_simulation_playbook: "{{ playbook_dir }}/../../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml"
+    wan_assert_tasks: "{{ playbook_dir }}/../../stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml"
+    # Inventory del test passato esplicitamente al playbook WAN annidato:
+    # senza "-i" userebbe l'inventory di default anche se questo test e'
+    # stato lanciato con -i su un altro ambiente (24.04/26.04).
+    wan_inventory: "{{ ansible_inventory_sources | join(',') }}"
 
   tasks:
-    # ==========================================================================
-    # PRE: ABILITAZIONE SIMULAZIONE WAN MPLS+IPSec SU TUTTO IL CLUSTER
-    # Il test deve girare sotto WAN simulata (50ms latenza, jitter, 0.1%
-    # perdita pacchetti sul traffico LDAP), non a velocita' LAN piena -
-    # richiama simulate_wan_mpls_ipsec.yml direttamente, come documentato.
-    # ==========================================================================
-
-    - name: "[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)"
-      ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=enabled"
-      register: wan_enable_result
-      changed_when: true
-
     - name: "Blocco principale del crash test (disattivazione WAN garantita in 'always' anche in caso di errore in una qualunque fase)"
       block:
+
+        # ==========================================================================
+        # PRE: ABILITAZIONE SIMULAZIONE WAN MPLS+IPSec SU TUTTO IL CLUSTER
+        # Il test deve girare sotto WAN simulata (25ms one-way = ~50ms RTT,
+        # jitter, 0.1% perdita pacchetti sul traffico LDAP), non a velocita'
+        # LAN piena. DENTRO il block (fino alla v8.0 era fuori): se fallisce a
+        # meta', l'"always" spegne comunque la WAN sui nodi gia' configurati.
+        # ==========================================================================
+
+        - name: "[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)"
+          ansible.builtin.command:
+            argv:
+              - ansible-playbook
+              - -i
+              - "{{ wan_inventory }}"
+              - "{{ wan_simulation_playbook }}"
+              - -e
+              - stato=enabled
+          changed_when: true
+
+        - name: "[PRE] Verifica che la simulazione WAN sia REALMENTE attiva sui 4 nodi (rc=0 del playbook WAN non basta)"
+          ansible.builtin.include_tasks: "{{ wan_assert_tasks }}"
+          vars:
+            wan_expected_state: "enabled"
+            wan_verify_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}", "{{ node4 }}"]
 
         # ==========================================================================
         # FASE 1: SCRITTURA AD ALTA FREQUENZA SU NODO 1 (DELEGATA SU NODE1)
@@ -1077,6 +1124,34 @@
             msg: "{{ cleanup_convergence.stdout_lines }}"
 
       always:
+        # failed_when: false + assert in fondo: l'esito vero si verifica sullo
+        # stato reale dei nodi (assert_wan_state.yml) e sul rc, cosi' un
+        # errore qui non resta nascosto ma nemmeno blocca la verifica.
         - name: "[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)"
-          ansible.builtin.command: "ansible-playbook {{ wan_simulation_playbook }} -e stato=disabled"
+          ansible.builtin.command:
+            argv:
+              - ansible-playbook
+              - -i
+              - "{{ wan_inventory }}"
+              - "{{ wan_simulation_playbook }}"
+              - -e
+              - stato=disabled
+          register: wan_disable
           changed_when: true
+          failed_when: false
+
+        - name: "[POST] Verifica che la simulazione WAN sia REALMENTE rimossa dai 4 nodi"
+          ansible.builtin.include_tasks: "{{ wan_assert_tasks }}"
+          vars:
+            wan_expected_state: "disabled"
+            wan_verify_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}", "{{ node4 }}"]
+
+        - name: "[POST] Blocca se il playbook di disattivazione WAN e' terminato con errore"
+          ansible.builtin.assert:
+            that:
+              - wan_disable.rc == 0
+            fail_msg: >-
+              ERRORE: simulate_wan_mpls_ipsec.yml -e stato=disabled e' uscito
+              con rc={{ wan_disable.rc }} - ultime righe:
+              {{ (wan_disable.stdout_lines | default([]))[-8:] | join(' | ') }}
+            quiet: true

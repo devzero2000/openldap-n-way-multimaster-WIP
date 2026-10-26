@@ -1,0 +1,113 @@
+# ==============================================================================
+# TITOLO:       assert_wan_state.yml
+# AUTORE:       Elia Pinto
+# DATA:         26 Ottobre 2026
+# SCOPO:        Task file (da includere con ansible.builtin.include_tasks, NON
+#               un playbook) che verifica lo stato REALE della simulazione WAN
+#               sui nodi indicati, leggendo direttamente tc e iptables mangle -
+#               senza fidarsi del solo codice di uscita di
+#               simulate_wan_mpls_ipsec.yml.
+#
+# PERCHE' SERVE: simulate_wan_mpls_ipsec.yml gira su "hosts: ldap_all". Se
+# l'inventory che riceve non contiene quel gruppo, oppure non e' lo stesso
+# inventory del test (chiamata annidata senza "-i"), esce con rc=0 senza aver
+# toccato nessuno dei nodi del test (verificato con ansible-core 2.20.1: un
+# pattern "hosts" senza corrispondenze da' rc=0). Il test girerebbe allora a
+# velocita' LAN credendo di essere sotto WAN - errore gia' successo, vedi il
+# changelog v5.2 di test_crash_cascading_node.yml. Qui i nodi arrivano dal
+# test stesso (node1..node4, derivati dal SUO inventory), quindi la verifica
+# non dipende dal gruppo usato dal playbook WAN.
+#
+# VARIABILI IN INGRESSO:
+#   wan_expected_state  (obbligatoria) "enabled" | "disabled"
+#   wan_verify_nodes    (obbligatoria) lista dei nodi da verificare
+#   wan_iface           (default eth1) - deve coincidere con "iface" di
+#                       simulate_wan_mpls_ipsec.yml
+#   wan_mark_id         (default 10)   - deve coincidere con "mark_id" di
+#                       simulate_wan_mpls_ipsec.yml
+#
+# Si verificano la qdisc netem (latenza/jitter/perdita) e le due regole MARK
+# sulla 636 (dport e sport): la qdisc senza le regole MARK non shapa nulla (il
+# traffico finisce nella classe di default 1:1, non modellata), le regole
+# senza la qdisc nemmeno - servono entrambe.
+#
+# CHECK MODE: il task di lettura ha check_mode: false (sola lettura), ma i test
+# che includono questo file NON vanno lanciati con --check: in check mode la
+# chiamata annidata a simulate_wan_mpls_ipsec.yml viene saltata e la verifica
+# "enabled" fallisce, correttamente.
+#
+# VERSIONE:     1.0
+# CHANGELOG:
+#   1.0 - 2026-10-26 - prima versione: verifica diretta su tc/iptables dello
+#                      stato WAN dopo enable/disable, condivisa dai tre test
+#                      in test/ (prima nessun test controllava che la WAN
+#                      fosse davvero attiva, ne' davvero rimossa a fine test).
+# ==============================================================================
+
+---
+- name: "[WAN] Controlla i parametri passati alla verifica dello stato WAN"
+  ansible.builtin.assert:
+    that:
+      - wan_expected_state is defined
+      - wan_expected_state in ['enabled', 'disabled']
+      - wan_verify_nodes is defined
+      - wan_verify_nodes | length > 0
+    fail_msg: >-
+      ERRORE: assert_wan_state.yml richiede wan_expected_state
+      ('enabled'/'disabled') e una lista wan_verify_nodes non vuota -
+      errore nel playbook chiamante, non nel cluster.
+    quiet: true
+
+- name: "[WAN] Rileva lo stato reale della simulazione WAN (qdisc netem e regole mangle 636) sui nodi"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      # Nessuna pipe "tc ... | grep -q": con pipefail, grep -q che esce al
+      # primo match puo' far terminare tc con SIGPIPE e rendere falso un
+      # esito vero. Si legge l'output intero e lo si confronta con "case".
+      # Se tc fallisce (es. interfaccia inesistente) il task fallisce: uno
+      # stato "disabled" dedotto da un output vuoto sarebbe un falso OK.
+      QDISC=$(tc qdisc show dev {{ wan_iface | default('eth1') }}) || { echo "TC_ERROR"; exit 1; }
+      case "$QDISC" in
+        *netem*) echo "TC_NETEM=1" ;;
+        *) echo "TC_NETEM=0" ;;
+      esac
+      for FLAG in dport sport; do
+        if iptables -t mangle -C POSTROUTING -o {{ wan_iface | default('eth1') }} -p tcp --$FLAG 636 \
+             -j MARK --set-mark {{ wan_mark_id | default('10') }} 2>/dev/null; then
+          echo "MANGLE_${FLAG^^}_636=1"
+        else
+          echo "MANGLE_${FLAG^^}_636=0"
+        fi
+      done
+    executable: /bin/bash
+  loop: "{{ wan_verify_nodes }}"
+  register: wan_state
+  changed_when: false
+  check_mode: false
+  delegate_to: "{{ item }}"
+  become: true
+
+- name: "[WAN] Blocca se lo stato reale della simulazione WAN non e' quello atteso su un nodo"
+  ansible.builtin.assert:
+    that:
+      - ("TC_NETEM=" + wan_flag) in wan_state.results[item].stdout_lines
+      - ("MANGLE_DPORT_636=" + wan_flag) in wan_state.results[item].stdout_lines
+      - ("MANGLE_SPORT_636=" + wan_flag) in wan_state.results[item].stdout_lines
+    fail_msg: >-
+      ERRORE: su {{ wan_state.results[item].item }} la simulazione WAN NON
+      risulta '{{ wan_expected_state }}' come atteso (rilevato:
+      {{ wan_state.results[item].stdout_lines | join(' ') }}).
+      Se atteso 'enabled': controllare che l'inventory passato al test
+      contenga il gruppo 'ldap_all' (senza, simulate_wan_mpls_ipsec.yml
+      esce con rc=0 senza toccare alcun host) e che l'interfaccia sia
+      {{ wan_iface | default('eth1') }} - il test girerebbe altrimenti a
+      velocita' LAN. Se atteso 'disabled': la WAN e' rimasta attiva -
+      rilanciare a mano simulate_wan_mpls_ipsec.yml -e stato=disabled
+      prima di qualunque altro test, che misurerebbe tempi falsati.
+    success_msg: "OK: simulazione WAN '{{ wan_expected_state }}' su {{ wan_state.results[item].item }}."
+  vars:
+    wan_flag: "{{ (wan_expected_state == 'enabled') | ternary('1', '0') }}"
+  loop: "{{ range(wan_state.results | length) | list }}"
+  loop_control:
+    label: "{{ wan_state.results[item].item }}"

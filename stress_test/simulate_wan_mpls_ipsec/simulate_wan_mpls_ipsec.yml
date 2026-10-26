@@ -2,7 +2,15 @@
 # TITOLO:       Simulazione di Rete WAN MPLS + IPSec via Ansible
 # AUTORE:       Elia Pinto
 # DATA:         Luglio 2026
-# VERSIONE:     3.0 (review)
+# VERSIONE:     3.1
+# CHANGELOG:
+#   3.1 - 2026-10-26 - assert iniziale sul valore di {{ stato }}: un refuso
+#                      (es. "-e stato=disable_d") eseguiva solo il BLOCCO 1
+#                      di cleanup e terminava con rc=0, senza segnalare che
+#                      la WAN non era stata ne' accesa ne' spenta come
+#                      richiesto. Lo stato reale dopo enable/disable viene ora
+#                      verificato dai test con assert_wan_state.yml.
+#   3.0 - Luglio 2026 - review (vedi NOVITÀ v3.0 sotto).
 # SCOPO:        Configurare a livello di Kernel Linux (Traffic Control + Iptables)
 #               una simulazione di latenza, jitter e cap di banda per emulare
 #               un link geografico MPLS protetto da IPSec sulle porte LDAP.
@@ -89,6 +97,16 @@
       - { chain: "POSTROUTING", iface_flag: "-o", port_flag: "--sport", port: "636" }
 
   tasks:
+
+    - name: "[PRE] Verifica che il valore di 'stato' sia uno di quelli supportati"
+      ansible.builtin.assert:
+        that:
+          - stato in ['enable', 'enabled', 'disable', 'disabled']
+        fail_msg: >-
+          ERRORE: stato='{{ stato }}' non valido - usare -e stato=enabled
+          oppure -e stato=disabled. Con un valore diverso il playbook
+          eseguirebbe solo il cleanup, senza attivare ne' confermare nulla.
+        quiet: true
 
     # ==========================================================================
     # BLOCCO 1: CLEANUP COMPLETO E IDEMPOTENTE — SEMPRE ESEGUITO, SENZA TAG.
