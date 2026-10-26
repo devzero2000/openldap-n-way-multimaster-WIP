@@ -76,8 +76,21 @@
 # fallimento a meta' non deve lasciare il cluster permanentemente
 # partizionato.
 #
-# VERSIONE:     1.4
+# VERSIONE:     1.5
 # CHANGELOG:
+#   1.5 - 2026-10-26 - FASE 11: esito del cleanup ora verificato con un
+#                      assert (prima failed_when: false e nessun assert:
+#                      residui dopo la cancellazione finivano con failed=0).
+#                      count_on() di FASE 2 e FASE 11 con retry e sentinella
+#                      -1: senza controllo dell'esito di SSH, una connessione
+#                      fallita dava "0" da grep -c, cioe' un falso "cleanup
+#                      riuscito" in FASE 11. Regole di partizione inserite in
+#                      TESTA alle catene (action: insert) invece che accodate,
+#                      cosi' precedono eventuali ACCEPT gia' presenti (oggi le
+#                      catene sono vuote, ma un ufw o simile le renderebbe
+#                      inefficaci); nuova diagnostica di FASE 4 che mostra la
+#                      posizione delle regole su ogni master prima della prova
+#                      dei leg.
 #   1.4 - 2026-10-26 - FASE 1: pre-flight sullo scarto degli orologi fra i 4
 #                      nodi (assert_clock_skew.yml, soglia 50ms): l'ipotesi
 #                      del vincitore in FASE 7 si basa sull'ordine dei CSN, e
@@ -279,11 +292,27 @@
             cmd: |
               set -u
               set -o pipefail
+              # Retry e sentinella -1: senza controllare l'esito di SSH, una
+              # connessione fallita darebbe "0" da grep -c, indistinguibile da
+              # "zero entry" (in FASE 11 sarebbe un falso cleanup riuscito).
               count_on() {
                 local host="$1"
-                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
-                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null \
-                  | grep -c "^dn: "
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
               }
               START=$(date +%s)
               TIMEOUT=60
@@ -328,6 +357,9 @@
             destination: "{{ (item.chain == 'OUTPUT') | ternary(item.peer, omit) }}"
             jump: DROP
             comment: "netsplit-test-partition"
+            # In testa alla catena: deve precedere eventuali ACCEPT gia'
+            # presenti, altrimenti il DROP non verrebbe mai raggiunto.
+            action: insert
           loop:
             - { chain: "INPUT", peer: "{{ node2 }}" }
             - { chain: "INPUT", peer: "{{ node3 }}" }
@@ -347,6 +379,7 @@
             destination: "{{ (item.chain == 'OUTPUT') | ternary(node1, omit) }}"
             jump: DROP
             comment: "netsplit-test-partition"
+            action: insert
           loop:
             - { host: "{{ node2 }}", chain: "INPUT" }
             - { host: "{{ node2 }}", chain: "OUTPUT" }
@@ -368,6 +401,32 @@
         # leg diretto testato bloccato - un falso positivo che invaliderebbe tutto
         # il resto del test senza che ce ne accorgessimo. Percio' si verificano
         # TUTTI e quattro i leg, non solo uno.
+        - name: "[FASE 4] Diagnostica: posizione delle regole di partizione nelle catene INPUT/OUTPUT di ogni master"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              for CHAIN in INPUT OUTPUT; do
+                echo "== $CHAIN"
+                iptables -L "$CHAIN" -n --line-numbers
+              done
+            executable: /bin/bash
+          loop:
+            - "{{ node1 }}"
+            - "{{ node2 }}"
+            - "{{ node3 }}"
+          register: partition_rules
+          changed_when: false
+          check_mode: false
+          delegate_to: "{{ item }}"
+          become: true
+
+        - name: "[FASE 4] Report della posizione delle regole (le DROP netsplit-test-partition devono precedere ogni ACCEPT)"
+          ansible.builtin.debug:
+            msg: "{{ [item.item ~ ':'] + item.stdout_lines }}"
+          loop: "{{ partition_rules.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
         - name: "[FASE 4] Verifica TUTTI i leg della partizione (entrambe le direzioni, entrambi i peer) - non solo un verso"
           delegate_to: "{{ item.from }}"
           ansible.builtin.shell: "timeout 3 bash -c 'echo > /dev/tcp/{{ item.to }}/{{ partition_ldap_port }}' 2>/dev/null; echo $?"
@@ -708,10 +767,27 @@
             cmd: |
               set -u
               set -o pipefail
+              # Retry e sentinella -1: senza controllare l'esito di SSH, una
+              # connessione fallita darebbe "0" da grep -c, indistinguibile da
+              # "zero entry" (in FASE 11 sarebbe un falso cleanup riuscito).
               count_on() {
-                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$1" \
-                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null \
-                  | grep -c "^dn: "
+                local host="$1"
+                local attempt=0
+                local max_attempts=3
+                local result rc
+                while [ $attempt -lt $max_attempts ]; do
+                  attempt=$((attempt + 1))
+                  result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=netsplit-conflict-test)' 2>/dev/null" 2>/dev/null)
+                  rc=$?
+                  if [ $rc -eq 0 ]; then
+                    echo "$result" | grep -c "^dn: "
+                    return 0
+                  fi
+                  sleep 0.3
+                done
+                echo "-1"
+                return 1
               }
               START=$(date +%s)
               TIMEOUT=60
@@ -736,6 +812,16 @@
         - name: "[FASE 11] Report pulizia finale"
           ansible.builtin.debug:
             msg: "{{ cleanup_convergence.stdout_lines }}"
+
+        - name: "[FASE 11] Blocca se l'entry di test non e' sparita da tutti i nodi"
+          ansible.builtin.assert:
+            that:
+              - "'CLEANUP_CONVERGENCE_OK' in cleanup_convergence.stdout"
+            fail_msg: >-
+              ERRORE: l'entry cn=netsplit-conflict-test resta su almeno un nodo
+              dopo la cancellazione (-1 = conteggio non riuscito via SSH) - vedi
+              il report sopra. Il prossimo run la rimuove comunque in FASE 2.
+            success_msg: "{{ cleanup_convergence.stdout_lines | last }}"
 
       always:
         # PRIMO task dell'always, e con failed_when: false: un task "always"

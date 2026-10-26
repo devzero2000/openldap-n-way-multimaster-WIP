@@ -1,11 +1,11 @@
 # Test: Partizione di Rete (Netsplit) e Riconciliazione Deterministica dei Conflitti
 
 **File playbook:** `test_network_partition_conflict_resolution.yml`
-**Versione playbook:** 1.3
+**Versione playbook:** 1.5
 **Autore:** Elia Pinto
-**Data:** 24 settembre 2026
-**Data ultima esecuzione registrata:** 24 settembre 2026
-**Esito ultima esecuzione:** ✅ Superato (`ok=38 changed=9 unreachable=0 failed=0`)
+**Data:** 24 settembre 2026 (ultimo aggiornamento: 26 ottobre 2026)
+**Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 26.04, sotto WAN simulata)
+**Esito ultima esecuzione:** ✅ Superato (`ok=56 changed=11 unreachable=0 failed=0`)
 
 ---
 
@@ -52,8 +52,22 @@ Il test copre tre proprietà distinte, verificate in sequenza:
 - Cluster N-Way Multi-Master su 3 nodi attivi (`node1`, `node2`, `node3`)
   più 1 nodo read-only (`node4`), identificati dalle variabili di
   inventory.
+- **WAN simulata attiva per tutto il test** (dalla v1.3): la partizione si
+  applica sopra la WAN, non a velocità LAN. La WAN viene accesa come primo
+  passo del `block` (`simulate_wan_mpls_ipsec.yml -e stato=enabled`, con
+  l'inventory del test passato via `-i`) e spenta **sempre** come primo task
+  dell'`always`. In entrambi i casi lo stato reale (qdisc `netem` e regole
+  mangle sulla 636) viene verificato su tutti e 4 i nodi con
+  `assert_wan_state.yml`: il solo `rc=0` del playbook WAN non basta, perché
+  senza il gruppo `ldap_all` nell'inventory esce con successo senza toccare
+  alcun host. WAN (tabella `mangle`, marcatura + `tc`) e partizione (tabella
+  `filter`, DROP su tcp/636) sono indipendenti fra loro.
 - Controllo pre-volo esplicito (Fase 1): il test si rifiuta di partire se
   anche uno solo dei tre master non risulta già `active` su systemd.
+- **Orologi dei nodi allineati** (Fase 1, dalla v1.4): lo scarto massimo
+  fra i 4 nodi deve essere ≤ 50 ms (`test/assert_clock_skew.yml`). L'ipotesi
+  sul vincitore (Fase 7) si basa sull'ordine dei CSN, che contengono l'ora
+  del master che scrive: vedi la nota sugli orologi in §3.
 - **La partizione è volutamente scoped alla sola porta LDAPS (636)**, l'unica
   attiva in produzione secondo `SLAPD_SERVICES="ldapi:/// ldaps:///"`),
   anziché a tutto il traffico IP fra i nodi. Motivo pratico: nell'ambiente
@@ -67,7 +81,12 @@ Il test copre tre proprietà distinte, verificate in sequenza:
   SSH/management restano sempre raggiungibili dal nodo di controllo.
 - Le regole `iptables` di partizione sono simmetriche su tutti e tre i nodi
   coinvolti (non solo un firewall unilaterale su `node1`), per simulare un
-  link realmente caduto.
+  link realmente caduto, e dalla v1.5 sono inserite **in testa** alle catene
+  (`action: insert`): devono precedere eventuali regole ACCEPT già presenti,
+  altrimenti il DROP non verrebbe mai raggiunto.
+- I conteggi via `slapcat` su SSH (Fasi 2 e 11) hanno retry e restituiscono
+  `-1` se la connessione fallisce, mai `0`: fino alla v1.4 una connessione
+  fallita dava `0`, che in Fase 11 equivaleva a "cleanup riuscito".
 - Le regole di partizione vengono rimosse **sempre**, in un blocco
   `always`, anche in caso di fallimento in una qualunque fase — un
   fallimento a metà non deve lasciare il cluster permanentemente
@@ -91,7 +110,9 @@ Il test copre tre proprietà distinte, verificate in sequenza:
 3. **Prova che la partizione è realmente attiva** (Fase 4): verifica di
    connettività TCP grezza (`/dev/tcp/.../636`) su **tutti e quattro i leg**
    rilevanti — `node2→node1`, `node3→node1`, `node1→node2`, `node1→node3` —
-   non solo uno. In una mesh N-Way, un singolo leg rimasto aperto potrebbe
+   non solo uno. Prima della prova, una diagnostica stampa le catene
+   `INPUT`/`OUTPUT` di ogni master con i numeri di riga, per vedere dove sono
+   finite le regole di partizione. In una mesh N-Way, un singolo leg rimasto aperto potrebbe
    far da ponte indiretto fra i due master isolati passando per il terzo
    nodo, invalidando silenziosamente il resto del test.
 4. **Scritture in conflitto** (Fase 5): `node1` (isolato) scrive
@@ -121,7 +142,14 @@ Il test copre tre proprietà distinte, verificate in sequenza:
    esattamente.
 10. **Cleanup finale** (Fase 11): cancellazione dell'entry di test e attesa
     (polling reale) della convergenza a 0 record residui su tutto il
-    cluster.
+    cluster. Dalla v1.5 l'esito è verificato con un `assert` (prima un
+    residuo finiva comunque con `failed=0`).
+11. **Chiusura garantita** (`always`): spegnimento della WAN, rimozione di
+    tutte le regole di partizione su `node1`/`node2`/`node3` (`state: absent`,
+    nessun effetto se già rimosse in Fase 9), verifica dello stato reale
+    della WAN. Un'interruzione con Ctrl-C non esegue l'`always`: in quel caso
+    rimuovere a mano partizione e WAN. Il playbook non va lanciato con
+    `--check`.
 
 ### Nota sulla dipendenza dagli orologi
 
@@ -134,7 +162,19 @@ una rottura della replica ma un disallineamento fra gli orologi di sistema
 dei nodi coinvolti — per questo il report include anche l'orario di sistema
 letto su entrambi i lati al momento della scrittura.
 
-## 4. Risultati ottenuti (esecuzione del 24 settembre 2026)
+Dalla v1.4 lo sfasamento si esclude **prima** di partire, invece di
+indagarlo a posteriori: il pre-volo di Fase 1 misura lo scarto fra gli
+orologi dei 4 nodi e si ferma oltre 50 ms. Il 26 ottobre 2026 sulle VM 26.04
+gli orologi oscillavano di ~4,5s per un conflitto fra VMware Tools e chrony,
+e nello Scenario B di `test_concurrent_multimaster_write.yml` questo ha
+prodotto una divergenza permanente (analisi completa nella §5 di
+`description_test_concurrent_multimaster_write.md`). Qui le due scritture in
+conflitto sono a ~0,5s l'una dall'altra (`node1` prima, `node2` dopo): con
+secondi di scarto il vincitore poteva invertirsi rispetto all'ordine reale.
+
+## 4. Risultati ottenuti
+
+### 4.1 Esecuzione del 24 settembre 2026 (ambiente ubuntu 24.04, playbook v1.2, WAN non attivata dal test)
 
 | Fase | Esito |
 |---|---|
@@ -151,7 +191,7 @@ letto su entrambi i lati al momento della scrittura.
 
 **Play recap:** `ok=38 changed=9 unreachable=0 failed=0 skipped=0 rescued=0 ignored=0` — nessun task fallito, nessuna assertion violata.
 
-### Lettura dei risultati
+#### Lettura dei risultati del 24 settembre
 
 - La partizione, scoped alla sola porta di replica LDAPS, si è dimostrata
   **completa su tutti e quattro i leg testati**: nessun percorso indiretto
@@ -176,6 +216,28 @@ letto su entrambi i lati al momento della scrittura.
   modifiche accumulato durante un'interruzione di rete reale, non solo una
   sovrapposizione temporale fra scritture.
 
+### 4.2 Esecuzione del 26 ottobre 2026 (ambiente ubuntu 26.04, playbook v1.5, sotto WAN simulata)
+
+| Fase | Esito |
+|---|---|
+| WAN accesa e verificata su tutti e 4 i nodi | ✅ |
+| Pre-volo sui 3 master | ✅ tutti `active` |
+| Scarto fra gli orologi | ✅ 0,9 ms (soglia 50 ms) |
+| Baseline propagata prima della partizione | ✅ |
+| Regole di partizione | ✅ inserite in testa (righe 1–2 di `INPUT`/`OUTPUT`) su `node1`, `node2`, `node3` |
+| Verifica di tutti e 4 i leg | ✅ tutti e quattro bloccati |
+| Continuità operativa sul nodo isolato | ✅ scrittura locale su `node1` riuscita (`rc=0`) |
+| Divergenza durante la partizione | ✅ `node1` = valore isolato; `node2`/`node3`/`node4` = valore raggiungibile |
+| CSN catturati a partizione attiva | `node1`: `…114942.231274Z#…#001`, `node2`: `…114942.751329Z#…#002` (stessa ora di sistema sui due lati) |
+| Vincitore previsto | `written-during-partition-by-node2-reachable` |
+| Convergenza dopo la guarigione | ✅ **3 secondi** |
+| Vincitore previsto = vincitore effettivo | ✅ **IPOTESI CONFERMATA** |
+| Cleanup finale | ✅ 0 residui su tutti e 4 i nodi in 1s |
+| WAN spenta e verificata; 0 regole di partizione residue | ✅ |
+
+La riconciliazione resta deterministica anche sotto WAN simulata: stessi
+esiti del 24 settembre, con convergenza in 3s invece di 4s.
+
 ## 5. Conclusioni
 
 Il cluster N-Way Multi-Master gestisce correttamente non solo i conflitti
@@ -196,5 +258,8 @@ la finestra di isolamento (tutti i nodi, incluso quello isolato, già
 allineati sul valore dell'altro lato), riconducibile a un leg della
 partizione non verificato esplicitamente. Il playbook è stato quindi esteso
 per verificare tutti e quattro i leg rilevanti prima di procedere — la
-versione qui documentata (1.3) è quella con la verifica completa, ed è
-quella che ha prodotto l'esecuzione riportata in §4.
+versione 1.2 è quella con la verifica completa e ha prodotto l'esecuzione
+del 24 settembre (§4.1; le prime stesure di questo documento la indicavano
+come 1.3); la 1.5 ha prodotto quella del 26 ottobre (§4.2). Fino alla 1.2 il
+test non attivava la WAN: se un altro test l'aveva lasciata accesa, girava
+sotto WAN senza saperlo.
