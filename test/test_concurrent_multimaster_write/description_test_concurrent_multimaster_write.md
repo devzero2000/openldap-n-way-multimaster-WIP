@@ -1,7 +1,7 @@
 # Test: Scritture Concorrenti da Più Master sotto Carico WAN
 
 **File playbook:** `test_concurrent_multimaster_write.yml`
-**Versione playbook:** 1.3
+**Versione playbook:** 1.4
 **Autore:** Elia Pinto
 **Data:** 22 settembre 2026 (ultimo aggiornamento: 26 ottobre 2026)
 **Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 26.04)
@@ -131,6 +131,21 @@ Cancellazione di tutte le entry di test di entrambi gli scenari via
 cancellazione a 0 record residui su tutti i 4 nodi — cluster restituito
 pulito indipendentemente dall'esito del test.
 
+### Esito finale (Fase 7, dalla v1.4)
+
+Tre `assert` bloccanti, **dopo** il cleanup:
+
+- Scenario A convergente su tutti e 4 i nodi (`SCENARIO_A_CONVERGENCE_OK`);
+- Scenario B coerente su tutti e 4 i nodi (`CONFLICT_RESOLUTION_CONSISTENT`);
+- cancellazione conversa a 0 residui (`CLEANUP_CONVERGENCE_OK`).
+
+Fino alla v1.3 lo Scenario A e il cleanup non avevano alcun `assert` (un
+timeout finiva comunque con `failed=0`), e l'`assert` dello Scenario B stava
+in Fase 5: uno split-brain fermava il test **prima** del cleanup e lasciava
+le 400 entry `concurrent.*` sul cluster, come è successo il 26 ottobre (§4.2).
+Ora il cluster viene ripulito comunque; i valori per nodo restano nei report
+delle fasi 3, 5 e 6.
+
 ## 4. Risultati ottenuti
 
 ### 4.1 Esecuzione del 24 settembre 2026 (ambiente ubuntu 24.04, playbook v1.0)
@@ -192,6 +207,17 @@ apertura):
 | 6 | 0,7 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 1s | `failed=0` |
 
 In tutti i run la WAN è stata spenta e verificata (4/4 nodi) a fine test.
+
+**Run con la v1.4 (esito verificato in Fase 7) — ✅ `ok=51 changed=14
+failed=0`:** scarto orologi 0,6 ms, Scenario A 400/400 in 1s, Scenario B
+`written-by-master-b` su tutti i nodi in 1s, cleanup a 0 residui in 4s, WAN
+spenta e verificata. Il run è durato ~33 minuti invece di ~2 perché **tutte e
+4 le VM si sono fermate insieme** durante la Fase 6 (journal vuoto su ogni
+nodo fra le 12:04 e le 12:34, poi `Clock change detected` simultaneo alla
+ripresa: sospensione dell'host o pausa delle VM in VMware). Il test ha
+ripreso e concluso normalmente; la sincronizzazione una tantum di VMware Tools
+alla ripresa, lasciata attiva apposta, ha riallineato gli orologi (scarto
+0,6 ms dopo la ripresa).
 I 6 run coprono circa 10 minuti: dimostrano la stabilità degli orologi nel
 breve periodo, non per ore o dopo una sospensione delle VM — per questo il
 controllo dello scarto resta come pre-volo a ogni esecuzione.

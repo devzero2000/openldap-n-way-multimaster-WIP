@@ -74,8 +74,18 @@
 # CHECK MODE: NON usare --check: il playbook orchestra un altro
 # ansible-playbook (WAN, tc/iptables) che in check mode verrebbe saltato.
 #
-# VERSIONE:     1.3
+# VERSIONE:     1.4
 # CHANGELOG:
+#   1.4 - 2026-10-26 - Esito finale VERIFICATO in una nuova FASE 7, dopo il
+#                      cleanup: lo Scenario A (convergenza delle 400 entry) e
+#                      il cleanup di FASE 6 avevano failed_when: false e nessun
+#                      assert, quindi un SCENARIO_A_TIMEOUT o residui dopo la
+#                      cancellazione finivano comunque con failed=0. L'assert
+#                      dello Scenario B e' spostato dalla FASE 5 alla FASE 7:
+#                      prima un split-brain fermava il test PRIMA del cleanup e
+#                      lasciava le 400 entry concurrent.* sul cluster (successo
+#                      il 26/10). Ora il cluster viene ripulito comunque; i
+#                      valori per nodo restano nei report delle fasi 3/5/6.
 #   1.3 - 2026-10-26 - FASE 1: pre-flight sullo scarto degli orologi fra i 4
 #                      nodi (assert_clock_skew.yml, soglia 50ms). Lo Scenario
 #                      B e' fallito con un falso split-brain: VMware Tools e
@@ -705,18 +715,6 @@
                    + conflict_resolution.stdout_lines +
                    ['========================================================================'] }}"
 
-        - name: "[FASE 5 - SCENARIO B] Blocca se i nodi non concordano sul valore finale (split-brain genuino, da indagare manualmente)"
-          ansible.builtin.assert:
-            that:
-              - "'CONFLICT_RESOLUTION_CONSISTENT' in conflict_resolution.stdout"
-            fail_msg: >-
-              ERRORE: i quattro nodi NON concordano sul valore finale
-              dell'attributo in conflitto - vedi il report sopra per i
-              valori esatti su ciascun nodo. Questo e' un caso di
-              inconsistenza persistente (split-brain), da indagare
-              manualmente prima di considerare il cluster affidabile
-              sotto scritture concorrenti sullo stesso DN.
-
         # ==========================================================================
         # FASE 6: CLEANUP FINALE
         # ==========================================================================
@@ -846,6 +844,54 @@
         - name: "[FASE 6] Report pulizia finale"
           ansible.builtin.debug:
             msg: "{{ cleanup_convergence.stdout_lines }}"
+
+        # ==========================================================================
+        # FASE 7: ESITO FINALE
+        # Gli assert stanno DOPO il cleanup di FASE 6: cosi' il cluster resta
+        # pulito anche quando il test fallisce (i valori per nodo restano nei
+        # report delle fasi 3, 5 e 6). Fino alla v1.3 Scenario A e cleanup non
+        # avevano alcun assert, e quello dello Scenario B fermava il test prima
+        # del cleanup lasciando le 400 entry concurrent.* sul cluster.
+        # ==========================================================================
+
+        - name: "[FASE 7] Blocca se le scritture indipendenti dello Scenario A non sono converse su tutti i nodi"
+          ansible.builtin.assert:
+            that:
+              - "'SCENARIO_A_CONVERGENCE_OK' in scenario_a_metric.stdout"
+            fail_msg: >-
+              ERRORE: le {{ (writes_per_node | int) * 2 }} entry concurrent.*
+              non risultano su tutti e 4 i nodi entro il timeout - vedi le righe
+              SCENARIO_A_PROGRESS/SCENARIO_A_TIMEOUT nel report di FASE 3.
+              Conteggi in crescita fino alla fine = solo lento; un nodo fermo
+              con entry mancanti = il buco silenzioso di replica gia' noto
+              (ITS#10604), da indagare prima del test.
+            success_msg: "{{ scenario_a_metric.stdout_lines | select('match', '^SCENARIO_A_CONVERGENCE_OK') | list | first | default('OK') }}"
+
+        - name: "[FASE 7] Blocca se i nodi non concordano sul valore finale dello Scenario B (split-brain genuino, da indagare manualmente)"
+          ansible.builtin.assert:
+            that:
+              - "'CONFLICT_RESOLUTION_CONSISTENT' in conflict_resolution.stdout"
+            fail_msg: >-
+              ERRORE: i quattro nodi NON concordano sul valore finale
+              dell'attributo in conflitto - vedi il report di FASE 5 per i
+              valori esatti su ciascun nodo. Questo e' un caso di
+              inconsistenza persistente (split-brain), da indagare
+              manualmente prima di considerare il cluster affidabile
+              sotto scritture concorrenti sullo stesso DN. Con gli orologi
+              allineati (pre-volo di FASE 1 superato) non e' un effetto dello
+              sfasamento: cercare i CSN delle due modifiche nel journal di
+              slapd su ogni nodo.
+            success_msg: "{{ conflict_resolution.stdout_lines | last }}"
+
+        - name: "[FASE 7] Blocca se la cancellazione delle entry di test non e' conversa a 0 su tutti i nodi"
+          ansible.builtin.assert:
+            that:
+              - "'CLEANUP_CONVERGENCE_OK' in cleanup_convergence.stdout"
+            fail_msg: >-
+              ERRORE: dopo la FASE 6 restano entry di test su almeno un nodo -
+              vedi le righe CLEANUP_PROGRESS e il riepilogo di ldapdelete. Il
+              prossimo run le rimuove comunque in FASE 2.
+            success_msg: "{{ cleanup_convergence.stdout_lines | last }}"
 
       always:
         # PRIMO task dell'always, e con failed_when: false: un task "always"
