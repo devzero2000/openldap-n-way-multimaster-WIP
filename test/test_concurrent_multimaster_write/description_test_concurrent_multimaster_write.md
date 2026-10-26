@@ -1,11 +1,11 @@
 # Test: Scritture Concorrenti da Più Master sotto Carico WAN
 
 **File playbook:** `test_concurrent_multimaster_write.yml`
-**Versione playbook:** 1.0
+**Versione playbook:** 1.3
 **Autore:** Elia Pinto
-**Data:** 22 settembre 2026
-**Data ultima esecuzione registrata:** 24 settembre 2026
-**Esito ultima esecuzione:** ✅ Superato al primo tentativo (`ok=30 changed=11 unreachable=0 failed=0`)
+**Data:** 22 settembre 2026 (ultimo aggiornamento: 26 ottobre 2026)
+**Data ultima esecuzione registrata:** 26 ottobre 2026 (ambiente ubuntu 26.04)
+**Esito ultima esecuzione:** ✅ 6 run consecutivi superati (`ok=49 changed=14 unreachable=0 failed=0`), dopo un primo run fallito per orologi dei nodi sfasati — vedi §4 e §5
 
 ---
 
@@ -44,11 +44,26 @@ secondo fenomeno (saturazione di un singolo provider) già isolato altrove.
   (abilitata in `[PRE]`, disabilitata sempre in un blocco `always`, anche in
   caso di fallimento di una qualunque fase): il test misura la convergenza
   sotto la stessa banda/latenza/perdita degradate previste in produzione fra
-  i siti, non a velocità di laboratorio.
+  i siti, non a velocità di laboratorio. Dalla v1.1:
+  - il playbook WAN annidato riceve l'**inventory del test** (`-i`), così la
+    WAN viene accesa sul cluster giusto anche lanciando il test con `-i` su
+    un altro ambiente;
+  - dopo l'accensione e dopo lo spegnimento lo **stato reale** (qdisc
+    `netem` e regole mangle sulla 636) viene verificato su tutti e 4 i nodi
+    con `stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml`. Il solo
+    `rc=0` del playbook WAN non basta: se l'inventory non contiene il gruppo
+    `ldap_all` esce con successo senza toccare nessun host, e il test
+    girerebbe a velocità LAN senza accorgersene;
+  - lo spegnimento è il primo task dell'`always`: un host irraggiungibile in
+    un task `always` interrompe i task successivi.
 - Controllo pre-volo esplicito (Fase 1): il test si rifiuta di partire se
   anche uno solo dei tre master non risulta già `active` su systemd,
   distinguendo un guasto residuo di un run precedente da un problema
   effettivamente causato da questo test.
+- **Orologi dei nodi allineati** (Fase 1, dalla v1.3): lo scarto massimo fra
+  gli orologi dei 4 nodi deve essere ≤ `max_clock_skew_ms` (default 50 ms),
+  misurato con `test/assert_clock_skew.yml`. È una **precondizione** dello
+  Scenario B, non un dettaglio: il motivo è spiegato in §5.
 - Tutte le scritture/letture di verifica passano da `ldaps://127.0.0.1:636`
   con `LDAPTLS_REQCERT=never` (certificato locale non in catena di fiducia
   del client) o da `slapcat` via SSH con utente privilegiato (`become: true`
@@ -61,6 +76,12 @@ secondo fenomeno (saturazione di un singolo provider) già isolato altrove.
 
 ### Scenario A — Scritture concorrenti su DN indipendenti
 
+0. (dalla v1.2) Cancellazione dei residui `concurrent.*` di un run precedente
+   interrotto e attesa che il conteggio sia 0 su tutti e 4 i nodi. Senza
+   questo passo, dopo un run fermato in Fase 5 (la Fase 6 di cleanup non
+   parte) restano 400 entry sul cluster: al run successivo `ldapadd -c`
+   salterebbe in silenzio quelle già presenti e il conteggio tornerebbe
+   comunque 400 = target — Scenario A passerebbe senza aver scritto nulla.
 1. `node2` e `node3` avviano ciascuno, **in background** (`nohup`, PID
    tracciato su file), un'iniezione di `writes_per_node = 200` entry
    (`inetOrgPerson`) su un namespace proprio e distinto (`concurrent.a.*` da
@@ -90,15 +111,17 @@ della concorrenza fra master, non un effetto collaterale di saturazione.
    `ldapmodify` sullo stesso DN e lo stesso attributo `description`, con
    valori diversi e riconoscibili (`written-by-master-a` da `node2`,
    `written-by-master-b` da `node3`).
-4. Il playbook attende il completamento di entrambe le modifiche, poi
-   applica un margine fisso di 10s per lasciare propagare l'esito del
-   conflitto (margine ritenuto ampio a questa scala, dato che il crash test
-   correlato aveva già osservato convergenze dell'ordine di 1s su centinaia
-   di entry).
-5. Legge, in un'unica passata, il valore finale dell'attributo su tutti e 4
-   i nodi e verifica che sia **identico ovunque** (non necessariamente quale
-   dei due valori "vince": conta solo che tutti i nodi concordino sullo
-   stesso esito).
+4. Il playbook attende il completamento di entrambe le modifiche, poi fa
+   **polling** (timeout 60s, progresso ogni 10s) del valore dell'attributo
+   su tutti e 4 i nodi via `slapcat`. Nella v1.0 c'era invece un margine
+   fisso di 10s seguito da una lettura unica: sotto WAN simulata 10s non
+   sono garantiti sufficienti.
+5. Verifica che il valore finale sia **identico ovunque**. Il test non
+   verifica *quale* dei due valori vinca, ma solo che tutti i nodi
+   concordino: con orologi allineati vince la scrittura con il CSN più alto,
+   cioè quella avvenuta per ultima (in pratica `written-by-master-b`, perché
+   `node3` viene avviato per secondo). Se i nodi non concordano entro 60s il
+   test fallisce con `CONFLICT_RESOLUTION_SPLIT_BRAIN`.
 
 ### Cleanup finale (Fase 6)
 
@@ -108,7 +131,9 @@ Cancellazione di tutte le entry di test di entrambi gli scenari via
 cancellazione a 0 record residui su tutti i 4 nodi — cluster restituito
 pulito indipendentemente dall'esito del test.
 
-## 4. Risultati ottenuti (esecuzione del 24 settembre 2026)
+## 4. Risultati ottenuti
+
+### 4.1 Esecuzione del 24 settembre 2026 (ambiente ubuntu 24.04, playbook v1.0)
 
 | Fase | Esito |
 |---|---|
@@ -121,7 +146,7 @@ pulito indipendentemente dall'esito del test.
 
 **Play recap:** `ok=30 changed=11 unreachable=0 failed=0 skipped=0 rescued=0 ignored=0` — nessun task fallito, nessuna assertion violata.
 
-### Lettura dei risultati
+#### Lettura dei risultati del 24 settembre
 
 - **Scenario A**: le 400 scritture concorrenti provenienti da due master
   diversi hanno raggiunto la convergenza su tutto il cluster (3 master + 1
@@ -137,16 +162,182 @@ pulito indipendentemente dall'esito del test.
   campagna (es. il crash test a cascata) che avevano richiesto più iterazioni
   di debug prima di stabilizzarsi.
 
-## 5. Conclusioni
+### 4.2 Esecuzioni del 26 ottobre 2026 (ambiente ubuntu 26.04)
+
+**Primo run (playbook v1.1) — ❌ fallito in Scenario B.**
+
+| Fase | Esito |
+|---|---|
+| WAN accesa e verificata su tutti e 4 i nodi | ✅ |
+| Scenario A — 400 entry combinate | ✅ 1 secondo |
+| Scenario B — risoluzione del conflitto | ❌ dopo 60s `node1`, `node2`, `node4` = `written-by-master-a`, `node3` = `written-by-master-b` (`CONFLICT_RESOLUTION_SPLIT_BRAIN`) |
+| WAN spenta e verificata (`always`) | ✅ |
+
+Il run ha lasciato sul cluster le 400 entry `concurrent.*` (la Fase 6 non è
+partita), rimosse a mano: da qui il passo 0 dello Scenario A (v1.2).
+La causa del fallimento non era la replica in sé ma gli **orologi dei nodi
+sfasati di secondi**: analisi completa in §5.
+
+**Dopo la correzione degli orologi (playbook v1.3) — ✅ 6 run consecutivi
+superati**, ciascuno ripartito da un cluster pulito (0 residui trovati in
+apertura):
+
+| Run | Scarto orologi | Scenario A | Scenario B | Cleanup | Play recap |
+|---|---|---|---|---|---|
+| 1 | 0,8 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 2s | `failed=0` |
+| 2 | 1,2 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 1s | `failed=0` |
+| 3 | 0,3 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 1s | `failed=0` |
+| 4 | 1,2 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 1s | `failed=0` |
+| 5 | 1,4 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 1s | `failed=0` |
+| 6 | 0,7 ms | ✅ 1s | ✅ tutti `written-by-master-b` in 1s | ✅ 1s | `failed=0` |
+
+In tutti i run la WAN è stata spenta e verificata (4/4 nodi) a fine test.
+I 6 run coprono circa 10 minuti: dimostrano la stabilità degli orologi nel
+breve periodo, non per ore o dopo una sospensione delle VM — per questo il
+controllo dello scarto resta come pre-volo a ogni esecuzione.
+
+## 5. Dipendenza dagli orologi dei nodi (perché lo Scenario B può fallire)
+
+### 5.1 Come si risolve un conflitto
+
+Il multi-master di OpenLDAP non ha un ordinatore centrale. Ogni modifica
+riceve un **CSN** (Change Sequence Number) nel formato
+`AAAAMMGGhhmmss.uuuuuuZ#contatore#serverID#mod`, cioè contiene **l'orario
+UTC del master che scrive**. Fra due modifiche della stessa entry vince il
+CSN più alto (confronto lessicografico). L'ordine "giusto" delle scritture
+è quindi definito dagli orologi dei master: per questo il multi-master
+richiede orologi sincronizzati via NTP.
+
+### 5.2 Cosa succede con orologi sfasati
+
+Uno scarto fra i master può produrre due effetti diversi:
+
+1. **Vince la scrittura "sbagliata", ma il cluster resta coerente.** Una
+   modifica avvenuta dopo nel tempo reale perde perché il suo master ha
+   l'orologio indietro. È un esito inatteso dal punto di vista del
+   significato, ma tutti i nodi concordano: lo Scenario B **passa** (verifica
+   la coerenza, non il vincitore).
+2. **Divergenza permanente.** Succede con un intreccio preciso:
+   - un master riceve da un altro master una modifica con un CSN "nel
+     futuro" rispetto al proprio orologio e la applica;
+   - subito dopo esegue una scrittura **locale** sulla stessa entry, e le
+     assegna un CSN **più basso** di quello appena applicato;
+   - lui tiene il proprio valore (per lui è l'ultima modifica arrivata);
+     gli altri lo scartano come più vecchio (`CSN too old, ignoring`);
+   - nessuno ripara la differenza: ciascuno risulta già aggiornato rispetto
+     all'altro (il `contextCSN` di ogni nodo include già il CSN dell'altro).
+     La divergenza resta finché non arriva un'altra modifica su quell'entry
+     o non si fa un refresh completo.
+
+Il caso 2 richiede uno scarto **maggiore dell'intervallo fra le due scritture
+in conflitto**. Nello Scenario B le due `ldapmodify` partono una dopo l'altra
+a pochi decimi di secondo di distanza: con secondi di scarto l'intreccio è
+probabile, con l'1–2 ms misurato dopo la correzione richiederebbe due
+scritture a meno di 1–2 ms l'una dall'altra. La soglia del pre-volo (50 ms)
+sta molto sopra l'errore di misura (pochi ms) e molto sotto lo sfasamento che
+ha rotto il test.
+
+**È normale che il test fallisca con secondi di scarto?** Sì: il test ha
+rilevato un'incoerenza **reale** del cluster, non un falso allarme. In
+produzione, con lo stesso sfasamento, la stessa sequenza produrrebbe dati
+diversi sui master, senza alcun errore nei log. Uno scarto di secondi fra
+server sincronizzati con NTP non è però normale: è già di per sé un guasto
+d'ambiente.
+
+### 5.3 Il caso del 26 ottobre 2026: evidenze
+
+Dal journal di slapd su `node3` (ora locale CET = UTC+1; i CSN sono in UTC):
+
+```
+11:13:08 syncrepl_entry: rid=002 LDAP_RES_SEARCH_ENTRY(LDAP_SYNC_MODIFY) csn=20261026101309.475770Z#000000#002#000000
+11:13:08 syncrepl_entry: rid=002 be_modify cn=concurrent-conflict-test,... (0)
+11:13:08 conn=1005 op=1 MOD dn="cn=concurrent-conflict-test,ou=People,dc=example,dc=com"
+11:13:08 slap_get_csn: conn=1005 op=1 generated new csn=20261026101308.918410Z#000000#003#000000
+```
+
+1. `node3` riceve da `node2` la modifica `written-by-master-a` con CSN
+   `…101309.475770Z#…#002`: secondo l'orologio di `node3` è nel futuro (le
+   sue 11:13:08 < 10:13:09 UTC di `node2`). La applica.
+2. Subito dopo esegue la propria `ldapmodify` (`written-by-master-b`) e le
+   assegna `…101308.918410Z#…#003`, **più basso** di quello appena applicato.
+3. `node1`, `node2`, `node4` scartano la modifica di `node3` come più vecchia
+   e restano su `written-by-master-a`; `node3` resta su `written-by-master-b`.
+
+Quindi l'orologio di `node2` era avanti rispetto a quello di `node3` di
+**almeno 0,56s** in quel momento.
+
+### 5.4 Causa dello sfasamento
+
+Sulle 4 VM due servizi correggevano l'orologio verso riferimenti diversi:
+
+| Elemento | Stato osservato |
+|---|---|
+| Sincronizzazione periodica di VMware Tools (`vmware-toolbox-cmd timesync status`) | `Enabled`: riallinea l'orologio della VM a quello dell'host, ~4,5s avanti rispetto all'NTP |
+| chrony | attivo, sincronizza con i server NTP Ubuntu: ogni ~65s `System clock wrong by -4.5 … -5.1 seconds` |
+| Frequenze stimate da chrony | 417, 1775, 749, 100028 ppm (un orologio sano sta sotto ~50 ppm) |
+| Tick del kernel su `node4` | 9000 invece di 10000: orologio rallentato del 10%, mascherato dal riallineamento periodico |
+
+Ogni VM oscillava con tempi propri, quindi in un istante qualsiasi due nodi
+potevano differire di secondi.
+
+**Correzione applicata** (26 ottobre 2026, VM 26.04):
+- sincronizzazione periodica di VMware Tools disattivata
+  (`vmware-toolbox-cmd timesync disable`) e, per le nuove VM, nei Vagrantfile
+  (`v.vmx["tools.syncTime"] = "FALSE"`); le sincronizzazioni una tantum
+  (resume/snapshot) restano attive;
+- frequenza e tick del kernel azzerati (`adjtimex`), file di drift di chrony
+  rimosso, chrony riavviato: disattivare VMware Tools da solo non bastava,
+  gli orologi derivavano fino a -5s al minuto per le frequenze falsate;
+- risultato: scarto fra i nodi stabile a 0,3–1,4 ms.
+
+Da fare ancora: la stessa correzione sulle VM ubuntu 24.04; l'orologio
+dell'host VMware resta ~4,5s avanti rispetto all'NTP.
+
+### 5.5 Perché il 24 settembre il test passava
+
+Il run riuscito del 24 settembre è sull'**ambiente ubuntu 24.04** (altre VM,
+altri orologi) e ha visto vincere `written-by-master-b` su tutti i nodi,
+cioè l'ordine dei CSN coincideva con l'ordine reale. Con VMware Tools e
+chrony in conflitto l'esito dipende dal momento:
+
+- **lo scarto oscillava**: in certi istanti quello fra `node2` e `node3`
+  era quasi zero;
+- **conta il verso**: si rompe solo se il master che scrive *per secondo*
+  ha l'orologio *indietro*; nel verso opposto i CSN restano ordinati e il
+  test passa.
+
+Non ci sono misure degli orologi del 24.04 di allora: è un'ipotesi coerente
+con quanto osservato, non una prova. Resta comunque un problema
+d'ambiente (VMware + chrony), non della logica del test.
+
+### 5.6 Come leggere un fallimento dello Scenario B oggi
+
+- **Fallisce il pre-volo sugli orologi** (`CLOCK_SKEW_TOO_HIGH`): problema
+  d'ambiente. Controllare `chronyc tracking` su ogni nodo e che
+  `vmware-toolbox-cmd timesync status` sia `Disabled`.
+- **Il pre-volo passa ma lo Scenario B fallisce**: con orologi allineati è un
+  **problema genuino di replica**, da indagare con il journal di slapd
+  (`sync` è nel loglevel) cercando il CSN delle due modifiche su ogni nodo.
+- Il pre-volo è una fotografia all'inizio del test: uno sfasamento che
+  compare durante il test non viene rilevato.
+
+## 6. Conclusioni
 
 Il cluster N-Way Multi-Master, nella configurazione hardened attualmente in
 esercizio, gestisce correttamente sia le scritture concorrenti su dati
 indipendenti sia i conflitti reali sullo stesso attributo/DN provenienti da
 master diversi, anche sotto le condizioni di rete degradate della WAN
-simulata. Non è stato osservato alcun caso di scrittura persa, duplicata, o
-di inconsistenza persistente fra i nodi (split-brain). Il test conferma,
-nell'ambito dei volumi testati (200 scritture per master, 400 combinate),
-l'affidabilità del meccanismo di replica sotto concorrenza reale fra master.
+simulata, **a condizione che gli orologi dei master siano sincronizzati**.
+Con orologi allineati (scarto ≤ 1,4 ms, 6 run del 26 ottobre) non è stato
+osservato alcun caso di scrittura persa, duplicata, o di inconsistenza
+persistente fra i nodi; lo stesso vale per il run del 24 settembre, per il
+quale però non ci sono misure degli orologi. Con orologi sfasati di
+secondi, invece, un conflitto sullo stesso attributo può lasciare i master
+**permanentemente divergenti** senza alcun errore nei log (§5): la
+sincronizzazione NTP dei master è un requisito di correttezza del cluster,
+non un dettaglio operativo. Il test conferma, nell'ambito dei volumi testati
+(200 scritture per master, 400 combinate), l'affidabilità del meccanismo di
+replica sotto concorrenza reale fra master.
 
 **Nota per estensioni future**: il file rileva esplicitamente che il numero
 di scritture è stato scelto deliberatamente basso per non sovrapporre
