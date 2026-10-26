@@ -96,8 +96,13 @@ EOF
         apt-get autoclean -y
 
         timedatectl set-timezone Europe/Rome
+        # Su 26.04 il servizio NTP e' chrony (systemd-timesyncd non e'
+        # installato: il vecchio "systemctl restart systemd-timesyncd",
+        # ereditato dal Vagrantfile 24.04, falliva con "Unit not found").
+        # timedatectl set-ntp abilita chrony tramite
+        # /usr/lib/systemd/ntp-units.d/50-chrony.list.
         timedatectl set-ntp true
-        systemctl restart systemd-timesyncd
+        systemctl restart chrony
         
         echo "vagrant ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-vagrant
         chmod 440 /etc/sudoers.d/90-vagrant
