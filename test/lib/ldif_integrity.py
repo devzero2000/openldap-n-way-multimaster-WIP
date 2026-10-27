@@ -250,9 +250,9 @@ def main():
         return 2
 
     if excludes:
-        for node in dumps:
-            kept = {k: v for k, v in dumps[node].items() if not any(rx.search(k) for rx in excludes)}
-            print(f"EXCLUDED {node}: {len(dumps[node]) - len(kept)} entry ({', '.join(args.exclude_dn)})")
+        for node, entries in list(dumps.items()):
+            kept = {k: v for k, v in entries.items() if not any(rx.search(k) for rx in excludes)}
+            print(f"EXCLUDED {node}: {len(entries) - len(kept)} entry ({', '.join(args.exclude_dn)})")
             dumps[node] = kept
     ignore = {a.lower() for a in args.ignore_attr}
     ref_node = args.dump[0].partition("=")[0]
