@@ -1,0 +1,154 @@
+# ==============================================================================
+# TITOLO:       assert_data_integrity.yml
+# AUTORE:       Elia Pinto
+# DATA:         27 Ottobre 2026
+# SCOPO:        Task file (da includere con ansible.builtin.include_tasks, NON
+#               un playbook) che verifica che il CONTENUTO del DIT sia identico
+#               su tutti i nodi indicati e, opzionalmente, che member/memberOf
+#               siano coerenti nel namespace del test chiamante. Attende con
+#               polling che la condizione si verifichi (la replica puo' essere
+#               ancora in corso) e la dichiara fallita solo allo scadere del
+#               timeout.
+#
+# PERCHE' SERVE: i test esistenti misurano la convergenza contando le entry di
+# un namespace. Un conteggio uguale non dice che i dati siano uguali: un
+# attributo non replicato, un member rimasto solo su un nodo, un entryUUID
+# diverso passano inosservati. Qui si confronta ogni entry, attributo per
+# attributo (lib/ldif_integrity.py), su un dump slapcat di ogni nodo.
+#
+# COME LEGGE I DATI: slapcat via SSH (convenzione del repo): niente protocollo
+# LDAP, niente size limit, niente porta 636 degradata dalla WAN o tagliata da
+# una partizione. Un SSH fallito non produce un dump vuoto scambiato per "zero
+# entry": il giro viene scartato e ripetuto.
+#
+# ATTRIBUTI IGNORATI (integrity_ignore_attrs): contextCSN, che syncprov scrive
+# su disco solo ai checkpoint (olcSpCheckpoint) e che quindi differisce fra i
+# nodi anche a cluster fermo e allineato (verificato il 2026-10-27).
+#
+# DIFFERENZE NOTE (integrity_known_differences): sulla replica read-only
+# l'entry radice del suffisso ha entryUUID, entryCSN e timestamp diversi da
+# quelli dei master (creata localmente al deploy, mai sostituita dalla
+# replica perche' il suo entryCSN e' piu' recente). E' un difetto reale del
+# deploy, fuori dallo scopo dei test di resilienza: non blocca, ma viene
+# stampata a ogni run come KNOWN_DIFF per restare visibile.
+#
+# VARIABILI IN INGRESSO:
+#   integrity_nodes              (obbligatoria) nodi da confrontare; il primo
+#                                e' il riferimento
+#   integrity_member_scope       (default '') regex sul DN in minuscolo per il
+#                                controllo member/memberOf; vuota = nessun
+#                                controllo. Va limitata al namespace del test:
+#                                nel DIT base cn=administrators ha come member
+#                                il rootDN, che non ha entry (pendente voluto)
+#   integrity_timeout            (default 120) secondi di polling
+#   integrity_assert             (default true) false = registra solo il
+#                                risultato in "integrity_check" e lascia
+#                                l'assert al chiamante (es. dopo il cleanup)
+#   integrity_label              (default '') contesto per i messaggi
+#   integrity_ignore_attrs, integrity_known_differences, integrity_basedn,
+#   integrity_lib                vedi i default sotto
+#
+# RISULTATO: variabile registrata "integrity_check" (stdout con i marcatori
+# INTEGRITY_OK / INTEGRITY_FAIL / INTEGRITY_TIMEOUT e i dettagli).
+#
+# VERSIONE:     1.0
+# CHANGELOG:
+#   1.0 - 2026-10-27 - prima versione.
+# ==============================================================================
+
+---
+- name: "[INTEGRITA'] Controlla i parametri passati alla verifica d'integrita'"
+  ansible.builtin.assert:
+    that:
+      - integrity_nodes is defined
+      - integrity_nodes | length > 1
+    fail_msg: >-
+      ERRORE: assert_data_integrity.yml richiede una lista integrity_nodes con
+      almeno due nodi - errore nel playbook chiamante, non nel cluster.
+    quiet: true
+
+- name: "[INTEGRITA'] Confronta il contenuto del DIT fra i nodi, con polling fino al timeout - puro shell"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      set -o pipefail
+      WORK=$(mktemp -d)
+      trap 'rm -rf "$WORK"' EXIT
+      NODES=({{ integrity_nodes | map('quote') | join(' ') }})
+      ARGS=({{ (_ignore_attrs | map('regex_replace', '^', '--ignore-attr=')
+               + _known_differences | map('regex_replace', '^', '--known='))
+               | map('quote') | join(' ') }})
+      {% if _member_scope | length > 0 %}
+      ARGS+=(--member-scope={{ _member_scope | quote }})
+      {% endif %}
+      START=$(date +%s)
+      TIMEOUT={{ _timeout | int }}
+      LAST_PROGRESS_LOG=0
+      while true; do
+        DUMPS=()
+        DUMP_OK=1
+        for n in "${NODES[@]}"; do
+          if ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$n" \
+              "sudo slapcat -b {{ _basedn | quote }}" > "$WORK/$n.ldif" 2>/dev/null; then
+            DUMPS+=(--dump "$n=$WORK/$n.ldif")
+          else
+            DUMP_OK=0
+            echo "slapcat non riuscito su $n" > "$WORK/last.txt"
+          fi
+        done
+        if [ "$DUMP_OK" -eq 1 ]; then
+          python3 -I {{ _lib | quote }} "${DUMPS[@]}" "${ARGS[@]}" > "$WORK/last.txt" 2>&1
+          RC=$?
+          if [ "$RC" -eq 0 ]; then
+            cat "$WORK/last.txt"
+            echo "INTEGRITY_ELAPSED: $(($(date +%s) - START))s"
+            exit 0
+          fi
+        fi
+        ELAPSED=$(($(date +%s) - START))
+        if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+          echo "INTEGRITY_PROGRESS: ${ELAPSED}s - $(grep -m1 -E 'INTEGRITY_|slapcat' "$WORK/last.txt")"
+          LAST_PROGRESS_LOG=$ELAPSED
+        fi
+        if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+          cat "$WORK/last.txt"
+          echo "INTEGRITY_TIMEOUT: nessun esito positivo entro ${TIMEOUT}s"
+          exit 1
+        fi
+        sleep 2
+      done
+    executable: /bin/bash
+  register: integrity_check
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  vars:
+    # Prefisso "_": i vars di un task interno prevalgono su quelli passati
+    # con include_tasks, quindi i default si applicano con | default() su
+    # nomi diversi, senza mai sovrascrivere i valori del chiamante.
+    _basedn: "{{ integrity_basedn | default('dc=example,dc=com') }}"
+    _lib: "{{ integrity_lib | default(playbook_dir ~ '/../lib/ldif_integrity.py') }}"
+    _member_scope: "{{ integrity_member_scope | default('') }}"
+    _timeout: "{{ integrity_timeout | default(120) }}"
+    _ignore_attrs: "{{ integrity_ignore_attrs | default(['contextCSN']) }}"
+    _known_differences: >-
+      {{ integrity_known_differences | default([_basedn
+         ~ '|entryUUID,entryCSN,createTimestamp,modifyTimestamp|'
+         ~ (groups['readonlyreplica'] | default([]) | join(','))]) }}
+
+- name: "[INTEGRITA'] Report del confronto fra i nodi"
+  ansible.builtin.debug:
+    msg: "{{ [integrity_label | default('')] + integrity_check.stdout_lines }}"
+
+- name: "[INTEGRITA'] Blocca se il contenuto del DIT diverge fra i nodi o le appartenenze sono incoerenti"
+  ansible.builtin.assert:
+    that:
+      - "'INTEGRITY_OK' in integrity_check.stdout"
+    fail_msg: >-
+      ERRORE{{ (' ' ~ integrity_label) if (integrity_label | default('')) else '' }}:
+      il contenuto del DIT non e' identico su tutti i nodi (o member/memberOf
+      sono incoerenti) entro il timeout - vedi il report sopra. VALUE_DIFF /
+      MISSING_ENTRY indicano dati non replicati o riconciliati in modo diverso;
+      DANGLING_MEMBER / ORPHAN_MEMBEROF indicano integrita' referenziale rotta.
+    success_msg: "{{ integrity_check.stdout_lines | select('match', '^INTEGRITY_') | list }}"
+  when: integrity_assert | default(true) | bool
