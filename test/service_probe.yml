@@ -1,0 +1,444 @@
+# ==============================================================================
+# TITOLO:       service_probe.yml
+# AUTORE:       Elia Pinto
+# DATA:         27 Ottobre 2026
+# SCOPO:        Task file (da includere con ansible.builtin.include_tasks, NON
+#               un playbook) che misura l'EROGAZIONE DEL SERVIZIO durante un
+#               test di resilienza: su ogni nodo gira in background una sonda
+#               (lib/service_probe.sh) che legge e, sui master, scrive sullo
+#               slapd locale; a fine test si calcolano disponibilita',
+#               interruzione massima e latenza per nodo, e si verifica che
+#               ogni scrittura confermata al client esista su TUTTI i nodi.
+#
+# PERCHE' SERVE: i test esistenti verificano lo stato finale (convergenza),
+# non cosa vede un client MENTRE avviene il guasto. Un cluster che converge
+# ma smette di rispondere su un nodo sano, o che conferma una scrittura e poi
+# la perde, fallisce lo scopo del servizio anche se lo stato finale e'
+# coerente.
+#
+# AZIONI (variabile probe_action), nell'ordine d'uso in un test:
+#   start  - ferma sonde residue, rimuove entry svcprobe.* residue (attende
+#            0 su tutti i nodi), copia script e password, avvia le sonde e
+#            verifica che scrivano davvero il log;
+#   stop   - ferma le sonde, raccoglie i log, calcola il report, attende con
+#            polling che tutte le scritture confermate siano presenti su tutti
+#            i nodi (durabilita'), cancella le entry svcprobe.* e attende 0.
+#            Registra "probe_report", "probe_durability", "probe_cleanup";
+#   assert - verifica i risultati di "stop" (da chiamare dopo il cleanup del
+#            test, come gli altri assert finali);
+#   kill   - solo arresto delle sonde e rimozione dei file sui nodi, per
+#            l'"always" del test. Idempotente, tollera nodi irraggiungibili.
+#
+# VARIABILI IN INGRESSO:
+#   probe_rw_nodes           (obbligatoria) master: lettura + scrittura
+#   probe_ro_nodes           (default []) repliche: solo lettura
+#   probe_impacted_nodes     (default []) nodi su cui il guasto e' VOLUTO:
+#                            la loro disponibilita' si riporta ma non si
+#                            verifica (in assert)
+#   probe_min_availability_pct (default 100) soglia per gli altri nodi
+#   probe_interval_s (1), probe_op_timeout_s (5), probe_durability_timeout
+#   (180), probe_cleanup_timeout (180), probe_basedn, probe_admin_dn,
+#   probe_admin_pass, probe_lib_dir: vedi i default nei task.
+#
+# PASSWORD: in un file 0600 sul nodo (ldap* -y), mai sulla riga di comando
+# della sonda (sarebbe visibile in ps per tutta la durata del test).
+#
+# CHECK MODE: non supportato (avvia processi e scrive sul cluster).
+#
+# VERSIONE:     1.0
+# CHANGELOG:
+#   1.0 - 2026-10-27 - prima versione.
+# ==============================================================================
+
+---
+- name: "[SONDA] Controlla i parametri della sonda di servizio"
+  ansible.builtin.assert:
+    that:
+      - probe_action | default('') in ['start', 'stop', 'assert', 'kill']
+      - probe_action == 'kill' or (probe_rw_nodes | default([]) | length > 0)
+    fail_msg: >-
+      ERRORE: service_probe.yml richiede probe_action (start|stop|assert|kill)
+      e, tranne che per kill, una lista probe_rw_nodes non vuota - errore nel
+      playbook chiamante, non nel cluster.
+    quiet: true
+
+- name: "[SONDA] Fissa l'identificativo del run e l'elenco dei nodi sondati"
+  ansible.builtin.set_fact:
+    probe_run_id: "{{ probe_run_id | default(lookup('ansible.builtin.pipe', 'date +%Y%m%d%H%M%S')) }}"
+    probe_all_nodes: >-
+      {{ (probe_rw_nodes | default([])) + (probe_ro_nodes | default([]))
+         if probe_action != 'kill' or probe_all_nodes is not defined
+         else probe_all_nodes }}
+  when: probe_action in ['start', 'kill']
+
+# ------------------------------------------------------------------------------
+# Arresto delle sonde: start (residui di un run interrotto), stop, kill
+# ------------------------------------------------------------------------------
+
+- name: "[SONDA] Ferma le sonde in esecuzione (file di stop, poi SIGTERM a chi resta)"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      DIR=/var/tmp/svcprobe
+      # Pattern ancorato all'inizio della riga di comando della sonda: senza
+      # "^", pgrep/pkill -f troverebbero anche la "bash -c" di Ansible che
+      # esegue questo task (la stringa e' nel suo stesso comando).
+      PAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'
+      [ -d "$DIR" ] || exit 0
+      for d in "$DIR"/run-*; do
+        [ -d "$d" ] && touch "$d/stop"
+      done
+      # Un giro della sonda dura al massimo intervallo + 2 operazioni in
+      # timeout: si attende quello, poi si termina chi e' ancora vivo.
+      END=$(( $(date +%s) + {{ (probe_interval_s | default(1) | float + 2 * (probe_op_timeout_s | default(5) | int) + 3) | int }} ))
+      while pgrep -u "$(id -u)" -f "$PAT" >/dev/null && [ "$(date +%s)" -lt "$END" ]; do
+        sleep 0.5
+      done
+      pkill -TERM -u "$(id -u)" -f "$PAT" || true
+      sleep 0.5
+      if pgrep -u "$(id -u)" -f "$PAT" >/dev/null; then
+        echo "SONDA ANCORA ATTIVA"
+        exit 1
+      fi
+      echo "SONDE FERME"
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes | default([]) }}"
+  register: probe_stop_result
+  changed_when: "'SONDE FERME' in probe_stop_result.stdout"
+  failed_when: probe_action != 'kill' and probe_stop_result.rc != 0
+  ignore_unreachable: "{{ probe_action == 'kill' }}"
+  when: probe_action in ['start', 'stop', 'kill']
+
+# ------------------------------------------------------------------------------
+# start: file sui nodi (servono anche alla pulizia dei residui)
+# ------------------------------------------------------------------------------
+
+- name: "[SONDA] Crea la directory del run sui nodi"
+  ansible.builtin.file:
+    path: "/var/tmp/svcprobe/run-{{ probe_run_id }}"
+    state: directory
+    mode: "0700"
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes }}"
+  when: probe_action == 'start'
+
+- name: "[SONDA] Copia lo script della sonda sui nodi"
+  ansible.builtin.copy:
+    src: "{{ probe_lib_dir | default(playbook_dir ~ '/../lib') }}/service_probe.sh"
+    dest: /var/tmp/svcprobe/service_probe.sh
+    mode: "0700"
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes }}"
+  when: probe_action == 'start'
+
+# Senza newline finale: ldap* -y usa l'INTERO contenuto del file come password.
+- name: "[SONDA] Scrive il file della password (0600) sui nodi"
+  ansible.builtin.copy:
+    content: "{{ probe_admin_pass | default('openldap') }}"
+    dest: "/var/tmp/svcprobe/run-{{ probe_run_id }}/pw"
+    mode: "0600"
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes }}"
+  no_log: true
+  when: probe_action == 'start'
+
+# ------------------------------------------------------------------------------
+# stop: raccolta log, report, durabilita'
+# ------------------------------------------------------------------------------
+
+- name: "[SONDA] Raccoglie i log, calcola il report e attende la durabilita' delle scritture confermate - puro shell"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      set -o pipefail
+      WORK=$(mktemp -d)
+      trap 'rm -rf "$WORK"' EXIT
+      LIB={{ probe_lib_dir | default(playbook_dir ~ '/../lib') | quote }}
+      RUN={{ probe_run_id | quote }}
+      LOGS=()
+      for n in {{ probe_all_nodes | map('quote') | join(' ') }}; do
+        if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" "cat /var/tmp/svcprobe/run-$RUN/probe.log" > "$WORK/$n.log"; then
+          echo "PROBE_ERROR: log della sonda non leggibile su $n"
+          exit 2
+        fi
+        LOGS+=(--log "$n=$WORK/$n.log")
+      done
+      python3 -I "$LIB/service_probe_report.py" report "${LOGS[@]}" --acked-out "$WORK/acked.txt" || exit 2
+
+      # Durabilita': ogni scrittura confermata deve comparire su TUTTI i nodi.
+      # Un SSH fallito scarta il giro (nessun elenco vuoto scambiato per
+      # "zero entry presenti").
+      START=$(date +%s)
+      TIMEOUT={{ probe_durability_timeout | default(180) | int }}
+      LAST_PROGRESS_LOG=0
+      while true; do
+        PRESENT=()
+        DUMP_OK=1
+        for n in {{ probe_all_nodes | map('quote') | join(' ') }}; do
+          if ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" \
+              "sudo slapcat -b {{ probe_basedn | default('dc=example,dc=com') | quote }} -a '(cn=svcprobe.$RUN.*)'" \
+              > "$WORK/$n.ldif" 2>/dev/null; then
+            sed -n 's/^dn: //p' "$WORK/$n.ldif" > "$WORK/$n.dns"
+            PRESENT+=(--present "$n=$WORK/$n.dns")
+          else
+            DUMP_OK=0
+          fi
+        done
+        if [ "$DUMP_OK" -eq 1 ]; then
+          python3 -I "$LIB/service_probe_report.py" durability --acked "$WORK/acked.txt" "${PRESENT[@]}" > "$WORK/dur.txt"
+          if [ $? -eq 0 ]; then
+            cat "$WORK/dur.txt"
+            echo "DURABILITY_ELAPSED: $(($(date +%s) - START))s"
+            exit 0
+          fi
+        fi
+        ELAPSED=$(($(date +%s) - START))
+        if [ $((ELAPSED - LAST_PROGRESS_LOG)) -ge 10 ]; then
+          echo "DURABILITY_PROGRESS: ${ELAPSED}s"
+          LAST_PROGRESS_LOG=$ELAPSED
+        fi
+        if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+          cat "$WORK/dur.txt" 2>/dev/null
+          echo "DURABILITY_TIMEOUT: scritture confermate ancora assenti dopo ${TIMEOUT}s"
+          exit 1
+        fi
+        sleep 2
+      done
+    executable: /bin/bash
+  # Registro interno + set_fact: un task SALTATO per "when" con register
+  # sovrascrive comunque la variabile (risultato "skipped"); con
+  # probe_action=assert il report di stop andrebbe perso.
+  register: _probe_report_raw
+  changed_when: false
+  failed_when: false
+  when: probe_action == 'stop'
+
+- name: "[SONDA] Conserva il report per l'assert finale"
+  ansible.builtin.set_fact:
+    probe_report: "{{ _probe_report_raw }}"
+  when: probe_action == 'stop'
+
+- name: "[SONDA] Report della sonda di servizio"
+  ansible.builtin.debug:
+    msg: "{{ probe_report.stdout_lines | reject('match', '^PROBE_JSON') | list }}"
+  when: probe_action == 'stop'
+
+# ------------------------------------------------------------------------------
+# start (residui) e stop: cancellazione delle entry svcprobe.* e attesa di 0
+# ------------------------------------------------------------------------------
+
+# Ogni master cancella le entry svcprobe.* che HA in locale: se una entry
+# fosse rimasta su un solo nodo (mai replicata), cancellarla da un solo master
+# non la toglierebbe. Le cancellazioni gia' arrivate via replica danno
+# "No such object" con -c: atteso e innocuo.
+- name: "[SONDA] Cancella le entry svcprobe.* e attende che spariscano da tutti i nodi - puro shell"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      set -o pipefail
+      BASE={{ probe_basedn | default('dc=example,dc=com') | quote }}
+      PW="/var/tmp/svcprobe/run-{{ probe_run_id }}/pw"
+      for n in {{ probe_rw_nodes | map('quote') | join(' ') }}; do
+        ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" \
+          "sudo slapcat -b $BASE -a '(cn=svcprobe.*)' 2>/dev/null | sed -n 's/^dn: //p' > /var/tmp/svcprobe/dns.txt;
+           [ -s /var/tmp/svcprobe/dns.txt ] || exit 0;
+           LDAPTLS_REQCERT=never ldapdelete -x -c -H ldaps://127.0.0.1:636 \
+             -D {{ probe_admin_dn | default('cn=admin,dc=example,dc=com') | quote }} -y $PW \
+             -f /var/tmp/svcprobe/dns.txt >/dev/null 2>&1; exit 0" || echo "CANCELLAZIONE NON ESEGUITA su $n"
+      done
+      # Retry e sentinella -1: un SSH fallito non deve sembrare "0 residui".
+      count_on() {
+        local out
+        if out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" "sudo slapcat -b $BASE -a '(cn=svcprobe.*)'" 2>/dev/null); then
+          printf '%s\n' "$out" | grep -c '^dn: '
+        else
+          echo "-1"
+        fi
+      }
+      START=$(date +%s)
+      TIMEOUT={{ probe_cleanup_timeout | default(180) | int }}
+      while true; do
+        STATUS=""
+        ALL_ZERO=1
+        for n in {{ probe_all_nodes | map('quote') | join(' ') }}; do
+          C=$(count_on "$n")
+          STATUS="$STATUS $n=$C"
+          [ "$C" = "0" ] || ALL_ZERO=0
+        done
+        if [ "$ALL_ZERO" -eq 1 ]; then
+          echo "PROBE_CLEANUP_OK: $(($(date +%s) - START))s (0 entry svcprobe.* su tutti i nodi)"
+          exit 0
+        fi
+        if [ $(($(date +%s) - START)) -ge "$TIMEOUT" ]; then
+          echo "PROBE_CLEANUP_TIMEOUT:$STATUS"
+          exit 1
+        fi
+        sleep 2
+      done
+    executable: /bin/bash
+  register: _probe_cleanup_raw
+  changed_when: true
+  failed_when: false
+  when: probe_action in ['start', 'stop']
+
+- name: "[SONDA] Conserva l'esito della cancellazione per gli assert"
+  ansible.builtin.set_fact:
+    probe_cleanup: "{{ _probe_cleanup_raw }}"
+  when: probe_action in ['start', 'stop']
+
+- name: "[SONDA] Blocca se i residui svcprobe.* di un run precedente non sono spariti prima di avviare la sonda"
+  ansible.builtin.assert:
+    that:
+      - "'PROBE_CLEANUP_OK' in probe_cleanup.stdout"
+    fail_msg: >-
+      ERRORE: entry svcprobe.* residue non rimosse da tutti i nodi prima di
+      avviare la sonda ({{ probe_cleanup.stdout_lines | last | default('') }};
+      -1 = conteggio non riuscito via SSH). Partire con residui renderebbe
+      ambigua la verifica di durabilita'.
+    success_msg: "{{ probe_cleanup.stdout_lines | last }}"
+  when: probe_action == 'start'
+
+# ------------------------------------------------------------------------------
+# start: avvio e verifica che le sonde scrivano davvero
+# ------------------------------------------------------------------------------
+
+# setsid + nohup + stdio rediretti: la sonda sopravvive alla chiusura della
+# sessione SSH di Ansible e non la tiene aperta. bash esplicito (non sh -c):
+# lo script usa costrutti bash.
+- name: "[SONDA] Avvia la sonda in background sui nodi"
+  ansible.builtin.shell:
+    cmd: >-
+      setsid nohup /bin/bash /var/tmp/svcprobe/service_probe.sh
+      {{ probe_run_id | quote }}
+      {{ (item in probe_rw_nodes) | ternary('rw', 'ro') }}
+      {{ probe_interval_s | default(1) | quote }}
+      {{ probe_op_timeout_s | default(5) | quote }}
+      {{ probe_basedn | default('dc=example,dc=com') | quote }}
+      {{ probe_admin_dn | default('cn=admin,dc=example,dc=com') | quote }}
+      /var/tmp/svcprobe/run-{{ probe_run_id }}/pw
+      /var/tmp/svcprobe/run-{{ probe_run_id }}/probe.log
+      {{ item.split('.')[0] | quote }}
+      > /dev/null 2>&1 < /dev/null &
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes }}"
+  changed_when: true
+  when: probe_action == 'start'
+
+- name: "[SONDA] Verifica che ogni sonda sia attiva e abbia gia' registrato operazioni riuscite"
+  ansible.builtin.shell:
+    cmd: |
+      set -u
+      LOG="/var/tmp/svcprobe/run-{{ probe_run_id }}/probe.log"
+      PAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'
+      for _ in $(seq 1 20); do
+        if pgrep -f "$PAT" >/dev/null && [ -s "$LOG" ] && awk '$4 == 0' "$LOG" | grep -q .; then
+          echo "SONDA_OK: $(wc -l < "$LOG") operazioni registrate"
+          exit 0
+        fi
+        sleep 0.5
+      done
+      echo "SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 "$LOG" 2>/dev/null | tr '\n' ' ')"
+      exit 1
+    executable: /bin/bash
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes }}"
+  register: probe_started
+  changed_when: false
+  failed_when: false
+  when: probe_action == 'start'
+
+- name: "[SONDA] Blocca se una sonda non e' partita (il test misurerebbe il servizio solo in parte)"
+  ansible.builtin.assert:
+    that:
+      - "'SONDA_OK' in item.stdout"
+    fail_msg: "ERRORE: sonda di servizio non attiva su {{ item.item }}: {{ item.stdout }}"
+    success_msg: "{{ item.item }}: {{ item.stdout }}"
+  loop: "{{ probe_started.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: probe_action == 'start'
+
+# ------------------------------------------------------------------------------
+# stop e kill: rimozione dei file della sonda (password compresa) dai nodi
+# ------------------------------------------------------------------------------
+
+- name: "[SONDA] Rimuove i file della sonda dai nodi (password compresa)"
+  ansible.builtin.file:
+    path: /var/tmp/svcprobe
+    state: absent
+  delegate_to: "{{ item }}"
+  loop: "{{ probe_all_nodes | default([]) }}"
+  failed_when: false
+  ignore_unreachable: true
+  when: probe_action in ['stop', 'kill']
+
+# ------------------------------------------------------------------------------
+# assert: esito (dopo il cleanup del test chiamante)
+# ------------------------------------------------------------------------------
+
+- name: "[SONDA] Estrae i numeri del report"
+  ansible.builtin.set_fact:
+    probe_summary: >-
+      {{ (probe_report.stdout_lines | select('match', '^PROBE_JSON ') | first | default('PROBE_JSON {}'))[11:] | from_json }}
+  when: probe_action == 'assert'
+
+- name: "[SONDA] Blocca se la sonda non ha prodotto un report completo"
+  ansible.builtin.assert:
+    that:
+      - probe_summary[item] is defined
+      - probe_summary[item]['R']['total'] | default(0) >= 3
+      - item not in probe_rw_nodes or (probe_summary[item]['W']['total'] | default(0) >= 3)
+    fail_msg: >-
+      ERRORE: report della sonda assente o incompleto per {{ item }} (servono
+      almeno 3 letture, e 3 scritture sui master) - senza dati il test non
+      dice nulla sull'erogazione del servizio.
+      {{ probe_report.stdout_lines | default([]) | select('match', '^PROBE_ERROR') | list }}
+    quiet: true
+  loop: "{{ probe_all_nodes }}"
+  when: probe_action == 'assert'
+
+- name: "[SONDA] Blocca se un nodo NON coinvolto dal guasto ha smesso di servire"
+  ansible.builtin.assert:
+    that:
+      - probe_summary[item[0]][item[1]]['availability_pct'] | float >= (probe_min_availability_pct | default(100) | float)
+    fail_msg: >-
+      ERRORE: su {{ item[0] }}, che il guasto non doveva toccare, la
+      {{ (item[1] == 'R') | ternary('lettura', 'scrittura') }} e' riuscita solo
+      nel {{ probe_summary[item[0]][item[1]]['availability_pct'] }}% dei casi
+      (soglia {{ probe_min_availability_pct | default(100) }}%; interruzione max
+      {{ probe_summary[item[0]][item[1]]['max_outage_s'] }}s). Il guasto si e'
+      propagato a un nodo sano.
+    success_msg: >-
+      OK: {{ item[0] }} {{ (item[1] == 'R') | ternary('lettura', 'scrittura') }}
+      {{ probe_summary[item[0]][item[1]]['availability_pct'] }}%
+  loop: >-
+    {{ (probe_all_nodes | difference(probe_impacted_nodes | default([]))) | product(['R', 'W']) | list }}
+  loop_control:
+    label: "{{ item[0] }} {{ item[1] }}"
+  when:
+    - probe_action == 'assert'
+    - item[1] in probe_summary[item[0]]
+
+- name: "[SONDA] Blocca se una scrittura confermata al client manca su un nodo (perdita di dati)"
+  ansible.builtin.assert:
+    that:
+      - "'DURABILITY_OK' in probe_report.stdout"
+    fail_msg: >-
+      ERRORE: almeno una scrittura confermata (rc=0) dalla sonda non e'
+      presente su tutti i nodi dopo {{ probe_durability_timeout | default(180) }}s -
+      {{ probe_report.stdout_lines | select('match', '^(DURABILITY|PROBE_ERROR)') | list }}
+    success_msg: "{{ probe_report.stdout_lines | select('match', '^DURABILITY_OK') | list }}"
+  when: probe_action == 'assert'
+
+- name: "[SONDA] Blocca se le entry della sonda non sono state rimosse da tutti i nodi"
+  ansible.builtin.assert:
+    that:
+      - "'PROBE_CLEANUP_OK' in probe_cleanup.stdout"
+    fail_msg: >-
+      ERRORE: entry svcprobe.* ancora presenti dopo il cleanup
+      ({{ probe_cleanup.stdout_lines | last | default('') }}; -1 = conteggio
+      non riuscito via SSH). Il prossimo run le rimuove comunque all'avvio.
+    success_msg: "{{ probe_cleanup.stdout_lines | last }}"
+  when: probe_action == 'assert'

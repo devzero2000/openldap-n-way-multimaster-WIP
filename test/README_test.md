@@ -116,3 +116,25 @@ questo controllo.
   `KNOWN_DIFF` per restare visibile.
 - Con `integrity_assert: false` registra solo il risultato
   (`integrity_check`), così il chiamante può fare l'assert dopo il cleanup.
+
+### `service_probe.yml` (+ `lib/service_probe.sh`, `lib/service_probe_report.py`)
+
+Misura l'**erogazione del servizio** durante il guasto, non solo lo stato
+finale. Su ogni nodo gira in background una sonda che a ogni giro (default
+1s) legge e, sui master, scrive sullo slapd **locale**: in uno scenario
+geografico i client stanno nel sito del proprio nodo, e la domanda è se ogni
+sito continua a servire. A fine test riporta per nodo disponibilità,
+interruzione massima e latenza, e verifica la **durabilità**: ogni scrittura
+confermata al client (rc=0) deve esistere su tutti i nodi.
+
+Si usa con `probe_action`:
+
+| Azione | Dove | Cosa fa |
+|---|---|---|
+| `start` | dopo pre-volo e WAN | rimuove residui `svcprobe.*`, avvia le sonde, verifica che registrino operazioni riuscite |
+| `stop` | dopo il ripristino | ferma le sonde, calcola il report, attende la durabilità, cancella le entry `svcprobe.*` |
+| `assert` | dopo il cleanup del test | i nodi non in `probe_impacted_nodes` devono restare a `probe_min_availability_pct` (default 100%); nessuna scrittura confermata persa; cleanup riuscito |
+| `kill` | nell'`always` | ferma le sonde e rimuove i file (password compresa); tollera nodi irraggiungibili |
+
+La password sta in un file 0600 sui nodi (`ldap* -y`), mai sulla riga di
+comando della sonda.
