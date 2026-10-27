@@ -38,8 +38,17 @@
 # incoerenza (dettagli su stdout); 2 = errore d'uso o di lettura dei dump.
 # Marcatori su stdout: INTEGRITY_OK / INTEGRITY_FAIL / INTEGRITY_ERROR.
 #
-# VERSIONE:     1.0
+# ESCLUSIONI (--exclude-dn REGEX, sul DN in minuscolo): entry non confrontate
+# ne' contate. Servono per i namespace che cambiano di continuo durante il
+# test (le entry della sonda di servizio): un'istantanea non li trova mai
+# identici su tutti i nodi, e la loro durabilita' e' verificata a parte.
+#
+# VERSIONE:     1.1
 # CHANGELOG:
+#   1.1 - 2026-10-27 - --exclude-dn: con la sonda di servizio attiva il
+#                      confronto non riusciva mai (entry svcprobe.* sempre in
+#                      volo fra i nodi al momento del dump): baseline di
+#                      test_partition_referential_integrity.yml in timeout.
 #   1.0 - 2026-10-27 - prima versione.
 # ==============================================================================
 
@@ -218,6 +227,8 @@ def main():
                         help="dump slapcat di un nodo; il primo e' il riferimento")
     parser.add_argument("--ignore-attr", action="append", default=[])
     parser.add_argument("--known", action="append", default=[])
+    parser.add_argument("--exclude-dn", action="append", default=[],
+                        help="regex sul DN (minuscolo) delle entry da non confrontare")
     parser.add_argument("--member-scope", default="",
                         help="regex sul DN (minuscolo); vuota = nessun controllo")
     parser.add_argument("--max-details", type=int, default=20)
@@ -233,10 +244,16 @@ def main():
             if not dumps[node]:
                 raise ValueError(f"{node}: dump vuoto ({path}) - slapcat non riuscito?")
         known = parse_known(args.known)
-    except (OSError, ValueError) as exc:
+        excludes = [re.compile(rx) for rx in args.exclude_dn]
+    except (OSError, ValueError, re.error) as exc:
         print(f"INTEGRITY_ERROR: {exc}")
         return 2
 
+    if excludes:
+        for node in dumps:
+            kept = {k: v for k, v in dumps[node].items() if not any(rx.search(k) for rx in excludes)}
+            print(f"EXCLUDED {node}: {len(dumps[node]) - len(kept)} entry ({', '.join(args.exclude_dn)})")
+            dumps[node] = kept
     ignore = {a.lower() for a in args.ignore_attr}
     ref_node = args.dump[0].partition("=")[0]
     for node, entries in dumps.items():

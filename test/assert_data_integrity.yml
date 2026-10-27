@@ -45,14 +45,23 @@
 #                                risultato in "integrity_check" e lascia
 #                                l'assert al chiamante (es. dopo il cleanup)
 #   integrity_label              (default '') contesto per i messaggi
+#   integrity_exclude_dn         (default ['^cn=svcprobe\.']) regex sul DN
+#                                delle entry da non confrontare: le entry
+#                                della sonda di servizio cambiano di continuo
+#                                mentre la sonda gira (la loro durabilita' la
+#                                verifica service_probe.yml)
 #   integrity_ignore_attrs, integrity_known_differences, integrity_basedn,
 #   integrity_lib                vedi i default sotto
 #
 # RISULTATO: variabile registrata "integrity_check" (stdout con i marcatori
 # INTEGRITY_OK / INTEGRITY_FAIL / INTEGRITY_TIMEOUT e i dettagli).
 #
-# VERSIONE:     1.0
+# VERSIONE:     1.1
 # CHANGELOG:
+#   1.1 - 2026-10-27 - integrity_exclude_dn, di default le entry svcprobe.*:
+#                      con la sonda di servizio attiva i nodi non risultavano
+#                      mai identici (scritture della sonda sempre in volo al
+#                      momento del dump) e la baseline andava in timeout.
 #   1.0 - 2026-10-27 - prima versione.
 # ==============================================================================
 
@@ -76,7 +85,8 @@
       trap 'rm -rf "$WORK"' EXIT
       NODES=({{ integrity_nodes | map('quote') | join(' ') }})
       ARGS=({{ (_ignore_attrs | map('regex_replace', '^', '--ignore-attr=')
-               + _known_differences | map('regex_replace', '^', '--known='))
+               + _known_differences | map('regex_replace', '^', '--known=')
+               + _exclude_dn | map('regex_replace', '^', '--exclude-dn='))
                | map('quote') | join(' ') }})
       {% if _member_scope | length > 0 %}
       ARGS+=(--member-scope={{ _member_scope | quote }})
@@ -131,6 +141,7 @@
     _member_scope: "{{ integrity_member_scope | default('') }}"
     _timeout: "{{ integrity_timeout | default(120) }}"
     _ignore_attrs: "{{ integrity_ignore_attrs | default(['contextCSN']) }}"
+    _exclude_dn: "{{ integrity_exclude_dn | default(['^cn=svcprobe\\.']) }}"
     _known_differences: >-
       {{ integrity_known_differences | default([_basedn
          ~ '|entryUUID,entryCSN,createTimestamp,modifyTimestamp|'
