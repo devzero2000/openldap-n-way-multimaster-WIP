@@ -1,0 +1,302 @@
+
+PLAY [CONCURRENT TEST 1: Scritture Concorrenti da Piu' Master sotto Carico WAN] ***
+
+TASK [Gathering Facts] *********************************************************
+ok: [localhost]
+
+TASK [[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster (il test deve girare sotto WAN simulata, non a velocita' LAN piena)] ***
+changed: [localhost]
+
+TASK [[PRE] Verifica che la simulazione WAN sia REALMENTE attiva sui 4 nodi (rc=0 del playbook WAN non basta)] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml for localhost
+
+TASK [[WAN] Controlla i parametri passati alla verifica dello stato WAN] *******
+ok: [localhost]
+
+TASK [[WAN] Rileva lo stato reale della simulazione WAN (qdisc netem e regole mangle 636) sui nodi] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[WAN] Blocca se lo stato reale della simulazione WAN non e' quello atteso su un nodo] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts1.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts2.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts3.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts4.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 3,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts4.example.com."
+}
+
+TASK [[FASE 1] Verifica pre-volo che slapd sia gia' attivo sui tre master, prima di iniziare] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu26lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu26lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 1] Blocca se uno dei tre master e' GIA' inattivo prima di iniziare (residuo di un run precedente, non causato da questo test)] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: slapd e' attivo su ubuntu26lts1.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: slapd e' attivo su ubuntu26lts2.example.com prima di iniziare."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: slapd e' attivo su ubuntu26lts3.example.com prima di iniziare."
+}
+
+TASK [[FASE 1] Controlla che la soglia sullo scarto degli orologi sia minore dell'intervallo fra le scritture in conflitto] ***
+ok: [localhost]
+
+TASK [[FASE 1] Verifica che gli orologi dei nodi siano allineati prima del conflitto sui CSN] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/assert_clock_skew.yml for localhost
+
+TASK [[CLOCK] Controlla i parametri passati alla verifica dello scarto degli orologi] ***
+ok: [localhost]
+
+TASK [[CLOCK] Misura lo scarto degli orologi fra i nodi via SSH persistente - puro shell] ***
+ok: [localhost]
+
+TASK [[CLOCK] Blocca se lo scarto fra gli orologi dei nodi supera la soglia] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": [
+        "CLOCK ubuntu26lts1.example.com offset_us=344 rtt_us=12133",
+        "CLOCK ubuntu26lts2.example.com offset_us=1932 rtt_us=12972",
+        "CLOCK ubuntu26lts3.example.com offset_us=1608 rtt_us=13176",
+        "CLOCK ubuntu26lts4.example.com offset_us=969 rtt_us=12252",
+        "CLOCK_SKEW_OK: scarto massimo fra i nodi 1588us (soglia 250000us)"
+    ]
+}
+
+TASK [[FASE 2 - SCENARIO A] Rimuovi eventuali entry concurrent.* residue di un run precedente interrotto (idempotenza)] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Blocca se la rimozione dei residui concurrent.* e' fallita] ***
+ok: [localhost]
+
+TASK [[FASE 2 - SCENARIO A] Attendi che la rimozione dei residui converga a 0 su TUTTO il cluster prima di scrivere - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 2 - SCENARIO A] Blocca se i residui concurrent.* non sono spariti da tutti i nodi prima di scrivere] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "PRECLEAN_OK: 1s (0 residui su tutti i 4 nodi)"
+}
+
+TASK [[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su ubuntu26lts2.example.com (namespace concurrent.a.*)] ***
+changed: [localhost -> ubuntu26lts2.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Avvia scrittura asincrona in background su ubuntu26lts3.example.com (namespace concurrent.b.*)] ***
+changed: [localhost -> ubuntu26lts3.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Attendi il completamento della scrittura su ubuntu26lts2.example.com] ***
+ok: [localhost -> ubuntu26lts2.example.com]
+
+TASK [[FASE 2 - SCENARIO A] Attendi il completamento della scrittura su ubuntu26lts3.example.com] ***
+ok: [localhost -> ubuntu26lts3.example.com]
+
+TASK [[FASE 3 - SCENARIO A] Misura il tempo di convergenza delle scritture indipendenti su TUTTO il cluster - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 3 - SCENARIO A] Report convergenza scritture indipendenti] *********
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "SCENARIO A: SCRITTURE CONCORRENTI SU DN INDIPENDENTI",
+        "========================================================================",
+        "SCENARIO_A_CONVERGENCE_OK: 1s (target=400 record allineati su tutti i 4 nodi)",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 4 - SCENARIO B] Rimuovi un'eventuale entry residua di un run precedente interrotto (idempotenza - tollera 'non esiste')] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Crea l'entry condivisa di test su ubuntu26lts1.example.com (valore iniziale)] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Blocca se la creazione dell'entry condivisa fallisce per un motivo diverso da 'entry residua non rimossa' (gia' gestito sopra)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 4 - SCENARIO B] Attendi che l'entry condivisa converga su node2/node3/node4 prima del conflitto - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 4 - SCENARIO B] Blocca se l'entry condivisa non e' propagata prima del conflitto] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "All assertions passed"
+}
+
+TASK [[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da ubuntu26lts2.example.com (description=written-by-master-a)] ***
+changed: [localhost -> ubuntu26lts2.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Avvia in background la scrittura concorrente da ubuntu26lts3.example.com (description=written-by-master-b, dopo 500ms)] ***
+changed: [localhost -> ubuntu26lts3.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Attendi il completamento della modifica concorrente su ubuntu26lts2.example.com] ***
+ok: [localhost -> ubuntu26lts2.example.com]
+
+TASK [[FASE 4 - SCENARIO B] Attendi il completamento della modifica concorrente su ubuntu26lts3.example.com] ***
+ok: [localhost -> ubuntu26lts3.example.com]
+
+TASK [[FASE 5 - SCENARIO B] Attendi la convergenza dell'attributo in conflitto su tutti e 4 i nodi - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 5 - SCENARIO B] Report risoluzione del conflitto] ******************
+ok: [localhost] => {
+    "msg": [
+        "========================================================================",
+        "SCENARIO B: CONFLITTO SULLO STESSO DN/ATTRIBUTO",
+        "========================================================================",
+        "VALORE node1=written-by-master-b",
+        "VALORE node2=written-by-master-b",
+        "VALORE node3=written-by-master-b",
+        "VALORE node4=written-by-master-b",
+        "CONFLICT_RESOLUTION_CONSISTENT: tutti i nodi concordano sul valore 'written-by-master-b' (dopo 1s)",
+        "========================================================================"
+    ]
+}
+
+TASK [[FASE 6] Cancellazione delle entry di test (entrambi gli scenari) su ubuntu26lts1.example.com] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 6] Mostra il riepilogo della cancellazione (nessuna password qui - file separato, vedi task precedente)] ***
+ok: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 6] Riepilogo cancellazione] ****************************************
+ok: [localhost] => {
+    "msg": "Tentate: 401 - rc ldapdelete: 0 - righe con errori nel log: 0"
+}
+
+TASK [[FASE 6] Rimozione dei log e file temporanei su ubuntu26lts1.example.com] ***
+changed: [localhost -> ubuntu26lts1.example.com] => (item=/tmp/concurrent_to_delete.txt)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=/tmp/concurrent_cleanup_ldapdelete.log)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=/tmp/concurrent_cleanup_summary.txt)
+
+TASK [[FASE 6] Rimozione dei file temporanei di Scenario A/B su ubuntu26lts2.example.com] ***
+changed: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_a.log)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_a.pid)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_b.log)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_b.pid)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_conflict_a.log)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_conflict_a.pid)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_conflict_b.log)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=/tmp/concurrent_conflict_b.pid)
+
+TASK [[FASE 6] Rimozione dei file temporanei di Scenario A/B su ubuntu26lts3.example.com] ***
+ok: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_a.log)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_a.pid)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_b.log)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_b.pid)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_conflict_a.log)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_conflict_a.pid)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_conflict_b.log)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=/tmp/concurrent_conflict_b.pid)
+
+TASK [[FASE 6] Attende (con polling reale, non un'attesa fissa) che la cancellazione converga su TUTTO il cluster - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 6] Report pulizia finale] ******************************************
+ok: [localhost] => {
+    "msg": [
+        "CLEANUP_CONVERGENCE_OK: 1s (0 record residui su tutti i 4 nodi)"
+    ]
+}
+
+TASK [[FASE 7] Blocca se le scritture indipendenti dello Scenario A non sono converse su tutti i nodi] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "SCENARIO_A_CONVERGENCE_OK: 1s (target=400 record allineati su tutti i 4 nodi)"
+}
+
+TASK [[FASE 7] Blocca se i nodi non concordano sul valore finale dello Scenario B (split-brain genuino, da indagare manualmente)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "CONFLICT_RESOLUTION_CONSISTENT: tutti i nodi concordano sul valore 'written-by-master-b' (dopo 1s)"
+}
+
+TASK [[FASE 7] Blocca se la cancellazione delle entry di test non e' conversa a 0 su tutti i nodi] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "CLEANUP_CONVERGENCE_OK: 1s (0 record residui su tutti i 4 nodi)"
+}
+
+TASK [[POST] Disabilita la simulazione WAN su tutto il cluster (sempre, anche se il test e' fallito)] ***
+changed: [localhost]
+
+TASK [[POST] Rimuovi SEMPRE l'entry condivisa di Scenario B (anche in caso di errore in una fase precedente alla FASE 6)] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[POST] Verifica che la simulazione WAN sia REALMENTE rimossa dai 4 nodi] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml for localhost
+
+TASK [[WAN] Controlla i parametri passati alla verifica dello stato WAN] *******
+ok: [localhost]
+
+TASK [[WAN] Rileva lo stato reale della simulazione WAN (qdisc netem e regole mangle 636) sui nodi] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[WAN] Blocca se lo stato reale della simulazione WAN non e' quello atteso su un nodo] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts1.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts2.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts3.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts4.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 3,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts4.example.com."
+}
+
+TASK [[POST] Blocca se il playbook di disattivazione WAN e' terminato con errore] ***
+ok: [localhost]
+
+PLAY RECAP *********************************************************************
+localhost                  : ok=52   changed=14   unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   
+
