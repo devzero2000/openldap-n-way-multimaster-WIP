@@ -1,0 +1,745 @@
+# ==============================================================================
+# TITOLO:       test_partition_referential_integrity.yml
+# AUTORE:       Elia Pinto
+# DATA:         27 Ottobre 2026
+# SCOPO:        Verifica che l'integrita' referenziale fra utenti e gruppi
+#               (member / memberOf, mantenuti dagli overlay memberof e refint)
+#               sopravviva a una partizione di rete durante la quale i due
+#               lati fanno modifiche INCROCIATE sulle stesse relazioni:
+#                 caso A - node1 cancella l'utente U1, poi node2 aggiunge U1
+#                          al gruppo G1;
+#                 caso B - node1 aggiunge U2 al gruppo G2, poi node2 cancella
+#                          U2;
+#                 caso C - node1 cancella il gruppo G3, poi node2 aggiunge U3
+#                          a G3;
+#                 caso D - node1 rinomina U4 (modrdn), poi node2 aggiunge il
+#                          vecchio DN di U4 al gruppo G4.
+#               Dopo la guarigione il contenuto deve essere identico su tutti
+#               e 4 i nodi e senza member pendenti ne' memberOf orfani.
+#
+# PERCHE' E' UN RISCHIO REALE: refint e memberof lavorano sulle operazioni
+# che ricevono. Durante la partizione ogni lato ha una vista parziale: il
+# lato che aggiunge U1 a G1 non sa che U1 e' gia' stato cancellato altrove,
+# e la cancellazione che arriva dopo la guarigione puo' non passare di nuovo
+# per refint. Il risultato possibile e' un gruppo con un member che non
+# esiste (o un memberOf verso un gruppo che non c'e'), replicato ovunque e
+# permanente, senza alcun errore nei log. In un cluster geografico, dove le
+# partizioni sono eventi normali, sarebbe una corruzione silenziosa dei
+# permessi applicativi basati sui gruppi.
+#
+# COSA NON SI VERIFICA: QUALE dei due lati "vinca" in ciascun caso (OpenLDAP
+# non lo garantisce per cancellazione contro modifica: e' oggetto di un test
+# dedicato). Si verifica che qualunque esito sia COERENTE e UGUALE su tutti i
+# nodi. Lo stato finale di ogni caso viene comunque stampato.
+#
+# COME: partizione su tcp/636 fra node1 e node2/node3, stessa tecnica e stessa
+# verifica dei 4 leg di test_network_partition_conflict_resolution.yml (solo
+# 636: il nodo di controllo Ansible e' node1, un DROP totale taglierebbe SSH).
+# Integrita' con assert_data_integrity.yml (contenuto identico entry per
+# entry + coerenza member/memberOf nel namespace refint-part.*), servizio con
+# service_probe.yml (ogni nodo deve continuare a servire durante la
+# partizione; ogni scrittura confermata deve sopravvivere).
+#
+# NAMESPACE: cn=refint-part.* (utenti in ou=people, gruppi in ou=groups).
+#
+# SIMULAZIONE WAN: accesa come primo task del "block" e spenta SEMPRE come
+# primo task dell'"always", con verifica dello stato reale sui 4 nodi
+# (assert_wan_state.yml). Ctrl-C non esegue l'"always": in quel caso
+# rimuovere a mano partizione (iptables, commento refint-partition-test),
+# sonde (service_probe.yml -e probe_action=kill) e WAN.
+#
+# CHECK MODE: NON usare --check (orchestra un altro ansible-playbook, applica
+# regole iptables reali, scrive sul cluster).
+#
+# VERSIONE:     1.0
+# CHANGELOG:
+#   1.0 - 2026-10-27 - prima versione.
+# ==============================================================================
+
+---
+- name: "REFERENTIAL INTEGRITY TEST: member/memberOf dopo modifiche incrociate durante una partizione"
+  hosts: localhost
+  gather_facts: false
+  vars:
+    # Nodi derivati dall'inventory, mai scritti a mano (CLAUDE.md, regola d'oro)
+    node1: "{{ (groups['cluster'] | sort)[0] }}"
+    node2: "{{ (groups['cluster'] | sort)[1] }}"
+    node3: "{{ (groups['cluster'] | sort)[2] }}"
+    node4: "{{ (groups['readonlyreplica'] | sort)[0] }}"
+    all_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}", "{{ node4 }}"]
+    ldap_basedn: "dc=example,dc=com"
+    ldap_admin_dn: "cn=admin,dc=example,dc=com"
+    ldap_admin_pass: "openldap"
+
+    wan_simulation_playbook: "{{ playbook_dir }}/../../stress_test/simulate_wan_mpls_ipsec/simulate_wan_mpls_ipsec.yml"
+    wan_assert_tasks: "{{ playbook_dir }}/../../stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml"
+    wan_inventory: "{{ ansible_inventory_sources | join(',') }}"
+    clock_skew_tasks: "{{ playbook_dir }}/../assert_clock_skew.yml"
+    integrity_tasks: "{{ playbook_dir }}/../assert_data_integrity.yml"
+    probe_tasks: "{{ playbook_dir }}/../service_probe.yml"
+
+    # Namespace del test e DN delle entry dei quattro casi
+    ns: "refint-part"
+    people_ou: "ou=people,{{ ldap_basedn }}"
+    groups_ou: "ou=groups,{{ ldap_basedn }}"
+    u0: "cn={{ ns }}.user.0,{{ people_ou }}"
+    u1: "cn={{ ns }}.user.1,{{ people_ou }}"
+    u2: "cn={{ ns }}.user.2,{{ people_ou }}"
+    u3: "cn={{ ns }}.user.3,{{ people_ou }}"
+    u4: "cn={{ ns }}.user.4,{{ people_ou }}"
+    u4_renamed_rdn: "cn={{ ns }}.user.4-renamed"
+    u4_renamed: "{{ u4_renamed_rdn }},{{ people_ou }}"
+    g1: "cn={{ ns }}.group.1,{{ groups_ou }}"
+    g2: "cn={{ ns }}.group.2,{{ groups_ou }}"
+    g3: "cn={{ ns }}.group.3,{{ groups_ou }}"
+    g4: "cn={{ ns }}.group.4,{{ groups_ou }}"
+    # Regex (DN in minuscolo) per la coerenza member/memberOf: solo il
+    # namespace del test, non il DIT base (cn=administrators ha come member
+    # il rootDN, che non ha entry: pendente voluto).
+    integrity_scope: "^cn=refint-part\\."
+
+    partition_ldap_port: "636"
+    partition_comment: "refint-partition-test"
+
+    # node2 scrive almeno conflict_write_gap_ms dopo node1, e la soglia sugli
+    # orologi ne e' la meta' (stesso criterio degli altri test): l'ordine dei
+    # CSN corrisponde all'ordine reale delle scritture.
+    conflict_write_gap_ms: 500
+    max_clock_skew_ms: "{{ (conflict_write_gap_ms | int) // 2 }}"
+
+    # Convergenza dopo la guarigione: il retry di syncrepl e' "5 10 10 30
+    # 60 120 300 +", dopo ~1 minuto di partizione la riconnessione puo'
+    # richiedere fino a 60s; margine per la riconciliazione.
+    convergence_timeout_after_heal: 240
+    namespace_timeout: 120
+
+  tasks:
+    - name: "Blocco principale del test (partizione, sonde e WAN rimosse in 'always' anche in caso di errore)"
+      block:
+
+        # ==========================================================================
+        # [PRE] WAN SIMULATA
+        # ==========================================================================
+
+        - name: "[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster"
+          ansible.builtin.command:
+            argv:
+              - ansible-playbook
+              - -i
+              - "{{ wan_inventory }}"
+              - "{{ wan_simulation_playbook }}"
+              - -e
+              - stato=enabled
+          changed_when: true
+
+        - name: "[PRE] Verifica che la simulazione WAN sia REALMENTE attiva sui 4 nodi"
+          ansible.builtin.include_tasks: "{{ wan_assert_tasks }}"
+          vars:
+            wan_expected_state: "enabled"
+            wan_verify_nodes: "{{ all_nodes }}"
+
+        # ==========================================================================
+        # FASE 0: PRE-VOLO (prima di toccare qualunque cosa)
+        # ==========================================================================
+
+        - name: "[FASE 0] Verifica pre-volo che slapd sia attivo su tutti e 4 i nodi"
+          ansible.builtin.systemd:
+            name: slapd
+          delegate_to: "{{ item }}"
+          loop: "{{ all_nodes }}"
+          register: preflight_status
+          failed_when: false
+
+        - name: "[FASE 0] Blocca se un nodo e' GIA' inattivo prima di iniziare (non causato da questo test)"
+          ansible.builtin.assert:
+            that:
+              - item.status.ActiveState | default('') == "active"
+            fail_msg: >-
+              ERRORE: slapd su {{ item.item }} risulta gia'
+              '{{ item.status.ActiveState | default('sconosciuto') }}' prima che
+              questo test tocchi qualunque cosa - ripartire da un cluster sano.
+            success_msg: "OK: slapd attivo su {{ item.item }}."
+          loop: "{{ preflight_status.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: "[FASE 0] Verifica che gli orologi dei nodi siano allineati (l'ordine dei CSN deve seguire l'ordine reale)"
+          ansible.builtin.include_tasks: "{{ clock_skew_tasks }}"
+          vars:
+            clock_verify_nodes: "{{ all_nodes }}"
+
+        # Rimozione per commento, non con il modulo iptables state=absent:
+        # toglie TUTTE le regole del test, anche duplicate da run interrotti.
+        - name: "[FASE 0] Rimuove eventuali regole di partizione residue di un run interrotto (idempotenza)"
+          ansible.builtin.shell:
+            cmd: &remove_rules_script |
+              set -u
+              set -o pipefail
+              # Senza pipe "iptables | grep -m1": con pipefail il SIGPIPE a
+              # iptables chiuderebbe il ciclo lasciando regole in piedi.
+              N=0
+              for CHAIN in INPUT OUTPUT; do
+                while true; do
+                  RULES=$(iptables -L "$CHAIN" -n --line-numbers) || exit 1
+                  NUM=$(awk '/{{ partition_comment }}/ {print $1; exit}' <<< "$RULES")
+                  [ -n "$NUM" ] || break
+                  iptables -D "$CHAIN" "$NUM" || exit 1
+                  N=$((N + 1))
+                done
+              done
+              echo "RIMOSSE=$N"
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          become: true
+          loop: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+          register: stale_rules
+          changed_when: "'RIMOSSE=0' not in stale_rules.stdout"
+
+        # Gruppi prima degli utenti (lezione 9: meno lavoro per refint su
+        # riferimenti pendenti). Cancellazione da OGNI master per le entry che
+        # quel master ha in locale: un residuo rimasto su un solo nodo
+        # (proprio cio' che questo test cerca) non sparirebbe cancellandolo da
+        # un nodo che non lo ha. "No such object" con -c: atteso.
+        - name: "[FASE 0] Rimuove le entry refint-part.* residue di un run precedente (idempotenza)"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              export LDAPTLS_REQCERT=never
+              DNS=$(sudo slapcat -b '{{ ldap_basedn }}' -a '(cn={{ ns }}.*)' 2>/dev/null | sed -n 's/^dn: //p')
+              [ -n "$DNS" ] || { echo "NESSUN_RESIDUO"; exit 0; }
+              { printf '%s\n' "$DNS" | grep ',{{ groups_ou }}$' || true
+                printf '%s\n' "$DNS" | grep -v ',{{ groups_ou }}$' || true; } \
+                | ldapdelete -x -c -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" >/dev/null 2>&1
+              echo "RESIDUI_CANCELLATI"
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          loop: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+          register: preclean
+          changed_when: "'RESIDUI_CANCELLATI' in preclean.stdout"
+          failed_when: preclean.rc != 0
+          no_log: true
+
+        - name: "[FASE 0] Attende che i residui refint-part.* siano 0 su tutti i nodi - puro shell"
+          ansible.builtin.shell:
+            cmd: &count_zero_script |
+              set -u
+              set -o pipefail
+              count_on() {
+                local out
+                if out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$1" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn={{ ns }}.*)'" 2>/dev/null); then
+                  printf '%s\n' "$out" | grep -c '^dn: '
+                else
+                  echo "-1"
+                fi
+              }
+              START=$(date +%s)
+              while true; do
+                STATUS=""
+                ALL_ZERO=1
+                for n in {{ all_nodes | map('quote') | join(' ') }}; do
+                  C=$(count_on "$n")
+                  STATUS="$STATUS $n=$C"
+                  [ "$C" = "0" ] || ALL_ZERO=0
+                done
+                if [ "$ALL_ZERO" -eq 1 ]; then
+                  echo "NAMESPACE_EMPTY: $(($(date +%s) - START))s"
+                  exit 0
+                fi
+                if [ $(($(date +%s) - START)) -ge {{ namespace_timeout }} ]; then
+                  echo "NAMESPACE_NOT_EMPTY:$STATUS"
+                  exit 1
+                fi
+                sleep 2
+              done
+            executable: /bin/bash
+          register: preclean_wait
+          changed_when: false
+          failed_when: false
+
+        - name: "[FASE 0] Blocca se i residui non sono spariti da tutti i nodi (-1 = conteggio non riuscito via SSH)"
+          ansible.builtin.assert:
+            that:
+              - "'NAMESPACE_EMPTY' in preclean_wait.stdout"
+            fail_msg: >-
+              ERRORE: entry refint-part.* ancora presenti prima di iniziare -
+              {{ preclean_wait.stdout }}. Un residuo rimasto su un solo nodo
+              e' gia' di per se' una divergenza da indagare.
+            success_msg: "{{ preclean_wait.stdout }}"
+
+        - name: "[FASE 0] Avvia la sonda di servizio su tutti i nodi"
+          ansible.builtin.include_tasks: "{{ probe_tasks }}"
+          vars:
+            probe_action: start
+            probe_rw_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+            probe_ro_nodes: ["{{ node4 }}"]
+
+        # ==========================================================================
+        # FASE 1: BASELINE - utenti e gruppi creati su node1 e propagati
+        # ovunque PRIMA della partizione (i conflitti devono nascere da uno
+        # stato gia' coerente). U0 e' member di ogni gruppo (groupOfNames
+        # richiede almeno un member) e non viene mai toccato.
+        # ==========================================================================
+
+        - name: "[FASE 1] Crea utenti e gruppi di baseline su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              export LDAPTLS_REQCERT=never
+              ldapadd -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<'LDIF'
+              {% for i in range(5) %}
+              dn: cn={{ ns }}.user.{{ i }},{{ people_ou }}
+              objectClass: inetOrgPerson
+              cn: {{ ns }}.user.{{ i }}
+              sn: user{{ i }}
+
+              {% endfor %}
+              {% for i in range(1, 5) %}
+              dn: cn={{ ns }}.group.{{ i }},{{ groups_ou }}
+              objectClass: groupOfNames
+              cn: {{ ns }}.group.{{ i }}
+              member: {{ u0 }}
+              {% if not loop.last %}
+
+              {% endif %}
+              {% endfor %}
+              LDIF
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          register: baseline_create
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 1] Blocca se la creazione della baseline e' fallita"
+          ansible.builtin.assert:
+            that:
+              - baseline_create.rc == 0
+            fail_msg: >-
+              ERRORE: creazione di utenti e gruppi di baseline fallita su {{ node1 }}
+              (rc={{ baseline_create.rc }}, output non mostrato: no_log). Ripetere
+              il ldapadd a mano per il messaggio completo.
+            quiet: true
+
+        - name: "[FASE 1] Attende che la baseline sia identica e coerente su tutti i nodi prima di partizionare"
+          ansible.builtin.include_tasks: "{{ integrity_tasks }}"
+          vars:
+            integrity_nodes: "{{ all_nodes }}"
+            integrity_member_scope: "{{ integrity_scope }}"
+            integrity_timeout: "{{ namespace_timeout }}"
+            integrity_label: "(baseline prima della partizione)"
+
+        # ==========================================================================
+        # FASE 2: PARTIZIONE node1 <-> node2/node3 (solo tcp/636) E PROVA DEI 4 LEG
+        # ==========================================================================
+
+        - name: "[FASE 2] Applica la partizione verso node2/node3 su {{ node1 }}"
+          ansible.builtin.iptables:
+            chain: "{{ item.chain }}"
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(item.peer, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(item.peer, omit) }}"
+            jump: DROP
+            comment: "{{ partition_comment }}"
+            # In testa alla catena: deve precedere eventuali ACCEPT
+            action: insert
+          delegate_to: "{{ node1 }}"
+          become: true
+          loop:
+            - {chain: "INPUT", peer: "{{ node2 }}"}
+            - {chain: "INPUT", peer: "{{ node3 }}"}
+            - {chain: "OUTPUT", peer: "{{ node2 }}"}
+            - {chain: "OUTPUT", peer: "{{ node3 }}"}
+          loop_control:
+            label: "{{ item.chain }} <-> {{ item.peer }}"
+
+        - name: "[FASE 2] Specchia la partizione su node2 e node3 verso {{ node1 }}"
+          ansible.builtin.iptables:
+            chain: "{{ item.chain }}"
+            protocol: tcp
+            destination_port: "{{ partition_ldap_port }}"
+            source: "{{ (item.chain == 'INPUT') | ternary(node1, omit) }}"
+            destination: "{{ (item.chain == 'OUTPUT') | ternary(node1, omit) }}"
+            jump: DROP
+            comment: "{{ partition_comment }}"
+            action: insert
+          delegate_to: "{{ item.host }}"
+          become: true
+          loop:
+            - {host: "{{ node2 }}", chain: "INPUT"}
+            - {host: "{{ node2 }}", chain: "OUTPUT"}
+            - {host: "{{ node3 }}", chain: "INPUT"}
+            - {host: "{{ node3 }}", chain: "OUTPUT"}
+          loop_control:
+            label: "{{ item.host }} {{ item.chain }} <-> {{ node1 }}"
+
+        # Tutti e 4 i leg: un leg aperto farebbe da ponte attraverso il terzo
+        # nodo e invaliderebbe il test (lezione 5).
+        - name: "[FASE 2] Verifica che TUTTI i leg della partizione siano bloccati"
+          ansible.builtin.shell: "timeout 3 bash -c 'echo > /dev/tcp/{{ item.to }}/{{ partition_ldap_port }}' 2>/dev/null; echo $?"
+          delegate_to: "{{ item.from }}"
+          loop:
+            - {from: "{{ node2 }}", to: "{{ node1 }}"}
+            - {from: "{{ node3 }}", to: "{{ node1 }}"}
+            - {from: "{{ node1 }}", to: "{{ node2 }}"}
+            - {from: "{{ node1 }}", to: "{{ node3 }}"}
+          loop_control:
+            label: "{{ item.from }} -> {{ item.to }}:{{ partition_ldap_port }}"
+          register: legs
+          changed_when: false
+
+        - name: "[FASE 2] Blocca se anche un solo leg e' ancora raggiungibile"
+          ansible.builtin.assert:
+            that:
+              - item.stdout | trim != "0"
+            fail_msg: >-
+              ERRORE: {{ item.item.from }} -> {{ item.item.to }}:{{ partition_ldap_port }}
+              ancora raggiungibile dopo le regole iptables - la partizione non e'
+              completa e il resto del test non avrebbe validita'.
+            success_msg: "OK: {{ item.item.from }} -> {{ item.item.to }} bloccato."
+          loop: "{{ legs.results }}"
+          loop_control:
+            label: "{{ item.item.from }} -> {{ item.item.to }}"
+
+        # ==========================================================================
+        # FASE 3: MODIFICHE INCROCIATE SUI DUE LATI (node1 prima, node2 dopo
+        # conflict_write_gap_ms). Ogni lato deve accettare le scritture
+        # locali nonostante l'isolamento (continuita' operativa).
+        # ==========================================================================
+
+        - name: "[FASE 3] Lato isolato: cancella U1, U2 in G2, cancella G3, rinomina U4 - su {{ node1 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              export LDAPTLS_REQCERT=never
+              ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<'LDIF'
+              dn: {{ u1 }}
+              changetype: delete
+
+              dn: {{ g2 }}
+              changetype: modify
+              add: member
+              member: {{ u2 }}
+
+              dn: {{ g3 }}
+              changetype: delete
+
+              dn: {{ u4 }}
+              changetype: modrdn
+              newrdn: {{ u4_renamed_rdn }}
+              deleteoldrdn: 1
+              LDIF
+            executable: /bin/bash
+          delegate_to: "{{ node1 }}"
+          register: write_side_a
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 3] Blocca se le scritture sul lato isolato sono fallite (continuita' operativa violata)"
+          ansible.builtin.assert:
+            that:
+              - write_side_a.rc == 0
+            fail_msg: >-
+              ERRORE: le modifiche locali su {{ node1 }} isolato sono fallite
+              (rc={{ write_side_a.rc }}, output non mostrato: no_log) - un master
+              isolato deve continuare ad accettare scritture locali.
+            quiet: true
+
+        - name: "[FASE 3] Lato raggiungibile, dopo l'intervallo: U1 in G1, cancella U2, U3 in G3, vecchio U4 in G4 - su {{ node2 }}"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              sleep {{ '%.3f' | format((conflict_write_gap_ms | int) / 1000) }}
+              export LDAPTLS_REQCERT=never
+              ldapmodify -x -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" <<'LDIF'
+              dn: {{ g1 }}
+              changetype: modify
+              add: member
+              member: {{ u1 }}
+
+              dn: {{ u2 }}
+              changetype: delete
+
+              dn: {{ g3 }}
+              changetype: modify
+              add: member
+              member: {{ u3 }}
+
+              dn: {{ g4 }}
+              changetype: modify
+              add: member
+              member: {{ u4 }}
+              LDIF
+            executable: /bin/bash
+          delegate_to: "{{ node2 }}"
+          register: write_side_b
+          changed_when: true
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 3] Blocca se le scritture sul lato raggiungibile sono fallite"
+          ansible.builtin.assert:
+            that:
+              - write_side_b.rc == 0
+            fail_msg: >-
+              ERRORE: le modifiche locali su {{ node2 }} sono fallite
+              (rc={{ write_side_b.rc }}, output non mostrato: no_log).
+            quiet: true
+
+        # ==========================================================================
+        # FASE 4: PROVA DELLA DIVERGENZA mentre la partizione e' attiva - le
+        # modifiche di ciascun lato NON devono essere visibili dall'altro.
+        # Senza questa prova un iptables inefficace farebbe passare il test
+        # per il motivo sbagliato.
+        # ==========================================================================
+
+        - name: "[FASE 4] Legge lo stato dei casi sui due lati mentre la partizione e' attiva - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              # Conteggio entry con un dato cn e (opzionale) un dato member;
+              # -1 se SSH/slapcat non riesce (mai 0, che e' un valore legittimo).
+              q() {
+                local host="$1" cn="$2" member="${3:-}" out
+                if ! out=$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+                    "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn=$cn)'" 2>/dev/null); then
+                  echo "-1"; return
+                fi
+                if [ -n "$member" ]; then
+                  printf '%s\n' "$out" | grep -ic "^member: $member\$" || true
+                else
+                  printf '%s\n' "$out" | grep -c '^dn: ' || true
+                fi
+              }
+              N1={{ node1 | quote }}; N2={{ node2 | quote }}
+              echo "node1 U1=$(q "$N1" {{ ns }}.user.1)"
+              echo "node1 U2=$(q "$N1" {{ ns }}.user.2)"
+              echo "node1 G2_ha_U2=$(q "$N1" {{ ns }}.group.2 {{ u2 | quote }})"
+              echo "node1 G3=$(q "$N1" {{ ns }}.group.3)"
+              echo "node1 U4=$(q "$N1" {{ ns }}.user.4)"
+              echo "node1 U4renamed=$(q "$N1" {{ ns }}.user.4-renamed)"
+              echo "node2 U1=$(q "$N2" {{ ns }}.user.1)"
+              echo "node2 G1_ha_U1=$(q "$N2" {{ ns }}.group.1 {{ u1 | quote }})"
+              echo "node2 U2=$(q "$N2" {{ ns }}.user.2)"
+              echo "node2 G3_ha_U3=$(q "$N2" {{ ns }}.group.3 {{ u3 | quote }})"
+              echo "node2 G4_ha_U4=$(q "$N2" {{ ns }}.group.4 {{ u4 | quote }})"
+              echo "node2 U4renamed=$(q "$N2" {{ ns }}.user.4-renamed)"
+            executable: /bin/bash
+          register: divergence
+          changed_when: false
+          check_mode: false
+
+        - name: "[FASE 4] Report dello stato dei due lati durante la partizione"
+          ansible.builtin.debug:
+            msg: "{{ ['DURANTE LA PARTIZIONE (1 = presente, 0 = assente, -1 = lettura fallita):'] + divergence.stdout_lines }}"
+
+        - name: "[FASE 4] Blocca se i due lati non mostrano ciascuno SOLO le proprie modifiche"
+          ansible.builtin.assert:
+            that:
+              - item in divergence.stdout_lines
+            fail_msg: >-
+              ERRORE: atteso '{{ item }}' durante la partizione - vedi il report
+              sopra. Se un lato vede gia' le modifiche dell'altro, la partizione
+              non e' efficace e il resto del test non ha validita'.
+            quiet: true
+          loop:
+            - "node1 U1=0"
+            - "node1 U2=1"
+            - "node1 G2_ha_U2=1"
+            - "node1 G3=0"
+            - "node1 U4=0"
+            - "node1 U4renamed=1"
+            - "node2 U1=1"
+            - "node2 G1_ha_U1=1"
+            - "node2 U2=0"
+            - "node2 G3_ha_U3=1"
+            - "node2 G4_ha_U4=1"
+            - "node2 U4renamed=0"
+
+        # ==========================================================================
+        # FASE 5: GUARIGIONE DELLA PARTIZIONE
+        # ==========================================================================
+
+        - name: "[FASE 5] Rimuove le regole di partizione da tutti e tre i master"
+          ansible.builtin.shell:
+            cmd: *remove_rules_script
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          become: true
+          loop: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+          register: heal
+          changed_when: "'RIMOSSE=0' not in heal.stdout"
+
+        # ==========================================================================
+        # FASE 6: INTEGRITA' DOPO LA GUARIGIONE - contenuto identico su tutti i
+        # nodi e member/memberOf coerenti nel namespace. Assert in FASE 9, dopo
+        # il cleanup: il cluster va ripulito anche se l'integrita' e' violata.
+        # ==========================================================================
+
+        - name: "[FASE 6] Attende che il namespace sia identico e coerente su tutti i nodi dopo la guarigione"
+          ansible.builtin.include_tasks: "{{ integrity_tasks }}"
+          vars:
+            integrity_nodes: "{{ all_nodes }}"
+            integrity_member_scope: "{{ integrity_scope }}"
+            integrity_timeout: "{{ convergence_timeout_after_heal }}"
+            integrity_label: "(dopo la guarigione della partizione)"
+            integrity_assert: false
+
+        - name: "[FASE 6] Conserva l'esito dell'integrita' per l'assert finale"
+          ansible.builtin.set_fact:
+            integrity_after_heal: "{{ integrity_check }}"
+
+        - name: "[FASE 6] Legge lo stato finale dei quattro casi su ogni nodo (dn, member, memberOf) - puro shell"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              for n in {{ all_nodes | map('quote') | join(' ') }}; do
+                echo "== $n"
+                ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" \
+                  "sudo slapcat -b '{{ ldap_basedn }}' -a '(cn={{ ns }}.*)'" 2>/dev/null \
+                  | grep -iE '^(dn|member|memberOf): ' | sed 's/,{{ ldap_basedn }}$//; s/^/  /' \
+                  || echo "  (lettura non riuscita)"
+              done
+            executable: /bin/bash
+          register: final_state
+          changed_when: false
+          check_mode: false
+
+        - name: "[FASE 6] Report dello stato finale (quale lato ha prevalso in ciascun caso)"
+          ansible.builtin.debug:
+            msg: "{{ final_state.stdout_lines }}"
+
+        # ==========================================================================
+        # FASE 7: SONDA DI SERVIZIO - arresto, report e durabilita'
+        # ==========================================================================
+
+        - name: "[FASE 7] Ferma la sonda di servizio e verifica la durabilita' delle scritture confermate"
+          ansible.builtin.include_tasks: "{{ probe_tasks }}"
+          vars:
+            probe_action: stop
+
+        # ==========================================================================
+        # FASE 8: CLEANUP del namespace (gruppi prima degli utenti, da ogni
+        # master per le entry che ha in locale) e attesa di 0 ovunque
+        # ==========================================================================
+
+        - name: "[FASE 8] Cancella le entry refint-part.* da ogni master"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              export LDAPTLS_REQCERT=never
+              DNS=$(sudo slapcat -b '{{ ldap_basedn }}' -a '(cn={{ ns }}.*)' 2>/dev/null | sed -n 's/^dn: //p')
+              [ -n "$DNS" ] || { echo "NESSUNA_ENTRY"; exit 0; }
+              { printf '%s\n' "$DNS" | grep ',{{ groups_ou }}$' || true
+                printf '%s\n' "$DNS" | grep -v ',{{ groups_ou }}$' || true; } \
+                | ldapdelete -x -c -H ldaps://127.0.0.1:636 -D "{{ ldap_admin_dn }}" -w "{{ ldap_admin_pass }}" >/dev/null 2>&1
+              echo "ENTRY_CANCELLATE"
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          loop: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+          register: cleanup
+          changed_when: "'ENTRY_CANCELLATE' in cleanup.stdout"
+          failed_when: false
+          no_log: true
+
+        - name: "[FASE 8] Attende che il namespace sia vuoto su tutti i nodi - puro shell"
+          ansible.builtin.shell:
+            cmd: *count_zero_script
+            executable: /bin/bash
+          register: cleanup_wait
+          changed_when: false
+          failed_when: false
+
+        # ==========================================================================
+        # FASE 9: ESITO VERIFICATO (dopo il cleanup)
+        # ==========================================================================
+
+        - name: "[FASE 9] Blocca se dopo la guarigione il namespace non e' identico e coerente su tutti i nodi"
+          ansible.builtin.assert:
+            that:
+              - "'INTEGRITY_OK' in integrity_after_heal.stdout"
+            fail_msg: "{{ [integrity_fail_hint] + integrity_after_heal.stdout_lines }}"
+            success_msg: "{{ integrity_after_heal.stdout_lines | select('match', '^INTEGRITY_') | list }}"
+          vars:
+            integrity_fail_hint: >-
+              ERRORE: dopo la guarigione della partizione l'integrita' referenziale
+              e' violata o i nodi divergono (dettagli sotto; lo stato finale per
+              nodo e' nel report di FASE 6). DANGLING_MEMBER = un gruppo contiene
+              un utente che non esiste piu'; ORPHAN_MEMBEROF = un utente risulta
+              membro di un gruppo inesistente o che non lo contiene;
+              VALUE_DIFF/MISSING_ENTRY = i nodi non hanno riconciliato allo
+              stesso stato. Non e' un difetto del test: e' una corruzione
+              silenziosa prodotta dalla partizione.
+
+        - name: "[FASE 9] Verifica erogazione del servizio e durabilita' delle scritture confermate"
+          ansible.builtin.include_tasks: "{{ probe_tasks }}"
+          vars:
+            probe_action: assert
+
+        - name: "[FASE 9] Blocca se le entry del test non sono sparite da tutti i nodi"
+          ansible.builtin.assert:
+            that:
+              - "'NAMESPACE_EMPTY' in cleanup_wait.stdout"
+            fail_msg: >-
+              ERRORE: entry refint-part.* ancora presenti dopo il cleanup
+              ({{ cleanup_wait.stdout }}; -1 = conteggio non riuscito via SSH).
+              Il prossimo run le rimuove comunque in FASE 0.
+            success_msg: "{{ cleanup_wait.stdout }}"
+
+      always:
+        # PRIMO task dell'always, gira in locale (non puo' essere
+        # UNREACHABLE): un task always fallito o con host irraggiungibile
+        # interromperebbe i successivi. Esito verificato in fondo.
+        - name: "[POST] Disabilita la simulazione WAN su tutto il cluster (sempre)"
+          ansible.builtin.command:
+            argv:
+              - ansible-playbook
+              - -i
+              - "{{ wan_inventory }}"
+              - "{{ wan_simulation_playbook }}"
+              - -e
+              - stato=disabled
+          register: wan_disable
+          changed_when: true
+          failed_when: false
+
+        - name: "[POST] Rimuove SEMPRE le regole di partizione (anche se il test si e' fermato prima della guarigione)"
+          ansible.builtin.shell:
+            cmd: *remove_rules_script
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          become: true
+          loop: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+          register: post_rules
+          changed_when: "'RIMOSSE=0' not in post_rules.stdout"
+          failed_when: false
+          ignore_unreachable: true
+
+        - name: "[POST] Ferma SEMPRE le sonde di servizio e ne rimuove i file dai nodi"
+          ansible.builtin.include_tasks: "{{ probe_tasks }}"
+          vars:
+            probe_action: kill
+            probe_rw_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+            probe_ro_nodes: ["{{ node4 }}"]
+
+        - name: "[POST] Verifica che la simulazione WAN sia REALMENTE rimossa dai 4 nodi"
+          ansible.builtin.include_tasks: "{{ wan_assert_tasks }}"
+          vars:
+            wan_expected_state: "disabled"
+            wan_verify_nodes: "{{ all_nodes }}"
+
+        - name: "[POST] Blocca se il playbook di disattivazione WAN e' terminato con errore"
+          ansible.builtin.assert:
+            that:
+              - wan_disable.rc == 0
+            fail_msg: >-
+              ERRORE: simulate_wan_mpls_ipsec.yml -e stato=disabled e' uscito con
+              rc={{ wan_disable.rc }} - ultime righe:
+              {{ (wan_disable.stdout_lines | default([]))[-8:] | join(' | ') }}
+            quiet: true
