@@ -30,7 +30,8 @@
 #            l'"always" del test. Idempotente, tollera nodi irraggiungibili.
 #
 # VARIABILI IN INGRESSO:
-#   probe_rw_nodes           (obbligatoria) master: lettura + scrittura
+#   probe_rw_nodes           (obbligatoria per start) master: lettura +
+#                            scrittura; stop/assert riusano i nodi di start
 #   probe_ro_nodes           (default []) repliche: solo lettura
 #   probe_impacted_nodes     (default []) nodi su cui il guasto e' VOLUTO:
 #                            la loro disponibilita' si riporta ma non si
@@ -45,8 +46,13 @@
 #
 # CHECK MODE: non supportato (avvia processi e scrive sul cluster).
 #
-# VERSIONE:     1.0
+# VERSIONE:     1.1
 # CHANGELOG:
+#   1.1 - 2026-10-27 - stop e assert usano i nodi ricordati da start
+#                      (probe_rw_set): chiamati senza probe_rw_nodes
+#                      fallivano sul controllo dei parametri, e in
+#                      test_partition_referential_integrity.yml cleanup e
+#                      assert finali non partivano.
 #   1.0 - 2026-10-27 - prima versione.
 # ==============================================================================
 
@@ -55,19 +61,27 @@
   ansible.builtin.assert:
     that:
       - probe_action | default('') in ['start', 'stop', 'assert', 'kill']
-      - probe_action == 'kill' or (probe_rw_nodes | default([]) | length > 0)
+      - probe_action != 'start' or (probe_rw_nodes | default([]) | length > 0)
+      - probe_action not in ['stop', 'assert'] or probe_rw_set is defined
     fail_msg: >-
-      ERRORE: service_probe.yml richiede probe_action (start|stop|assert|kill)
-      e, tranne che per kill, una lista probe_rw_nodes non vuota - errore nel
-      playbook chiamante, non nel cluster.
+      ERRORE: service_probe.yml richiede probe_action (start|stop|assert|kill);
+      start richiede una lista probe_rw_nodes non vuota, stop e assert un
+      start precedente nello stesso play - errore nel playbook chiamante, non
+      nel cluster.
     quiet: true
 
 - name: "[SONDA] Fissa l'identificativo del run e l'elenco dei nodi sondati"
   ansible.builtin.set_fact:
     probe_run_id: "{{ probe_run_id | default(lookup('ansible.builtin.pipe', 'date +%Y%m%d%H%M%S')) }}"
+    # Ricordati da start: stop e assert non richiedono di ripassare i nodi
+    # (prima "stop" senza probe_rw_nodes falliva sul controllo dei parametri)
+    probe_rw_set: >-
+      {{ probe_rw_nodes | default([])
+         if probe_action == 'start' or probe_rw_set is not defined
+         else probe_rw_set }}
     probe_all_nodes: >-
       {{ (probe_rw_nodes | default([])) + (probe_ro_nodes | default([]))
-         if probe_action != 'kill' or probe_all_nodes is not defined
+         if probe_action == 'start' or probe_all_nodes is not defined
          else probe_all_nodes }}
   when: probe_action in ['start', 'kill']
 
@@ -239,7 +253,7 @@
       set -o pipefail
       BASE={{ probe_basedn | default('dc=example,dc=com') | quote }}
       PW="/var/tmp/svcprobe/run-{{ probe_run_id }}/pw"
-      for n in {{ probe_rw_nodes | map('quote') | join(' ') }}; do
+      for n in {{ probe_rw_set | map('quote') | join(' ') }}; do
         ssh -o BatchMode=yes -o ConnectTimeout=5 "$n" \
           "sudo slapcat -b $BASE -a '(cn=svcprobe.*)' 2>/dev/null | sed -n 's/^dn: //p' > /var/tmp/svcprobe/dns.txt;
            [ -s /var/tmp/svcprobe/dns.txt ] || exit 0;
@@ -311,7 +325,7 @@
     cmd: >-
       setsid nohup /bin/bash /var/tmp/svcprobe/service_probe.sh
       {{ probe_run_id | quote }}
-      {{ (item in probe_rw_nodes) | ternary('rw', 'ro') }}
+      {{ (item in probe_rw_set) | ternary('rw', 'ro') }}
       {{ probe_interval_s | default(1) | quote }}
       {{ probe_op_timeout_s | default(5) | quote }}
       {{ probe_basedn | default('dc=example,dc=com') | quote }}
@@ -389,7 +403,7 @@
     that:
       - probe_summary[item] is defined
       - probe_summary[item]['R']['total'] | default(0) >= 3
-      - item not in probe_rw_nodes or (probe_summary[item]['W']['total'] | default(0) >= 3)
+      - item not in probe_rw_set or (probe_summary[item]['W']['total'] | default(0) >= 3)
     fail_msg: >-
       ERRORE: report della sonda assente o incompleto per {{ item }} (servono
       almeno 3 letture, e 3 scritture sui master) - senza dati il test non
