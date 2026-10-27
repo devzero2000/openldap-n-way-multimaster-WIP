@@ -82,3 +82,37 @@ reale (qdisc `netem` e regole mangle sulla 636) viene verificato su tutti e 4
 i nodi con `assert_wan_state.yml`. Un'interruzione con Ctrl-C non esegue
 l'`always`: in quel caso spegnere la WAN a mano con `-e stato=disabled`.
 I test non vanno lanciati con `--check`.
+
+## Componenti comuni
+
+Task file da includere con `ansible.builtin.include_tasks` (non sono
+playbook), condivisi dai test.
+
+### `assert_clock_skew.yml`
+
+Misura lo scarto reale fra gli orologi dei nodi via SSH e ferma il test oltre
+`max_clock_skew_ms`. Serve ai test che dipendono dall'ordine dei CSN.
+
+### `assert_data_integrity.yml` (+ `lib/ldif_integrity.py`)
+
+Verifica che il **contenuto** del DIT sia identico su tutti i nodi indicati,
+entry per entry e attributo per attributo, partendo da un dump `slapcat` di
+ogni nodo letto via SSH. Opzionalmente verifica anche la coerenza
+`member`/`memberOf` nel namespace del test (`integrity_member_scope`):
+membri che puntano a entry inesistenti (`DANGLING_MEMBER`), membri senza il
+`memberOf` corrispondente (`MISSING_MEMBEROF`), `memberOf` verso gruppi che
+non li contengono (`ORPHAN_MEMBEROF`). Ripete il confronto fino a
+`integrity_timeout`, perché la replica può essere ancora in corso.
+
+Sostituisce i conteggi dove conta l'integrità: due nodi con lo stesso numero
+di entry ma valori diversi risultano convergenti per un conteggio, non per
+questo controllo.
+
+- `contextCSN` non si confronta: syncprov la scrive su disco solo ai
+  checkpoint, quindi differisce anche a cluster fermo e allineato.
+- **Differenza nota**: sulla replica read-only l'entry radice del suffisso ha
+  `entryUUID`, `entryCSN` e timestamp diversi da quelli dei master (creata
+  localmente al deploy). Non blocca i test, ma viene stampata a ogni run come
+  `KNOWN_DIFF` per restare visibile.
+- Con `integrity_assert: false` registra solo il risultato
+  (`integrity_check`), così il chiamante può fare l'assert dopo il cleanup.
