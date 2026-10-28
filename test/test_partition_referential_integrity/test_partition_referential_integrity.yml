@@ -35,6 +35,11 @@
 # COME: partizione su tcp/636 fra node1 e node2/node3, stessa tecnica e stessa
 # verifica dei 4 leg di test_network_partition_conflict_resolution.yml (solo
 # 636: il nodo di controllo Ansible e' node1, un DROP totale taglierebbe SSH).
+# Le regole filtrano sia --dport 636 sia --sport 636, in INPUT e in OUTPUT:
+# con la sola --dport, sulle connessioni syncrepl GIA' stabilite i dati
+# provider->consumer (che escono dalla 636) passavano e si perdevano solo gli
+# ACK. La prova dei 4 leg apre connessioni nuove e non se ne accorge, per
+# questo c'e' anche il conteggio delle regole per porta su ogni nodo.
 # Integrita' con assert_data_integrity.yml (contenuto identico entry per
 # entry + coerenza member/memberOf nel namespace refint-part.*), servizio con
 # service_probe.yml (ogni nodo deve continuare a servire durante la
@@ -51,8 +56,20 @@
 # CHECK MODE: NON usare --check (orchestra un altro ansible-playbook, applica
 # regole iptables reali, scrive sul cluster).
 #
-# VERSIONE:     1.0
+# VERSIONE:     1.2
 # CHANGELOG:
+#   1.2 - 2026-10-28 - probe_rw_nodes/probe_ro_nodes spostati nei vars del
+#                      play: passati solo alle include di start e kill, le
+#                      chiamate stop (FASE 7) e assert (FASE 9) li ricevevano
+#                      vuoti e il test si fermava prima del cleanup del
+#                      namespace (run del 2026-10-28, entry refint-part.*
+#                      rimaste sul cluster).
+#   1.1 - 2026-10-28 - FASE 2: partizione anche su --sport 636 (INPUT e OUTPUT,
+#                      tutti e tre i master) e assert sul numero di regole per
+#                      porta. Con la sola --dport le connessioni syncrepl gia'
+#                      stabilite continuavano a portare i dati del provider:
+#                      la partizione non era reale e la prova dei leg, fatta
+#                      con connessioni nuove, non lo rilevava.
 #   1.0 - 2026-10-27 - prima versione.
 # ==============================================================================
 
@@ -77,6 +94,12 @@
     clock_skew_tasks: "{{ playbook_dir }}/../assert_clock_skew.yml"
     integrity_tasks: "{{ playbook_dir }}/../assert_data_integrity.yml"
     probe_tasks: "{{ playbook_dir }}/../service_probe.yml"
+    # Nodi sondati: nei vars del play e non in quelli delle singole
+    # include_tasks, perche' le vars di un'inclusione valgono solo per
+    # quella: stop e assert le ricevevano vuote e service_probe.yml
+    # falliva in FASE 7 (v1.2).
+    probe_rw_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+    probe_ro_nodes: ["{{ node4 }}"]
 
     # Namespace del test e DN delle entry dei quattro casi
     ns: "refint-part"
@@ -272,8 +295,6 @@
           ansible.builtin.include_tasks: "{{ probe_tasks }}"
           vars:
             probe_action: start
-            probe_rw_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
-            probe_ro_nodes: ["{{ node4 }}"]
 
         # ==========================================================================
         # FASE 1: BASELINE - utenti e gruppi creati su node1 e propagati
@@ -334,11 +355,16 @@
         # FASE 2: PARTIZIONE node1 <-> node2/node3 (solo tcp/636) E PROVA DEI 4 LEG
         # ==========================================================================
 
+        # Ogni coppia chain/peer ha DUE regole: --dport 636 (il peer e' client
+        # del server locale, o viceversa) e --sport 636 (risposte e dati del
+        # provider). Senza --sport le connessioni syncrepl gia' stabilite
+        # restavano aperte nel verso provider->consumer (v1.1).
         - name: "[FASE 2] Applica la partizione verso node2/node3 su {{ node1 }}"
           ansible.builtin.iptables:
             chain: "{{ item.chain }}"
             protocol: tcp
-            destination_port: "{{ partition_ldap_port }}"
+            destination_port: "{{ (item.port == 'dport') | ternary(partition_ldap_port, omit) }}"
+            source_port: "{{ (item.port == 'sport') | ternary(partition_ldap_port, omit) }}"
             source: "{{ (item.chain == 'INPUT') | ternary(item.peer, omit) }}"
             destination: "{{ (item.chain == 'OUTPUT') | ternary(item.peer, omit) }}"
             jump: DROP
@@ -348,18 +374,23 @@
           delegate_to: "{{ node1 }}"
           become: true
           loop:
-            - {chain: "INPUT", peer: "{{ node2 }}"}
-            - {chain: "INPUT", peer: "{{ node3 }}"}
-            - {chain: "OUTPUT", peer: "{{ node2 }}"}
-            - {chain: "OUTPUT", peer: "{{ node3 }}"}
+            - {chain: "INPUT", peer: "{{ node2 }}", port: "dport"}
+            - {chain: "INPUT", peer: "{{ node2 }}", port: "sport"}
+            - {chain: "INPUT", peer: "{{ node3 }}", port: "dport"}
+            - {chain: "INPUT", peer: "{{ node3 }}", port: "sport"}
+            - {chain: "OUTPUT", peer: "{{ node2 }}", port: "dport"}
+            - {chain: "OUTPUT", peer: "{{ node2 }}", port: "sport"}
+            - {chain: "OUTPUT", peer: "{{ node3 }}", port: "dport"}
+            - {chain: "OUTPUT", peer: "{{ node3 }}", port: "sport"}
           loop_control:
-            label: "{{ item.chain }} <-> {{ item.peer }}"
+            label: "{{ item.chain }} {{ item.port }} <-> {{ item.peer }}"
 
         - name: "[FASE 2] Specchia la partizione su node2 e node3 verso {{ node1 }}"
           ansible.builtin.iptables:
             chain: "{{ item.chain }}"
             protocol: tcp
-            destination_port: "{{ partition_ldap_port }}"
+            destination_port: "{{ (item.port == 'dport') | ternary(partition_ldap_port, omit) }}"
+            source_port: "{{ (item.port == 'sport') | ternary(partition_ldap_port, omit) }}"
             source: "{{ (item.chain == 'INPUT') | ternary(node1, omit) }}"
             destination: "{{ (item.chain == 'OUTPUT') | ternary(node1, omit) }}"
             jump: DROP
@@ -368,12 +399,60 @@
           delegate_to: "{{ item.host }}"
           become: true
           loop:
-            - {host: "{{ node2 }}", chain: "INPUT"}
-            - {host: "{{ node2 }}", chain: "OUTPUT"}
-            - {host: "{{ node3 }}", chain: "INPUT"}
-            - {host: "{{ node3 }}", chain: "OUTPUT"}
+            - {host: "{{ node2 }}", chain: "INPUT", port: "dport"}
+            - {host: "{{ node2 }}", chain: "INPUT", port: "sport"}
+            - {host: "{{ node2 }}", chain: "OUTPUT", port: "dport"}
+            - {host: "{{ node2 }}", chain: "OUTPUT", port: "sport"}
+            - {host: "{{ node3 }}", chain: "INPUT", port: "dport"}
+            - {host: "{{ node3 }}", chain: "INPUT", port: "sport"}
+            - {host: "{{ node3 }}", chain: "OUTPUT", port: "dport"}
+            - {host: "{{ node3 }}", chain: "OUTPUT", port: "sport"}
           loop_control:
-            label: "{{ item.host }} {{ item.chain }} <-> {{ node1 }}"
+            label: "{{ item.host }} {{ item.chain }} {{ item.port }} <-> {{ node1 }}"
+
+        # La prova dei leg sotto apre connessioni NUOVE e vede solo --dport:
+        # il conteggio per chain e porta e' l'unico controllo che copre anche
+        # le connessioni gia' stabilite. Attesi: 2 regole (una per peer) per
+        # ogni combinazione su node1, 1 su node2 e node3.
+        - name: "[FASE 2] Conta le regole di partizione per chain e porta su ogni master"
+          ansible.builtin.shell:
+            cmd: |
+              set -u
+              set -o pipefail
+              RULES=$(iptables -S | grep -F -- "{{ partition_comment }}") || RULES=""
+              for CHAIN in INPUT OUTPUT; do
+                for DIR in dport sport; do
+                  N=$(grep -c -- "-A $CHAIN .*--$DIR {{ partition_ldap_port }} " <<< "$RULES") || true
+                  echo "$CHAIN-$DIR=$N"
+                done
+              done
+            executable: /bin/bash
+          delegate_to: "{{ item }}"
+          become: true
+          loop: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
+          register: rule_counts
+          changed_when: false
+
+        - name: "[FASE 2] Blocca se mancano regole di partizione (in particolare --sport, connessioni stabilite)"
+          ansible.builtin.assert:
+            that:
+              - item.stdout_lines | sort == expected | sort
+            fail_msg: >-
+              ERRORE: regole di partizione incomplete su {{ item.item }}:
+              {{ item.stdout_lines | join(', ') }} (attese {{ expected | join(', ') }}).
+              Una combinazione mancante lascia passare il traffico syncrepl su
+              connessioni gia' stabilite: la partizione non sarebbe reale.
+            success_msg: "OK: {{ item.item }} {{ item.stdout_lines | join(', ') }}"
+          vars:
+            n_expected: "{{ (item.item == node1) | ternary(2, 1) }}"
+            expected:
+              - "INPUT-dport={{ n_expected }}"
+              - "INPUT-sport={{ n_expected }}"
+              - "OUTPUT-dport={{ n_expected }}"
+              - "OUTPUT-sport={{ n_expected }}"
+          loop: "{{ rule_counts.results }}"
+          loop_control:
+            label: "{{ item.item }}"
 
         # Tutti e 4 i leg: un leg aperto farebbe da ponte attraverso il terzo
         # nodo e invaliderebbe il test (lezione 5).
@@ -725,8 +804,6 @@
           ansible.builtin.include_tasks: "{{ probe_tasks }}"
           vars:
             probe_action: kill
-            probe_rw_nodes: ["{{ node1 }}", "{{ node2 }}", "{{ node3 }}"]
-            probe_ro_nodes: ["{{ node4 }}"]
 
         - name: "[POST] Verifica che la simulazione WAN sia REALMENTE rimossa dai 4 nodi"
           ansible.builtin.include_tasks: "{{ wan_assert_tasks }}"

@@ -1,0 +1,2565 @@
+
+PLAY [REFERENTIAL INTEGRITY TEST: member/memberOf dopo modifiche incrociate durante una partizione] ***
+
+TASK [[PRE] Abilita la simulazione WAN MPLS+IPSec su tutto il cluster] *********
+changed: [localhost]
+
+TASK [[PRE] Verifica che la simulazione WAN sia REALMENTE attiva sui 4 nodi] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml for localhost
+
+TASK [[WAN] Controlla i parametri passati alla verifica dello stato WAN] *******
+ok: [localhost]
+
+TASK [[WAN] Rileva lo stato reale della simulazione WAN (qdisc netem e regole mangle 636) sui nodi] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[WAN] Blocca se lo stato reale della simulazione WAN non e' quello atteso su un nodo] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts1.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts2.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts3.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts4.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 3,
+    "msg": "OK: simulazione WAN 'enabled' su ubuntu26lts4.example.com."
+}
+
+TASK [[FASE 0] Verifica pre-volo che slapd sia attivo su tutti e 4 i nodi] *****
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[FASE 0] Blocca se un nodo e' GIA' inattivo prima di iniziare (non causato da questo test)] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "daemon_reexec": false,
+                "daemon_reload": false,
+                "enabled": null,
+                "force": null,
+                "masked": null,
+                "name": "slapd",
+                "no_block": false,
+                "scope": "system",
+                "state": null
+            }
+        },
+        "item": "ubuntu26lts1.example.com",
+        "name": "slapd",
+        "status": {
+            "ActiveEnterTimestamp": "Tue 2026-10-27 06:38:29 CET",
+            "ActiveEnterTimestampMonotonic": "13602927",
+            "ActiveExitTimestampMonotonic": "0",
+            "ActiveState": "active",
+            "After": "network.target sysinit.target systemd-journald.socket basic.target system.slice",
+            "AllowIsolate": "no",
+            "AssertResult": "yes",
+            "AssertTimestamp": "Tue 2026-10-27 06:38:22 CET",
+            "AssertTimestampMonotonic": "11821305",
+            "Before": "shutdown.target multi-user.target",
+            "BindLogSockets": "no",
+            "CPUAffinityFromNUMA": "no",
+            "CPUQuotaPerSecUSec": "infinity",
+            "CPUQuotaPeriodUSec": "infinity",
+            "CPUSchedulingPolicy": "0",
+            "CPUSchedulingPriority": "0",
+            "CPUSchedulingResetOnFork": "no",
+            "CPUUsageNSec": "19446819000",
+            "CPUWeight": "[not set]",
+            "CacheDirectoryAccounting": "no",
+            "CacheDirectoryMode": "0755",
+            "CacheDirectoryQuota": "[not set]",
+            "CanFreeze": "yes",
+            "CanIsolate": "no",
+            "CanLiveMount": "no",
+            "CanReload": "no",
+            "CanStart": "yes",
+            "CanStop": "yes",
+            "CapabilityBoundingSet": "cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore",
+            "CleanResult": "success",
+            "CollectMode": "inactive",
+            "ConditionResult": "yes",
+            "ConditionTimestamp": "Tue 2026-10-27 06:38:22 CET",
+            "ConditionTimestampMonotonic": "11821300",
+            "ConfigurationDirectoryMode": "0755",
+            "Conflicts": "shutdown.target",
+            "ControlGroup": "/system.slice/slapd.service",
+            "ControlGroupId": "4586",
+            "ControlPID": "0",
+            "CoredumpFilter": "0x33",
+            "CoredumpReceive": "no",
+            "DebugInvocation": "no",
+            "DefaultDependencies": "yes",
+            "DefaultMemoryLow": "0",
+            "DefaultMemoryMin": "0",
+            "DefaultStartupMemoryLow": "0",
+            "Delegate": "no",
+            "DelegateNamespaces": "18446744073709551615",
+            "Description": "OpenLDAP Server Daemon",
+            "DevicePolicy": "auto",
+            "Documentation": "man:slapd man:slapd-config man:slapd-mdb",
+            "DropInPaths": "/etc/systemd/system/slapd.service.d/limits.conf /etc/systemd/system/slapd.service.d/stop-timeout.conf",
+            "DynamicUser": "no",
+            "EffectiveMemoryHigh": "4100124672",
+            "EffectiveMemoryMax": "4100124672",
+            "EffectiveTasksMax": "3549",
+            "EnvironmentFiles": "/etc/default/slapd (ignore_errors=no)",
+            "ExecMainCode": "0",
+            "ExecMainExitTimestampMonotonic": "0",
+            "ExecMainHandoffTimestamp": "Tue 2026-10-27 06:38:22 CET",
+            "ExecMainHandoffTimestampMonotonic": "11901684",
+            "ExecMainPID": "1176",
+            "ExecMainStartTimestamp": "Tue 2026-10-27 06:38:22 CET",
+            "ExecMainStartTimestampMonotonic": "11825157",
+            "ExecMainStatus": "0",
+            "ExecStart": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+            "ExecStartEx": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; flags= ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+            "ExitType": "main",
+            "ExtensionImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "FailureAction": "none",
+            "FileDescriptorStoreMax": "0",
+            "FileDescriptorStorePreserve": "restart",
+            "FinalKillSignal": "9",
+            "FragmentPath": "/usr/lib/systemd/system/slapd.service",
+            "FreezerState": "running",
+            "GID": "[not set]",
+            "GuessMainPID": "yes",
+            "IOAccounting": "no",
+            "IOReadBytes": "[not set]",
+            "IOReadOperations": "[not set]",
+            "IOSchedulingClass": "2",
+            "IOSchedulingPriority": "4",
+            "IOWeight": "[not set]",
+            "IOWriteBytes": "[not set]",
+            "IOWriteOperations": "[not set]",
+            "IPAccounting": "no",
+            "IPEgressBytes": "[no data]",
+            "IPEgressPackets": "[no data]",
+            "IPIngressBytes": "[no data]",
+            "IPIngressPackets": "[no data]",
+            "Id": "slapd.service",
+            "IgnoreOnIsolate": "no",
+            "IgnoreSIGPIPE": "yes",
+            "InactiveEnterTimestampMonotonic": "0",
+            "InactiveExitTimestamp": "Tue 2026-10-27 06:38:22 CET",
+            "InactiveExitTimestampMonotonic": "11826224",
+            "InvocationID": "ec77f1f132c446a094bed70097d77ade",
+            "JobRunningTimeoutUSec": "infinity",
+            "JobTimeoutAction": "none",
+            "JobTimeoutUSec": "infinity",
+            "KeyringMode": "private",
+            "KillMode": "mixed",
+            "KillSignal": "15",
+            "LimitAS": "infinity",
+            "LimitASSoft": "infinity",
+            "LimitCORE": "infinity",
+            "LimitCORESoft": "0",
+            "LimitCPU": "infinity",
+            "LimitCPUSoft": "infinity",
+            "LimitDATA": "infinity",
+            "LimitDATASoft": "infinity",
+            "LimitFSIZE": "infinity",
+            "LimitFSIZESoft": "infinity",
+            "LimitLOCKS": "infinity",
+            "LimitLOCKSSoft": "infinity",
+            "LimitMEMLOCK": "8388608",
+            "LimitMEMLOCKSoft": "8388608",
+            "LimitMSGQUEUE": "819200",
+            "LimitMSGQUEUESoft": "819200",
+            "LimitNICE": "0",
+            "LimitNICESoft": "0",
+            "LimitNOFILE": "65536",
+            "LimitNOFILESoft": "65536",
+            "LimitNPROC": "65536",
+            "LimitNPROCSoft": "65536",
+            "LimitRSS": "infinity",
+            "LimitRSSSoft": "infinity",
+            "LimitRTPRIO": "0",
+            "LimitRTPRIOSoft": "0",
+            "LimitRTTIME": "infinity",
+            "LimitRTTIMESoft": "infinity",
+            "LimitSIGPENDING": "11832",
+            "LimitSIGPENDINGSoft": "11832",
+            "LimitSTACK": "infinity",
+            "LimitSTACKSoft": "8388608",
+            "LiveMountResult": "success",
+            "LoadState": "loaded",
+            "LockPersonality": "no",
+            "LogLevelMax": "-1",
+            "LogRateLimitBurst": "0",
+            "LogRateLimitIntervalUSec": "0",
+            "LogsDirectoryAccounting": "no",
+            "LogsDirectoryMode": "0755",
+            "LogsDirectoryQuota": "[not set]",
+            "MainPID": "1176",
+            "ManagedOOMKills": "0",
+            "ManagedOOMMemoryPressure": "auto",
+            "ManagedOOMMemoryPressureDurationUSec": "[not set]",
+            "ManagedOOMMemoryPressureLimit": "0",
+            "ManagedOOMPreference": "none",
+            "ManagedOOMSwap": "auto",
+            "MemoryAccounting": "yes",
+            "MemoryAvailable": "2937085952",
+            "MemoryCurrent": "63791104",
+            "MemoryDenyWriteExecute": "no",
+            "MemoryHigh": "infinity",
+            "MemoryKSM": "no",
+            "MemoryLow": "0",
+            "MemoryMax": "infinity",
+            "MemoryMin": "0",
+            "MemoryPeak": "64315392",
+            "MemoryPressureThresholdUSec": "200ms",
+            "MemoryPressureWatch": "auto",
+            "MemorySwapCurrent": "0",
+            "MemorySwapMax": "infinity",
+            "MemorySwapPeak": "0",
+            "MemoryZSwapCurrent": "0",
+            "MemoryZSwapMax": "infinity",
+            "MemoryZSwapWriteback": "yes",
+            "MountAPIVFS": "no",
+            "MountImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "NFileDescriptorStore": "0",
+            "NRestarts": "0",
+            "NUMAPolicy": "n/a",
+            "Names": "slapd.service",
+            "NeedDaemonReload": "no",
+            "Nice": "0",
+            "NoNewPrivileges": "no",
+            "NonBlocking": "no",
+            "NotifyAccess": "main",
+            "OOMKills": "0",
+            "OOMPolicy": "stop",
+            "OOMScoreAdjust": "0",
+            "OnFailureJobMode": "replace",
+            "OnSuccessJobMode": "fail",
+            "Perpetual": "no",
+            "PrivateBPF": "no",
+            "PrivateDevices": "no",
+            "PrivateIPC": "no",
+            "PrivateMounts": "no",
+            "PrivateNetwork": "no",
+            "PrivatePIDs": "no",
+            "PrivateTmp": "no",
+            "PrivateTmpEx": "no",
+            "PrivateUsers": "no",
+            "PrivateUsersEx": "no",
+            "ProcSubset": "all",
+            "ProtectClock": "no",
+            "ProtectControlGroups": "no",
+            "ProtectControlGroupsEx": "no",
+            "ProtectHome": "no",
+            "ProtectHostname": "no",
+            "ProtectKernelLogs": "no",
+            "ProtectKernelModules": "no",
+            "ProtectKernelTunables": "no",
+            "ProtectProc": "default",
+            "ProtectSystem": "no",
+            "RefuseManualStart": "no",
+            "RefuseManualStop": "no",
+            "ReloadResult": "success",
+            "ReloadSignal": "1",
+            "RemainAfterExit": "no",
+            "RemoveIPC": "no",
+            "Requires": "system.slice sysinit.target",
+            "Restart": "no",
+            "RestartKillSignal": "15",
+            "RestartMaxDelayUSec": "infinity",
+            "RestartMode": "normal",
+            "RestartSteps": "0",
+            "RestartUSec": "100ms",
+            "RestartUSecNext": "100ms",
+            "RestrictNamespaces": "no",
+            "RestrictRealtime": "no",
+            "RestrictSUIDSGID": "no",
+            "Result": "success",
+            "RootDirectoryStartOnly": "no",
+            "RootEphemeral": "no",
+            "RootImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "RuntimeDirectoryMode": "0755",
+            "RuntimeDirectoryPreserve": "no",
+            "RuntimeMaxUSec": "infinity",
+            "RuntimeRandomizedExtraUSec": "0",
+            "SameProcessGroup": "no",
+            "SecureBits": "0",
+            "SendSIGHUP": "no",
+            "SendSIGKILL": "yes",
+            "SetLoginEnvironment": "no",
+            "Slice": "system.slice",
+            "StandardError": "inherit",
+            "StandardInput": "null",
+            "StandardOutput": "journal",
+            "StartLimitAction": "none",
+            "StartLimitBurst": "5",
+            "StartLimitIntervalUSec": "10s",
+            "StartupCPUWeight": "[not set]",
+            "StartupIOWeight": "[not set]",
+            "StartupMemoryHigh": "infinity",
+            "StartupMemoryLow": "0",
+            "StartupMemoryMax": "infinity",
+            "StartupMemorySwapMax": "infinity",
+            "StartupMemoryZSwapMax": "infinity",
+            "StateChangeTimestamp": "Tue 2026-10-27 06:38:29 CET",
+            "StateChangeTimestampMonotonic": "13602927",
+            "StateDirectoryAccounting": "no",
+            "StateDirectoryMode": "0755",
+            "StateDirectoryQuota": "[not set]",
+            "StatusErrno": "0",
+            "StopWhenUnneeded": "no",
+            "SubState": "running",
+            "SuccessAction": "none",
+            "SurviveFinalKillSignal": "no",
+            "SyslogFacility": "3",
+            "SyslogLevel": "6",
+            "SyslogLevelPrefix": "yes",
+            "SyslogPriority": "30",
+            "SystemCallErrorNumber": "2147483646",
+            "TTYReset": "no",
+            "TTYVHangup": "no",
+            "TTYVTDisallocate": "no",
+            "TasksAccounting": "yes",
+            "TasksCurrent": "10",
+            "TasksMax": "3549",
+            "TimeoutAbortUSec": "15s",
+            "TimeoutCleanUSec": "infinity",
+            "TimeoutStartFailureMode": "terminate",
+            "TimeoutStartUSec": "1min 30s",
+            "TimeoutStopFailureMode": "terminate",
+            "TimeoutStopUSec": "15s",
+            "TimerSlackNSec": "50000",
+            "Transient": "no",
+            "Type": "notify",
+            "UID": "[not set]",
+            "UMask": "0022",
+            "UnitFilePreset": "enabled",
+            "UnitFileState": "enabled",
+            "UtmpMode": "init",
+            "WantedBy": "multi-user.target",
+            "WatchdogSignal": "6",
+            "WatchdogTimestampMonotonic": "0",
+            "WatchdogUSec": "0"
+        }
+    },
+    "msg": "OK: slapd attivo su ubuntu26lts1.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "daemon_reexec": false,
+                "daemon_reload": false,
+                "enabled": null,
+                "force": null,
+                "masked": null,
+                "name": "slapd",
+                "no_block": false,
+                "scope": "system",
+                "state": null
+            }
+        },
+        "item": "ubuntu26lts2.example.com",
+        "name": "slapd",
+        "status": {
+            "ActiveEnterTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "ActiveEnterTimestampMonotonic": "807737510",
+            "ActiveExitTimestamp": "Tue 2026-10-27 07:04:56 CET",
+            "ActiveExitTimestampMonotonic": "792573422",
+            "ActiveState": "active",
+            "After": "basic.target systemd-journald.socket sysinit.target system.slice network.target",
+            "AllowIsolate": "no",
+            "AssertResult": "yes",
+            "AssertTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "AssertTimestampMonotonic": "807678071",
+            "Before": "multi-user.target shutdown.target",
+            "BindLogSockets": "no",
+            "CPUAffinityFromNUMA": "no",
+            "CPUQuotaPerSecUSec": "infinity",
+            "CPUQuotaPeriodUSec": "infinity",
+            "CPUSchedulingPolicy": "0",
+            "CPUSchedulingPriority": "0",
+            "CPUSchedulingResetOnFork": "no",
+            "CPUUsageNSec": "20194147000",
+            "CPUWeight": "[not set]",
+            "CacheDirectoryAccounting": "no",
+            "CacheDirectoryMode": "0755",
+            "CacheDirectoryQuota": "[not set]",
+            "CanFreeze": "yes",
+            "CanIsolate": "no",
+            "CanLiveMount": "no",
+            "CanReload": "no",
+            "CanStart": "yes",
+            "CanStop": "yes",
+            "CapabilityBoundingSet": "cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore",
+            "CleanResult": "success",
+            "CollectMode": "inactive",
+            "ConditionResult": "yes",
+            "ConditionTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "ConditionTimestampMonotonic": "807678068",
+            "ConfigurationDirectoryMode": "0755",
+            "Conflicts": "shutdown.target",
+            "ControlGroup": "/system.slice/slapd.service",
+            "ControlGroupId": "6960",
+            "ControlPID": "0",
+            "CoredumpFilter": "0x33",
+            "CoredumpReceive": "no",
+            "DebugInvocation": "no",
+            "DefaultDependencies": "yes",
+            "DefaultMemoryLow": "0",
+            "DefaultMemoryMin": "0",
+            "DefaultStartupMemoryLow": "0",
+            "Delegate": "no",
+            "DelegateNamespaces": "18446744073709551615",
+            "Description": "OpenLDAP Server Daemon",
+            "DevicePolicy": "auto",
+            "Documentation": "man:slapd man:slapd-config man:slapd-mdb",
+            "DropInPaths": "/etc/systemd/system/slapd.service.d/limits.conf /etc/systemd/system/slapd.service.d/stop-timeout.conf",
+            "DynamicUser": "no",
+            "EffectiveMemoryHigh": "4100128768",
+            "EffectiveMemoryMax": "4100128768",
+            "EffectiveTasksMax": "3560",
+            "EnvironmentFiles": "/etc/default/slapd (ignore_errors=no)",
+            "ExecMainCode": "0",
+            "ExecMainExitTimestampMonotonic": "0",
+            "ExecMainHandoffTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "ExecMainHandoffTimestampMonotonic": "807689957",
+            "ExecMainPID": "4679",
+            "ExecMainStartTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "ExecMainStartTimestampMonotonic": "807679049",
+            "ExecMainStatus": "0",
+            "ExecStart": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; ignore_errors=no ; start_time=[Tue 2026-10-27 07:05:11 CET] ; stop_time=[n/a] ; pid=4679 ; code=(null) ; status=0/0 }",
+            "ExecStartEx": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; flags= ; start_time=[Tue 2026-10-27 07:05:11 CET] ; stop_time=[n/a] ; pid=4679 ; code=(null) ; status=0/0 }",
+            "ExitType": "main",
+            "ExtensionImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "FailureAction": "none",
+            "FileDescriptorStoreMax": "0",
+            "FileDescriptorStorePreserve": "restart",
+            "FinalKillSignal": "9",
+            "FragmentPath": "/usr/lib/systemd/system/slapd.service",
+            "FreezerState": "running",
+            "GID": "[not set]",
+            "GuessMainPID": "yes",
+            "IOAccounting": "no",
+            "IOReadBytes": "[not set]",
+            "IOReadOperations": "[not set]",
+            "IOSchedulingClass": "2",
+            "IOSchedulingPriority": "4",
+            "IOWeight": "[not set]",
+            "IOWriteBytes": "[not set]",
+            "IOWriteOperations": "[not set]",
+            "IPAccounting": "no",
+            "IPEgressBytes": "[no data]",
+            "IPEgressPackets": "[no data]",
+            "IPIngressBytes": "[no data]",
+            "IPIngressPackets": "[no data]",
+            "Id": "slapd.service",
+            "IgnoreOnIsolate": "no",
+            "IgnoreSIGPIPE": "yes",
+            "InactiveEnterTimestamp": "Tue 2026-10-27 07:04:56 CET",
+            "InactiveEnterTimestampMonotonic": "792573422",
+            "InactiveExitTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "InactiveExitTimestampMonotonic": "807680071",
+            "InvocationID": "5076e8c127a540b7888dc2762a25075e",
+            "JobRunningTimeoutUSec": "infinity",
+            "JobTimeoutAction": "none",
+            "JobTimeoutUSec": "infinity",
+            "KeyringMode": "private",
+            "KillMode": "mixed",
+            "KillSignal": "15",
+            "LimitAS": "infinity",
+            "LimitASSoft": "infinity",
+            "LimitCORE": "infinity",
+            "LimitCORESoft": "0",
+            "LimitCPU": "infinity",
+            "LimitCPUSoft": "infinity",
+            "LimitDATA": "infinity",
+            "LimitDATASoft": "infinity",
+            "LimitFSIZE": "infinity",
+            "LimitFSIZESoft": "infinity",
+            "LimitLOCKS": "infinity",
+            "LimitLOCKSSoft": "infinity",
+            "LimitMEMLOCK": "8388608",
+            "LimitMEMLOCKSoft": "8388608",
+            "LimitMSGQUEUE": "819200",
+            "LimitMSGQUEUESoft": "819200",
+            "LimitNICE": "0",
+            "LimitNICESoft": "0",
+            "LimitNOFILE": "65536",
+            "LimitNOFILESoft": "65536",
+            "LimitNPROC": "65536",
+            "LimitNPROCSoft": "65536",
+            "LimitRSS": "infinity",
+            "LimitRSSSoft": "infinity",
+            "LimitRTPRIO": "0",
+            "LimitRTPRIOSoft": "0",
+            "LimitRTTIME": "infinity",
+            "LimitRTTIMESoft": "infinity",
+            "LimitSIGPENDING": "11869",
+            "LimitSIGPENDINGSoft": "11869",
+            "LimitSTACK": "infinity",
+            "LimitSTACKSoft": "8388608",
+            "LiveMountResult": "success",
+            "LoadState": "loaded",
+            "LockPersonality": "no",
+            "LogLevelMax": "-1",
+            "LogRateLimitBurst": "0",
+            "LogRateLimitIntervalUSec": "0",
+            "LogsDirectoryAccounting": "no",
+            "LogsDirectoryMode": "0755",
+            "LogsDirectoryQuota": "[not set]",
+            "MainPID": "4679",
+            "ManagedOOMKills": "0",
+            "ManagedOOMMemoryPressure": "auto",
+            "ManagedOOMMemoryPressureDurationUSec": "[not set]",
+            "ManagedOOMMemoryPressureLimit": "0",
+            "ManagedOOMPreference": "none",
+            "ManagedOOMSwap": "auto",
+            "MemoryAccounting": "yes",
+            "MemoryAvailable": "3518484480",
+            "MemoryCurrent": "59228160",
+            "MemoryDenyWriteExecute": "no",
+            "MemoryHigh": "infinity",
+            "MemoryKSM": "no",
+            "MemoryLow": "0",
+            "MemoryMax": "infinity",
+            "MemoryMin": "0",
+            "MemoryPeak": "59736064",
+            "MemoryPressureThresholdUSec": "200ms",
+            "MemoryPressureWatch": "auto",
+            "MemorySwapCurrent": "0",
+            "MemorySwapMax": "infinity",
+            "MemorySwapPeak": "0",
+            "MemoryZSwapCurrent": "0",
+            "MemoryZSwapMax": "infinity",
+            "MemoryZSwapWriteback": "yes",
+            "MountAPIVFS": "no",
+            "MountImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "NFileDescriptorStore": "0",
+            "NRestarts": "0",
+            "NUMAPolicy": "n/a",
+            "Names": "slapd.service",
+            "NeedDaemonReload": "no",
+            "Nice": "0",
+            "NoNewPrivileges": "no",
+            "NonBlocking": "no",
+            "NotifyAccess": "main",
+            "OOMKills": "0",
+            "OOMPolicy": "stop",
+            "OOMScoreAdjust": "0",
+            "OnFailureJobMode": "replace",
+            "OnSuccessJobMode": "fail",
+            "Perpetual": "no",
+            "PrivateBPF": "no",
+            "PrivateDevices": "no",
+            "PrivateIPC": "no",
+            "PrivateMounts": "no",
+            "PrivateNetwork": "no",
+            "PrivatePIDs": "no",
+            "PrivateTmp": "no",
+            "PrivateTmpEx": "no",
+            "PrivateUsers": "no",
+            "PrivateUsersEx": "no",
+            "ProcSubset": "all",
+            "ProtectClock": "no",
+            "ProtectControlGroups": "no",
+            "ProtectControlGroupsEx": "no",
+            "ProtectHome": "no",
+            "ProtectHostname": "no",
+            "ProtectKernelLogs": "no",
+            "ProtectKernelModules": "no",
+            "ProtectKernelTunables": "no",
+            "ProtectProc": "default",
+            "ProtectSystem": "no",
+            "RefuseManualStart": "no",
+            "RefuseManualStop": "no",
+            "ReloadResult": "success",
+            "ReloadSignal": "1",
+            "RemainAfterExit": "no",
+            "RemoveIPC": "no",
+            "Requires": "system.slice sysinit.target",
+            "Restart": "no",
+            "RestartKillSignal": "15",
+            "RestartMaxDelayUSec": "infinity",
+            "RestartMode": "normal",
+            "RestartSteps": "0",
+            "RestartUSec": "100ms",
+            "RestartUSecNext": "100ms",
+            "RestrictNamespaces": "no",
+            "RestrictRealtime": "no",
+            "RestrictSUIDSGID": "no",
+            "Result": "success",
+            "RootDirectoryStartOnly": "no",
+            "RootEphemeral": "no",
+            "RootImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "RuntimeDirectoryMode": "0755",
+            "RuntimeDirectoryPreserve": "no",
+            "RuntimeMaxUSec": "infinity",
+            "RuntimeRandomizedExtraUSec": "0",
+            "SameProcessGroup": "no",
+            "SecureBits": "0",
+            "SendSIGHUP": "no",
+            "SendSIGKILL": "yes",
+            "SetLoginEnvironment": "no",
+            "Slice": "system.slice",
+            "StandardError": "inherit",
+            "StandardInput": "null",
+            "StandardOutput": "journal",
+            "StartLimitAction": "none",
+            "StartLimitBurst": "5",
+            "StartLimitIntervalUSec": "10s",
+            "StartupCPUWeight": "[not set]",
+            "StartupIOWeight": "[not set]",
+            "StartupMemoryHigh": "infinity",
+            "StartupMemoryLow": "0",
+            "StartupMemoryMax": "infinity",
+            "StartupMemorySwapMax": "infinity",
+            "StartupMemoryZSwapMax": "infinity",
+            "StateChangeTimestamp": "Tue 2026-10-27 07:05:11 CET",
+            "StateChangeTimestampMonotonic": "807737510",
+            "StateDirectoryAccounting": "no",
+            "StateDirectoryMode": "0755",
+            "StateDirectoryQuota": "[not set]",
+            "StatusErrno": "0",
+            "StopWhenUnneeded": "no",
+            "SubState": "running",
+            "SuccessAction": "none",
+            "SurviveFinalKillSignal": "no",
+            "SyslogFacility": "3",
+            "SyslogLevel": "6",
+            "SyslogLevelPrefix": "yes",
+            "SyslogPriority": "30",
+            "SystemCallErrorNumber": "2147483646",
+            "TTYReset": "no",
+            "TTYVHangup": "no",
+            "TTYVTDisallocate": "no",
+            "TasksAccounting": "yes",
+            "TasksCurrent": "9",
+            "TasksMax": "3560",
+            "TimeoutAbortUSec": "15s",
+            "TimeoutCleanUSec": "infinity",
+            "TimeoutStartFailureMode": "terminate",
+            "TimeoutStartUSec": "1min 30s",
+            "TimeoutStopFailureMode": "terminate",
+            "TimeoutStopUSec": "15s",
+            "TimerSlackNSec": "50000",
+            "Transient": "no",
+            "Type": "notify",
+            "UID": "[not set]",
+            "UMask": "0022",
+            "UnitFilePreset": "enabled",
+            "UnitFileState": "enabled",
+            "UtmpMode": "init",
+            "WantedBy": "multi-user.target",
+            "WatchdogSignal": "6",
+            "WatchdogTimestampMonotonic": "0",
+            "WatchdogUSec": "0"
+        }
+    },
+    "msg": "OK: slapd attivo su ubuntu26lts2.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "daemon_reexec": false,
+                "daemon_reload": false,
+                "enabled": null,
+                "force": null,
+                "masked": null,
+                "name": "slapd",
+                "no_block": false,
+                "scope": "system",
+                "state": null
+            }
+        },
+        "item": "ubuntu26lts3.example.com",
+        "name": "slapd",
+        "status": {
+            "ActiveEnterTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "ActiveEnterTimestampMonotonic": "744646880",
+            "ActiveExitTimestamp": "Tue 2026-10-27 07:05:01 CET",
+            "ActiveExitTimestampMonotonic": "733831785",
+            "ActiveState": "active",
+            "After": "system.slice basic.target network.target sysinit.target systemd-journald.socket",
+            "AllowIsolate": "no",
+            "AssertResult": "yes",
+            "AssertTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "AssertTimestampMonotonic": "744576887",
+            "Before": "shutdown.target multi-user.target",
+            "BindLogSockets": "no",
+            "CPUAffinityFromNUMA": "no",
+            "CPUQuotaPerSecUSec": "infinity",
+            "CPUQuotaPeriodUSec": "infinity",
+            "CPUSchedulingPolicy": "0",
+            "CPUSchedulingPriority": "0",
+            "CPUSchedulingResetOnFork": "no",
+            "CPUUsageNSec": "19196550000",
+            "CPUWeight": "[not set]",
+            "CacheDirectoryAccounting": "no",
+            "CacheDirectoryMode": "0755",
+            "CacheDirectoryQuota": "[not set]",
+            "CanFreeze": "yes",
+            "CanIsolate": "no",
+            "CanLiveMount": "no",
+            "CanReload": "no",
+            "CanStart": "yes",
+            "CanStop": "yes",
+            "CapabilityBoundingSet": "cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore",
+            "CleanResult": "success",
+            "CollectMode": "inactive",
+            "ConditionResult": "yes",
+            "ConditionTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "ConditionTimestampMonotonic": "744576883",
+            "ConfigurationDirectoryMode": "0755",
+            "Conflicts": "shutdown.target",
+            "ControlGroup": "/system.slice/slapd.service",
+            "ControlGroupId": "6934",
+            "ControlPID": "0",
+            "CoredumpFilter": "0x33",
+            "CoredumpReceive": "no",
+            "DebugInvocation": "no",
+            "DefaultDependencies": "yes",
+            "DefaultMemoryLow": "0",
+            "DefaultMemoryMin": "0",
+            "DefaultStartupMemoryLow": "0",
+            "Delegate": "no",
+            "DelegateNamespaces": "18446744073709551615",
+            "Description": "OpenLDAP Server Daemon",
+            "DevicePolicy": "auto",
+            "Documentation": "man:slapd man:slapd-config man:slapd-mdb",
+            "DropInPaths": "/etc/systemd/system/slapd.service.d/limits.conf /etc/systemd/system/slapd.service.d/stop-timeout.conf",
+            "DynamicUser": "no",
+            "EffectiveMemoryHigh": "4100132864",
+            "EffectiveMemoryMax": "4100132864",
+            "EffectiveTasksMax": "3560",
+            "EnvironmentFiles": "/etc/default/slapd (ignore_errors=no)",
+            "ExecMainCode": "0",
+            "ExecMainExitTimestampMonotonic": "0",
+            "ExecMainHandoffTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "ExecMainHandoffTimestampMonotonic": "744595227",
+            "ExecMainPID": "4635",
+            "ExecMainStartTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "ExecMainStartTimestampMonotonic": "744578017",
+            "ExecMainStatus": "0",
+            "ExecStart": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; ignore_errors=no ; start_time=[Tue 2026-10-27 07:05:12 CET] ; stop_time=[n/a] ; pid=4635 ; code=(null) ; status=0/0 }",
+            "ExecStartEx": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; flags= ; start_time=[Tue 2026-10-27 07:05:12 CET] ; stop_time=[n/a] ; pid=4635 ; code=(null) ; status=0/0 }",
+            "ExitType": "main",
+            "ExtensionImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "FailureAction": "none",
+            "FileDescriptorStoreMax": "0",
+            "FileDescriptorStorePreserve": "restart",
+            "FinalKillSignal": "9",
+            "FragmentPath": "/usr/lib/systemd/system/slapd.service",
+            "FreezerState": "running",
+            "GID": "[not set]",
+            "GuessMainPID": "yes",
+            "IOAccounting": "no",
+            "IOReadBytes": "[not set]",
+            "IOReadOperations": "[not set]",
+            "IOSchedulingClass": "2",
+            "IOSchedulingPriority": "4",
+            "IOWeight": "[not set]",
+            "IOWriteBytes": "[not set]",
+            "IOWriteOperations": "[not set]",
+            "IPAccounting": "no",
+            "IPEgressBytes": "[no data]",
+            "IPEgressPackets": "[no data]",
+            "IPIngressBytes": "[no data]",
+            "IPIngressPackets": "[no data]",
+            "Id": "slapd.service",
+            "IgnoreOnIsolate": "no",
+            "IgnoreSIGPIPE": "yes",
+            "InactiveEnterTimestamp": "Tue 2026-10-27 07:05:01 CET",
+            "InactiveEnterTimestampMonotonic": "733831785",
+            "InactiveExitTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "InactiveExitTimestampMonotonic": "744579075",
+            "InvocationID": "cda57b742a3d4b1fa4fbc09c1b0ccfe3",
+            "JobRunningTimeoutUSec": "infinity",
+            "JobTimeoutAction": "none",
+            "JobTimeoutUSec": "infinity",
+            "KeyringMode": "private",
+            "KillMode": "mixed",
+            "KillSignal": "15",
+            "LimitAS": "infinity",
+            "LimitASSoft": "infinity",
+            "LimitCORE": "infinity",
+            "LimitCORESoft": "0",
+            "LimitCPU": "infinity",
+            "LimitCPUSoft": "infinity",
+            "LimitDATA": "infinity",
+            "LimitDATASoft": "infinity",
+            "LimitFSIZE": "infinity",
+            "LimitFSIZESoft": "infinity",
+            "LimitLOCKS": "infinity",
+            "LimitLOCKSSoft": "infinity",
+            "LimitMEMLOCK": "8388608",
+            "LimitMEMLOCKSoft": "8388608",
+            "LimitMSGQUEUE": "819200",
+            "LimitMSGQUEUESoft": "819200",
+            "LimitNICE": "0",
+            "LimitNICESoft": "0",
+            "LimitNOFILE": "65536",
+            "LimitNOFILESoft": "65536",
+            "LimitNPROC": "65536",
+            "LimitNPROCSoft": "65536",
+            "LimitRSS": "infinity",
+            "LimitRSSSoft": "infinity",
+            "LimitRTPRIO": "0",
+            "LimitRTPRIOSoft": "0",
+            "LimitRTTIME": "infinity",
+            "LimitRTTIMESoft": "infinity",
+            "LimitSIGPENDING": "11869",
+            "LimitSIGPENDINGSoft": "11869",
+            "LimitSTACK": "infinity",
+            "LimitSTACKSoft": "8388608",
+            "LiveMountResult": "success",
+            "LoadState": "loaded",
+            "LockPersonality": "no",
+            "LogLevelMax": "-1",
+            "LogRateLimitBurst": "0",
+            "LogRateLimitIntervalUSec": "0",
+            "LogsDirectoryAccounting": "no",
+            "LogsDirectoryMode": "0755",
+            "LogsDirectoryQuota": "[not set]",
+            "MainPID": "4635",
+            "ManagedOOMKills": "0",
+            "ManagedOOMMemoryPressure": "auto",
+            "ManagedOOMMemoryPressureDurationUSec": "[not set]",
+            "ManagedOOMMemoryPressureLimit": "0",
+            "ManagedOOMPreference": "none",
+            "ManagedOOMSwap": "auto",
+            "MemoryAccounting": "yes",
+            "MemoryAvailable": "3521880064",
+            "MemoryCurrent": "60239872",
+            "MemoryDenyWriteExecute": "no",
+            "MemoryHigh": "infinity",
+            "MemoryKSM": "no",
+            "MemoryLow": "0",
+            "MemoryMax": "infinity",
+            "MemoryMin": "0",
+            "MemoryPeak": "60764160",
+            "MemoryPressureThresholdUSec": "200ms",
+            "MemoryPressureWatch": "auto",
+            "MemorySwapCurrent": "0",
+            "MemorySwapMax": "infinity",
+            "MemorySwapPeak": "0",
+            "MemoryZSwapCurrent": "0",
+            "MemoryZSwapMax": "infinity",
+            "MemoryZSwapWriteback": "yes",
+            "MountAPIVFS": "no",
+            "MountImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "NFileDescriptorStore": "0",
+            "NRestarts": "0",
+            "NUMAPolicy": "n/a",
+            "Names": "slapd.service",
+            "NeedDaemonReload": "no",
+            "Nice": "0",
+            "NoNewPrivileges": "no",
+            "NonBlocking": "no",
+            "NotifyAccess": "main",
+            "OOMKills": "0",
+            "OOMPolicy": "stop",
+            "OOMScoreAdjust": "0",
+            "OnFailureJobMode": "replace",
+            "OnSuccessJobMode": "fail",
+            "Perpetual": "no",
+            "PrivateBPF": "no",
+            "PrivateDevices": "no",
+            "PrivateIPC": "no",
+            "PrivateMounts": "no",
+            "PrivateNetwork": "no",
+            "PrivatePIDs": "no",
+            "PrivateTmp": "no",
+            "PrivateTmpEx": "no",
+            "PrivateUsers": "no",
+            "PrivateUsersEx": "no",
+            "ProcSubset": "all",
+            "ProtectClock": "no",
+            "ProtectControlGroups": "no",
+            "ProtectControlGroupsEx": "no",
+            "ProtectHome": "no",
+            "ProtectHostname": "no",
+            "ProtectKernelLogs": "no",
+            "ProtectKernelModules": "no",
+            "ProtectKernelTunables": "no",
+            "ProtectProc": "default",
+            "ProtectSystem": "no",
+            "RefuseManualStart": "no",
+            "RefuseManualStop": "no",
+            "ReloadResult": "success",
+            "ReloadSignal": "1",
+            "RemainAfterExit": "no",
+            "RemoveIPC": "no",
+            "Requires": "sysinit.target system.slice",
+            "Restart": "no",
+            "RestartKillSignal": "15",
+            "RestartMaxDelayUSec": "infinity",
+            "RestartMode": "normal",
+            "RestartSteps": "0",
+            "RestartUSec": "100ms",
+            "RestartUSecNext": "100ms",
+            "RestrictNamespaces": "no",
+            "RestrictRealtime": "no",
+            "RestrictSUIDSGID": "no",
+            "Result": "success",
+            "RootDirectoryStartOnly": "no",
+            "RootEphemeral": "no",
+            "RootImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "RuntimeDirectoryMode": "0755",
+            "RuntimeDirectoryPreserve": "no",
+            "RuntimeMaxUSec": "infinity",
+            "RuntimeRandomizedExtraUSec": "0",
+            "SameProcessGroup": "no",
+            "SecureBits": "0",
+            "SendSIGHUP": "no",
+            "SendSIGKILL": "yes",
+            "SetLoginEnvironment": "no",
+            "Slice": "system.slice",
+            "StandardError": "inherit",
+            "StandardInput": "null",
+            "StandardOutput": "journal",
+            "StartLimitAction": "none",
+            "StartLimitBurst": "5",
+            "StartLimitIntervalUSec": "10s",
+            "StartupCPUWeight": "[not set]",
+            "StartupIOWeight": "[not set]",
+            "StartupMemoryHigh": "infinity",
+            "StartupMemoryLow": "0",
+            "StartupMemoryMax": "infinity",
+            "StartupMemorySwapMax": "infinity",
+            "StartupMemoryZSwapMax": "infinity",
+            "StateChangeTimestamp": "Tue 2026-10-27 07:05:12 CET",
+            "StateChangeTimestampMonotonic": "744646880",
+            "StateDirectoryAccounting": "no",
+            "StateDirectoryMode": "0755",
+            "StateDirectoryQuota": "[not set]",
+            "StatusErrno": "0",
+            "StopWhenUnneeded": "no",
+            "SubState": "running",
+            "SuccessAction": "none",
+            "SurviveFinalKillSignal": "no",
+            "SyslogFacility": "3",
+            "SyslogLevel": "6",
+            "SyslogLevelPrefix": "yes",
+            "SyslogPriority": "30",
+            "SystemCallErrorNumber": "2147483646",
+            "TTYReset": "no",
+            "TTYVHangup": "no",
+            "TTYVTDisallocate": "no",
+            "TasksAccounting": "yes",
+            "TasksCurrent": "8",
+            "TasksMax": "3560",
+            "TimeoutAbortUSec": "15s",
+            "TimeoutCleanUSec": "infinity",
+            "TimeoutStartFailureMode": "terminate",
+            "TimeoutStartUSec": "1min 30s",
+            "TimeoutStopFailureMode": "terminate",
+            "TimeoutStopUSec": "15s",
+            "TimerSlackNSec": "50000",
+            "Transient": "no",
+            "Type": "notify",
+            "UID": "[not set]",
+            "UMask": "0022",
+            "UnitFilePreset": "enabled",
+            "UnitFileState": "enabled",
+            "UtmpMode": "init",
+            "WantedBy": "multi-user.target",
+            "WatchdogSignal": "6",
+            "WatchdogTimestampMonotonic": "0",
+            "WatchdogUSec": "0"
+        }
+    },
+    "msg": "OK: slapd attivo su ubuntu26lts3.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts4.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "daemon_reexec": false,
+                "daemon_reload": false,
+                "enabled": null,
+                "force": null,
+                "masked": null,
+                "name": "slapd",
+                "no_block": false,
+                "scope": "system",
+                "state": null
+            }
+        },
+        "item": "ubuntu26lts4.example.com",
+        "name": "slapd",
+        "status": {
+            "ActiveEnterTimestamp": "Tue 2026-10-27 06:41:32 CET",
+            "ActiveEnterTimestampMonotonic": "12895170",
+            "ActiveExitTimestampMonotonic": "0",
+            "ActiveState": "active",
+            "After": "basic.target system.slice systemd-journald.socket network.target sysinit.target",
+            "AllowIsolate": "no",
+            "AssertResult": "yes",
+            "AssertTimestamp": "Tue 2026-10-27 06:41:25 CET",
+            "AssertTimestampMonotonic": "11153799",
+            "Before": "shutdown.target multi-user.target",
+            "BindLogSockets": "no",
+            "CPUAffinityFromNUMA": "no",
+            "CPUQuotaPerSecUSec": "infinity",
+            "CPUQuotaPeriodUSec": "infinity",
+            "CPUSchedulingPolicy": "0",
+            "CPUSchedulingPriority": "0",
+            "CPUSchedulingResetOnFork": "no",
+            "CPUUsageNSec": "18815330000",
+            "CPUWeight": "[not set]",
+            "CacheDirectoryAccounting": "no",
+            "CacheDirectoryMode": "0755",
+            "CacheDirectoryQuota": "[not set]",
+            "CanFreeze": "yes",
+            "CanIsolate": "no",
+            "CanLiveMount": "no",
+            "CanReload": "no",
+            "CanStart": "yes",
+            "CanStop": "yes",
+            "CapabilityBoundingSet": "cap_chown cap_dac_override cap_dac_read_search cap_fowner cap_fsetid cap_kill cap_setgid cap_setuid cap_setpcap cap_linux_immutable cap_net_bind_service cap_net_broadcast cap_net_admin cap_net_raw cap_ipc_lock cap_ipc_owner cap_sys_module cap_sys_rawio cap_sys_chroot cap_sys_ptrace cap_sys_pacct cap_sys_admin cap_sys_boot cap_sys_nice cap_sys_resource cap_sys_time cap_sys_tty_config cap_mknod cap_lease cap_audit_write cap_audit_control cap_setfcap cap_mac_override cap_mac_admin cap_syslog cap_wake_alarm cap_block_suspend cap_audit_read cap_perfmon cap_bpf cap_checkpoint_restore",
+            "CleanResult": "success",
+            "CollectMode": "inactive",
+            "ConditionResult": "yes",
+            "ConditionTimestamp": "Tue 2026-10-27 06:41:25 CET",
+            "ConditionTimestampMonotonic": "11153793",
+            "ConfigurationDirectoryMode": "0755",
+            "Conflicts": "shutdown.target",
+            "ControlGroup": "/system.slice/slapd.service",
+            "ControlGroupId": "4586",
+            "ControlPID": "0",
+            "CoredumpFilter": "0x33",
+            "CoredumpReceive": "no",
+            "DebugInvocation": "no",
+            "DefaultDependencies": "yes",
+            "DefaultMemoryLow": "0",
+            "DefaultMemoryMin": "0",
+            "DefaultStartupMemoryLow": "0",
+            "Delegate": "no",
+            "DelegateNamespaces": "18446744073709551615",
+            "Description": "OpenLDAP Server Daemon",
+            "DevicePolicy": "auto",
+            "Documentation": "man:slapd man:slapd-config man:slapd-mdb",
+            "DropInPaths": "/etc/systemd/system/slapd.service.d/limits.conf /etc/systemd/system/slapd.service.d/stop-timeout.conf",
+            "DynamicUser": "no",
+            "EffectiveMemoryHigh": "4100132864",
+            "EffectiveMemoryMax": "4100132864",
+            "EffectiveTasksMax": "3560",
+            "EnvironmentFiles": "/etc/default/slapd (ignore_errors=no)",
+            "ExecMainCode": "0",
+            "ExecMainExitTimestampMonotonic": "0",
+            "ExecMainHandoffTimestamp": "Tue 2026-10-27 06:41:25 CET",
+            "ExecMainHandoffTimestampMonotonic": "11255241",
+            "ExecMainPID": "1185",
+            "ExecMainStartTimestamp": "Tue 2026-10-27 06:41:25 CET",
+            "ExecMainStartTimestampMonotonic": "11158781",
+            "ExecMainStatus": "0",
+            "ExecStart": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+            "ExecStartEx": "{ path=sh ; argv[]=sh -c mkdir -p /run/slapd;  \tchown \"$SLAPD_USER\":\"$SLAPD_GROUP\" /run/slapd;  \t[ -d \"$SLAPD_CONF\" ] && confflag=-F || confflag=-f;  \texec /usr/sbin/slapd -d0  \t\t${SLAPD_SERVICES:+-h \"$SLAPD_SERVICES\"}  \t\t${SLAPD_USER:+-u \"$SLAPD_USER\"}  \t\t${SLAPD_GROUP:+-g \"$SLAPD_GROUP\"}  \t\t${SLAPD_CONF:+$confflag \"$SLAPD_CONF\"}  \t\t$SLAPD_OPTIONS ; flags= ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
+            "ExitType": "main",
+            "ExtensionImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "FailureAction": "none",
+            "FileDescriptorStoreMax": "0",
+            "FileDescriptorStorePreserve": "restart",
+            "FinalKillSignal": "9",
+            "FragmentPath": "/usr/lib/systemd/system/slapd.service",
+            "FreezerState": "running",
+            "GID": "[not set]",
+            "GuessMainPID": "yes",
+            "IOAccounting": "no",
+            "IOReadBytes": "[not set]",
+            "IOReadOperations": "[not set]",
+            "IOSchedulingClass": "2",
+            "IOSchedulingPriority": "4",
+            "IOWeight": "[not set]",
+            "IOWriteBytes": "[not set]",
+            "IOWriteOperations": "[not set]",
+            "IPAccounting": "no",
+            "IPEgressBytes": "[no data]",
+            "IPEgressPackets": "[no data]",
+            "IPIngressBytes": "[no data]",
+            "IPIngressPackets": "[no data]",
+            "Id": "slapd.service",
+            "IgnoreOnIsolate": "no",
+            "IgnoreSIGPIPE": "yes",
+            "InactiveEnterTimestampMonotonic": "0",
+            "InactiveExitTimestamp": "Tue 2026-10-27 06:41:25 CET",
+            "InactiveExitTimestampMonotonic": "11165461",
+            "InvocationID": "7f8756f160fd4cb685361fbab5e2fca1",
+            "JobRunningTimeoutUSec": "infinity",
+            "JobTimeoutAction": "none",
+            "JobTimeoutUSec": "infinity",
+            "KeyringMode": "private",
+            "KillMode": "mixed",
+            "KillSignal": "15",
+            "LimitAS": "infinity",
+            "LimitASSoft": "infinity",
+            "LimitCORE": "infinity",
+            "LimitCORESoft": "0",
+            "LimitCPU": "infinity",
+            "LimitCPUSoft": "infinity",
+            "LimitDATA": "infinity",
+            "LimitDATASoft": "infinity",
+            "LimitFSIZE": "infinity",
+            "LimitFSIZESoft": "infinity",
+            "LimitLOCKS": "infinity",
+            "LimitLOCKSSoft": "infinity",
+            "LimitMEMLOCK": "8388608",
+            "LimitMEMLOCKSoft": "8388608",
+            "LimitMSGQUEUE": "819200",
+            "LimitMSGQUEUESoft": "819200",
+            "LimitNICE": "0",
+            "LimitNICESoft": "0",
+            "LimitNOFILE": "65536",
+            "LimitNOFILESoft": "65536",
+            "LimitNPROC": "65536",
+            "LimitNPROCSoft": "65536",
+            "LimitRSS": "infinity",
+            "LimitRSSSoft": "infinity",
+            "LimitRTPRIO": "0",
+            "LimitRTPRIOSoft": "0",
+            "LimitRTTIME": "infinity",
+            "LimitRTTIMESoft": "infinity",
+            "LimitSIGPENDING": "11869",
+            "LimitSIGPENDINGSoft": "11869",
+            "LimitSTACK": "infinity",
+            "LimitSTACKSoft": "8388608",
+            "LiveMountResult": "success",
+            "LoadState": "loaded",
+            "LockPersonality": "no",
+            "LogLevelMax": "-1",
+            "LogRateLimitBurst": "0",
+            "LogRateLimitIntervalUSec": "0",
+            "LogsDirectoryAccounting": "no",
+            "LogsDirectoryMode": "0755",
+            "LogsDirectoryQuota": "[not set]",
+            "MainPID": "1185",
+            "ManagedOOMKills": "0",
+            "ManagedOOMMemoryPressure": "auto",
+            "ManagedOOMMemoryPressureDurationUSec": "[not set]",
+            "ManagedOOMMemoryPressureLimit": "0",
+            "ManagedOOMPreference": "none",
+            "ManagedOOMSwap": "auto",
+            "MemoryAccounting": "yes",
+            "MemoryAvailable": "3522068480",
+            "MemoryCurrent": "61440000",
+            "MemoryDenyWriteExecute": "no",
+            "MemoryHigh": "infinity",
+            "MemoryKSM": "no",
+            "MemoryLow": "0",
+            "MemoryMax": "infinity",
+            "MemoryMin": "0",
+            "MemoryPeak": "61964288",
+            "MemoryPressureThresholdUSec": "200ms",
+            "MemoryPressureWatch": "auto",
+            "MemorySwapCurrent": "0",
+            "MemorySwapMax": "infinity",
+            "MemorySwapPeak": "0",
+            "MemoryZSwapCurrent": "0",
+            "MemoryZSwapMax": "infinity",
+            "MemoryZSwapWriteback": "yes",
+            "MountAPIVFS": "no",
+            "MountImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "NFileDescriptorStore": "0",
+            "NRestarts": "0",
+            "NUMAPolicy": "n/a",
+            "Names": "slapd.service",
+            "NeedDaemonReload": "no",
+            "Nice": "0",
+            "NoNewPrivileges": "no",
+            "NonBlocking": "no",
+            "NotifyAccess": "main",
+            "OOMKills": "0",
+            "OOMPolicy": "stop",
+            "OOMScoreAdjust": "0",
+            "OnFailureJobMode": "replace",
+            "OnSuccessJobMode": "fail",
+            "Perpetual": "no",
+            "PrivateBPF": "no",
+            "PrivateDevices": "no",
+            "PrivateIPC": "no",
+            "PrivateMounts": "no",
+            "PrivateNetwork": "no",
+            "PrivatePIDs": "no",
+            "PrivateTmp": "no",
+            "PrivateTmpEx": "no",
+            "PrivateUsers": "no",
+            "PrivateUsersEx": "no",
+            "ProcSubset": "all",
+            "ProtectClock": "no",
+            "ProtectControlGroups": "no",
+            "ProtectControlGroupsEx": "no",
+            "ProtectHome": "no",
+            "ProtectHostname": "no",
+            "ProtectKernelLogs": "no",
+            "ProtectKernelModules": "no",
+            "ProtectKernelTunables": "no",
+            "ProtectProc": "default",
+            "ProtectSystem": "no",
+            "RefuseManualStart": "no",
+            "RefuseManualStop": "no",
+            "ReloadResult": "success",
+            "ReloadSignal": "1",
+            "RemainAfterExit": "no",
+            "RemoveIPC": "no",
+            "Requires": "sysinit.target system.slice",
+            "Restart": "no",
+            "RestartKillSignal": "15",
+            "RestartMaxDelayUSec": "infinity",
+            "RestartMode": "normal",
+            "RestartSteps": "0",
+            "RestartUSec": "100ms",
+            "RestartUSecNext": "100ms",
+            "RestrictNamespaces": "no",
+            "RestrictRealtime": "no",
+            "RestrictSUIDSGID": "no",
+            "Result": "success",
+            "RootDirectoryStartOnly": "no",
+            "RootEphemeral": "no",
+            "RootImagePolicy": "root=verity+signed+encrypted+unprotected+absent:usr=verity+signed+encrypted+unprotected+absent:home=encrypted+unprotected+absent:srv=encrypted+unprotected+absent:tmp=encrypted+unprotected+absent:var=encrypted+unprotected+absent",
+            "RuntimeDirectoryMode": "0755",
+            "RuntimeDirectoryPreserve": "no",
+            "RuntimeMaxUSec": "infinity",
+            "RuntimeRandomizedExtraUSec": "0",
+            "SameProcessGroup": "no",
+            "SecureBits": "0",
+            "SendSIGHUP": "no",
+            "SendSIGKILL": "yes",
+            "SetLoginEnvironment": "no",
+            "Slice": "system.slice",
+            "StandardError": "inherit",
+            "StandardInput": "null",
+            "StandardOutput": "journal",
+            "StartLimitAction": "none",
+            "StartLimitBurst": "5",
+            "StartLimitIntervalUSec": "10s",
+            "StartupCPUWeight": "[not set]",
+            "StartupIOWeight": "[not set]",
+            "StartupMemoryHigh": "infinity",
+            "StartupMemoryLow": "0",
+            "StartupMemoryMax": "infinity",
+            "StartupMemorySwapMax": "infinity",
+            "StartupMemoryZSwapMax": "infinity",
+            "StateChangeTimestamp": "Tue 2026-10-27 06:41:32 CET",
+            "StateChangeTimestampMonotonic": "12895170",
+            "StateDirectoryAccounting": "no",
+            "StateDirectoryMode": "0755",
+            "StateDirectoryQuota": "[not set]",
+            "StatusErrno": "0",
+            "StopWhenUnneeded": "no",
+            "SubState": "running",
+            "SuccessAction": "none",
+            "SurviveFinalKillSignal": "no",
+            "SyslogFacility": "3",
+            "SyslogLevel": "6",
+            "SyslogLevelPrefix": "yes",
+            "SyslogPriority": "30",
+            "SystemCallErrorNumber": "2147483646",
+            "TTYReset": "no",
+            "TTYVHangup": "no",
+            "TTYVTDisallocate": "no",
+            "TasksAccounting": "yes",
+            "TasksCurrent": "7",
+            "TasksMax": "3560",
+            "TimeoutAbortUSec": "15s",
+            "TimeoutCleanUSec": "infinity",
+            "TimeoutStartFailureMode": "terminate",
+            "TimeoutStartUSec": "1min 30s",
+            "TimeoutStopFailureMode": "terminate",
+            "TimeoutStopUSec": "15s",
+            "TimerSlackNSec": "50000",
+            "Transient": "no",
+            "Type": "notify",
+            "UID": "[not set]",
+            "UMask": "0022",
+            "UnitFilePreset": "enabled",
+            "UnitFileState": "enabled",
+            "UtmpMode": "init",
+            "WantedBy": "multi-user.target",
+            "WatchdogSignal": "6",
+            "WatchdogTimestampMonotonic": "0",
+            "WatchdogUSec": "0"
+        }
+    },
+    "msg": "OK: slapd attivo su ubuntu26lts4.example.com."
+}
+
+TASK [[FASE 0] Verifica che gli orologi dei nodi siano allineati (l'ordine dei CSN deve seguire l'ordine reale)] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/assert_clock_skew.yml for localhost
+
+TASK [[CLOCK] Controlla i parametri passati alla verifica dello scarto degli orologi] ***
+ok: [localhost]
+
+TASK [[CLOCK] Misura lo scarto degli orologi fra i nodi via SSH persistente - puro shell] ***
+ok: [localhost]
+
+TASK [[CLOCK] Blocca se lo scarto fra gli orologi dei nodi supera la soglia] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": [
+        "CLOCK ubuntu26lts1.example.com offset_us=-25 rtt_us=11551",
+        "CLOCK ubuntu26lts2.example.com offset_us=332 rtt_us=13165",
+        "CLOCK ubuntu26lts3.example.com offset_us=3153 rtt_us=12279",
+        "CLOCK ubuntu26lts4.example.com offset_us=-248 rtt_us=13164",
+        "CLOCK_SKEW_OK: scarto massimo fra i nodi 3401us (soglia 250000us)"
+    ]
+}
+
+TASK [[FASE 0] Rimuove eventuali regole di partizione residue di un run interrotto (idempotenza)] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+
+TASK [[FASE 0] Rimuove le entry refint-part.* residue di un run precedente (idempotenza)] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu26lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu26lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 0] Attende che i residui refint-part.* siano 0 su tutti i nodi - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 0] Blocca se i residui non sono spariti da tutti i nodi (-1 = conteggio non riuscito via SSH)] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "NAMESPACE_EMPTY: 0s"
+}
+
+TASK [[FASE 0] Avvia la sonda di servizio su tutti i nodi] *********************
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/service_probe.yml for localhost
+
+TASK [[SONDA] Controlla i parametri della sonda di servizio] *******************
+ok: [localhost]
+
+TASK [[SONDA] Fissa l'identificativo del run e l'elenco dei nodi sondati] ******
+ok: [localhost]
+
+TASK [[SONDA] Ferma le sonde in esecuzione (file di stop, poi SIGTERM a chi resta)] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Crea la directory del run sui nodi] ******************************
+changed: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Copia lo script della sonda sui nodi] ****************************
+changed: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Scrive il file della password (0600) sui nodi] *******************
+changed: [localhost -> ubuntu26lts1.example.com] => (item=(censored due to no_log))
+changed: [localhost -> ubuntu26lts2.example.com] => (item=(censored due to no_log))
+changed: [localhost -> ubuntu26lts3.example.com] => (item=(censored due to no_log))
+changed: [localhost -> ubuntu26lts4.example.com] => (item=(censored due to no_log))
+
+TASK [[SONDA] Raccoglie i log, calcola il report e attende la durabilita' delle scritture confermate - puro shell] ***
+skipping: [localhost]
+
+TASK [[SONDA] Conserva il report per l'assert finale] **************************
+skipping: [localhost]
+
+TASK [[SONDA] Report della sonda di servizio] **********************************
+skipping: [localhost]
+
+TASK [[SONDA] Cancella le entry svcprobe.* e attende che spariscano da tutti i nodi - puro shell] ***
+changed: [localhost]
+
+TASK [[SONDA] Conserva l'esito della cancellazione per gli assert] *************
+ok: [localhost]
+
+TASK [[SONDA] Blocca se i residui svcprobe.* di un run precedente non sono spariti prima di avviare la sonda] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": "PROBE_CLEANUP_OK: 2s (0 entry svcprobe.* su tutti i nodi)"
+}
+
+TASK [[SONDA] Avvia la sonda in background sui nodi] ***************************
+changed: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Verifica che ogni sonda sia attiva e abbia gia' registrato operazioni riuscite] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Blocca se una sonda non e' partita (il test misurerebbe il servizio solo in parte)] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+        "delta": "0:00:00.043970",
+        "end": "2026-10-28 08:33:00.533061",
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts1.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:00.489091",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "SONDA_OK: 4 operazioni registrate",
+        "stdout_lines": [
+            "SONDA_OK: 4 operazioni registrate"
+        ]
+    },
+    "msg": "ubuntu26lts1.example.com: SONDA_OK: 4 operazioni registrate"
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+        "delta": "0:00:00.033271",
+        "end": "2026-10-28 08:33:01.018566",
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts2.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:00.985295",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "SONDA_OK: 4 operazioni registrate",
+        "stdout_lines": [
+            "SONDA_OK: 4 operazioni registrate"
+        ]
+    },
+    "msg": "ubuntu26lts2.example.com: SONDA_OK: 4 operazioni registrate"
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+        "delta": "0:00:00.029605",
+        "end": "2026-10-28 08:33:01.515149",
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts3.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:01.485544",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "SONDA_OK: 4 operazioni registrate",
+        "stdout_lines": [
+            "SONDA_OK: 4 operazioni registrate"
+        ]
+    },
+    "msg": "ubuntu26lts3.example.com: SONDA_OK: 4 operazioni registrate"
+}
+ok: [localhost] => (item=ubuntu26lts4.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+        "delta": "0:00:00.031534",
+        "end": "2026-10-28 08:33:01.984144",
+        "failed": false,
+        "failed_when_result": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nLOG=\"/var/tmp/svcprobe/run-20261028083245/probe.log\"\nPAT='^/bin/bash /var/tmp/svcprobe/service_probe[.]sh'\nfor _ in $(seq 1 20); do\n  if pgrep -f \"$PAT\" >/dev/null && [ -s \"$LOG\" ] && awk '$4 == 0' \"$LOG\" | grep -q .; then\n    echo \"SONDA_OK: $(wc -l < \"$LOG\") operazioni registrate\"\n    exit 0\n  fi\n  sleep 0.5\ndone\necho \"SONDA_KO: processo assente o nessuna operazione riuscita - $(tail -3 \"$LOG\" 2>/dev/null | tr '\\n' ' ')\"\nexit 1\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts4.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:01.952610",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "SONDA_OK: 2 operazioni registrate",
+        "stdout_lines": [
+            "SONDA_OK: 2 operazioni registrate"
+        ]
+    },
+    "msg": "ubuntu26lts4.example.com: SONDA_OK: 2 operazioni registrate"
+}
+
+TASK [[SONDA] Rimuove i file della sonda dai nodi (password compresa)] *********
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Estrae i numeri del report] **************************************
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se la sonda non ha prodotto un report completo] ***********
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se un nodo NON coinvolto dal guasto ha smesso di servire] ***
+skipping: [localhost] => (item=ubuntu26lts4.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts1.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts1.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com W) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se una scrittura confermata al client manca su un nodo (perdita di dati)] ***
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se le entry della sonda non sono state rimosse da tutti i nodi] ***
+skipping: [localhost]
+
+TASK [[FASE 1] Crea utenti e gruppi di baseline su ubuntu26lts1.example.com] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 1] Blocca se la creazione della baseline e' fallita] ***************
+ok: [localhost]
+
+TASK [[FASE 1] Attende che la baseline sia identica e coerente su tutti i nodi prima di partizionare] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/assert_data_integrity.yml for localhost
+
+TASK [[INTEGRITA'] Controlla i parametri passati alla verifica d'integrita'] ***
+ok: [localhost]
+
+TASK [[INTEGRITA'] Confronta il contenuto del DIT fra i nodi, con polling fino al timeout - puro shell] ***
+ok: [localhost]
+
+TASK [[INTEGRITA'] Report del confronto fra i nodi] ****************************
+ok: [localhost] => {
+    "msg": [
+        "(baseline prima della partizione)",
+        "EXCLUDED ubuntu26lts1.example.com: 14 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts2.example.com: 14 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts3.example.com: 16 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts4.example.com: 16 entry (^cn=svcprobe\\.)",
+        "DIGEST ubuntu26lts1.example.com: entry=20 sha256=9443bb66076a1cab",
+        "DIGEST ubuntu26lts2.example.com: entry=20 sha256=9443bb66076a1cab",
+        "DIGEST ubuntu26lts3.example.com: entry=20 sha256=9443bb66076a1cab",
+        "DIGEST ubuntu26lts4.example.com: entry=20 sha256=4c32d0012dfe9e8d",
+        "KNOWN_DIFF ubuntu26lts4.example.com: dc=example,dc=com attributi createtimestamp,entrycsn,entryuuid,modifytimestamp",
+        "INTEGRITY_OK: 4 nodi con contenuto identico e appartenenze coerenti (1 differenze note)",
+        "INTEGRITY_ELAPSED: 1s"
+    ]
+}
+
+TASK [[INTEGRITA'] Blocca se il contenuto del DIT diverge fra i nodi o le appartenenze sono incoerenti] ***
+ok: [localhost] => {
+    "changed": false,
+    "msg": [
+        "INTEGRITY_OK: 4 nodi con contenuto identico e appartenenze coerenti (1 differenze note)",
+        "INTEGRITY_ELAPSED: 1s"
+    ]
+}
+
+TASK [[FASE 2] Applica la partizione verso node2/node3 su ubuntu26lts1.example.com] ***
+changed: [localhost -> ubuntu26lts1.example.com] => (item=INPUT dport <-> ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=INPUT sport <-> ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=INPUT dport <-> ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=INPUT sport <-> ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=OUTPUT dport <-> ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=OUTPUT sport <-> ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=OUTPUT dport <-> ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts1.example.com] => (item=OUTPUT sport <-> ubuntu26lts3.example.com)
+
+TASK [[FASE 2] Specchia la partizione su node2 e node3 verso ubuntu26lts1.example.com] ***
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com INPUT dport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com INPUT sport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com OUTPUT dport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com OUTPUT sport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com INPUT dport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com INPUT sport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com OUTPUT dport <-> ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com OUTPUT sport <-> ubuntu26lts1.example.com)
+
+TASK [[FASE 2] Conta le regole di partizione per chain e porta su ogni master] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+
+TASK [[FASE 2] Blocca se mancano regole di partizione (in particolare --sport, connessioni stabilite)] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nset -o pipefail\nRULES=$(iptables -S | grep -F -- \"refint-partition-test\") || RULES=\"\"\nfor CHAIN in INPUT OUTPUT; do\n  for DIR in dport sport; do\n    N=$(grep -c -- \"-A $CHAIN .*--$DIR 636 \" <<< \"$RULES\") || true\n    echo \"$CHAIN-$DIR=$N\"\n  done\ndone\n",
+        "delta": "0:00:00.026563",
+        "end": "2026-10-28 08:33:14.605944",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nset -o pipefail\nRULES=$(iptables -S | grep -F -- \"refint-partition-test\") || RULES=\"\"\nfor CHAIN in INPUT OUTPUT; do\n  for DIR in dport sport; do\n    N=$(grep -c -- \"-A $CHAIN .*--$DIR 636 \" <<< \"$RULES\") || true\n    echo \"$CHAIN-$DIR=$N\"\n  done\ndone\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts1.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:14.579381",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "INPUT-dport=2\nINPUT-sport=2\nOUTPUT-dport=2\nOUTPUT-sport=2",
+        "stdout_lines": [
+            "INPUT-dport=2",
+            "INPUT-sport=2",
+            "OUTPUT-dport=2",
+            "OUTPUT-sport=2"
+        ]
+    },
+    "msg": "OK: ubuntu26lts1.example.com INPUT-dport=2, INPUT-sport=2, OUTPUT-dport=2, OUTPUT-sport=2"
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nset -o pipefail\nRULES=$(iptables -S | grep -F -- \"refint-partition-test\") || RULES=\"\"\nfor CHAIN in INPUT OUTPUT; do\n  for DIR in dport sport; do\n    N=$(grep -c -- \"-A $CHAIN .*--$DIR 636 \" <<< \"$RULES\") || true\n    echo \"$CHAIN-$DIR=$N\"\n  done\ndone\n",
+        "delta": "0:00:00.022003",
+        "end": "2026-10-28 08:33:15.098571",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nset -o pipefail\nRULES=$(iptables -S | grep -F -- \"refint-partition-test\") || RULES=\"\"\nfor CHAIN in INPUT OUTPUT; do\n  for DIR in dport sport; do\n    N=$(grep -c -- \"-A $CHAIN .*--$DIR 636 \" <<< \"$RULES\") || true\n    echo \"$CHAIN-$DIR=$N\"\n  done\ndone\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts2.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:15.076568",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "INPUT-dport=1\nINPUT-sport=1\nOUTPUT-dport=1\nOUTPUT-sport=1",
+        "stdout_lines": [
+            "INPUT-dport=1",
+            "INPUT-sport=1",
+            "OUTPUT-dport=1",
+            "OUTPUT-sport=1"
+        ]
+    },
+    "msg": "OK: ubuntu26lts2.example.com INPUT-dport=1, INPUT-sport=1, OUTPUT-dport=1, OUTPUT-sport=1"
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "set -u\nset -o pipefail\nRULES=$(iptables -S | grep -F -- \"refint-partition-test\") || RULES=\"\"\nfor CHAIN in INPUT OUTPUT; do\n  for DIR in dport sport; do\n    N=$(grep -c -- \"-A $CHAIN .*--$DIR 636 \" <<< \"$RULES\") || true\n    echo \"$CHAIN-$DIR=$N\"\n  done\ndone\n",
+        "delta": "0:00:00.023412",
+        "end": "2026-10-28 08:33:15.572568",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": null,
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": "set -u\nset -o pipefail\nRULES=$(iptables -S | grep -F -- \"refint-partition-test\") || RULES=\"\"\nfor CHAIN in INPUT OUTPUT; do\n  for DIR in dport sport; do\n    N=$(grep -c -- \"-A $CHAIN .*--$DIR 636 \" <<< \"$RULES\") || true\n    echo \"$CHAIN-$DIR=$N\"\n  done\ndone\n",
+                "creates": null,
+                "executable": "/bin/bash",
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": "ubuntu26lts3.example.com",
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:15.549156",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "INPUT-dport=1\nINPUT-sport=1\nOUTPUT-dport=1\nOUTPUT-sport=1",
+        "stdout_lines": [
+            "INPUT-dport=1",
+            "INPUT-sport=1",
+            "OUTPUT-dport=1",
+            "OUTPUT-sport=1"
+        ]
+    },
+    "msg": "OK: ubuntu26lts3.example.com INPUT-dport=1, INPUT-sport=1, OUTPUT-dport=1, OUTPUT-sport=1"
+}
+
+TASK [[FASE 2] Verifica che TUTTI i leg della partizione siano bloccati] *******
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com -> ubuntu26lts1.example.com:636)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com -> ubuntu26lts1.example.com:636)
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com -> ubuntu26lts2.example.com:636)
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com -> ubuntu26lts3.example.com:636)
+
+TASK [[FASE 2] Blocca se anche un solo leg e' ancora raggiungibile] ************
+ok: [localhost] => (item=ubuntu26lts2.example.com -> ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts1.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.011171",
+        "end": "2026-10-28 08:33:19.235200",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts1.example.com/636' 2>/dev/null; echo $?",
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": null,
+                "creates": null,
+                "executable": null,
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": {
+            "from": "ubuntu26lts2.example.com",
+            "to": "ubuntu26lts1.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:16.224029",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ]
+    },
+    "msg": "OK: ubuntu26lts2.example.com -> ubuntu26lts1.example.com bloccato."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com -> ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts1.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.011960",
+        "end": "2026-10-28 08:33:22.697592",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts1.example.com/636' 2>/dev/null; echo $?",
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": null,
+                "creates": null,
+                "executable": null,
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": {
+            "from": "ubuntu26lts3.example.com",
+            "to": "ubuntu26lts1.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:19.685632",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ]
+    },
+    "msg": "OK: ubuntu26lts3.example.com -> ubuntu26lts1.example.com bloccato."
+}
+ok: [localhost] => (item=ubuntu26lts1.example.com -> ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts2.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.012385",
+        "end": "2026-10-28 08:33:26.149975",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts2.example.com/636' 2>/dev/null; echo $?",
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": null,
+                "creates": null,
+                "executable": null,
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": {
+            "from": "ubuntu26lts1.example.com",
+            "to": "ubuntu26lts2.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:23.137590",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ]
+    },
+    "msg": "OK: ubuntu26lts1.example.com -> ubuntu26lts2.example.com bloccato."
+}
+ok: [localhost] => (item=ubuntu26lts1.example.com -> ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": {
+        "ansible_loop_var": "item",
+        "changed": false,
+        "cmd": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts3.example.com/636' 2>/dev/null; echo $?",
+        "delta": "0:00:03.014689",
+        "end": "2026-10-28 08:33:29.595619",
+        "failed": false,
+        "invocation": {
+            "module_args": {
+                "_raw_params": "timeout 3 bash -c 'echo > /dev/tcp/ubuntu26lts3.example.com/636' 2>/dev/null; echo $?",
+                "_uses_shell": true,
+                "argv": null,
+                "chdir": null,
+                "cmd": null,
+                "creates": null,
+                "executable": null,
+                "expand_argument_vars": true,
+                "removes": null,
+                "stdin": null,
+                "stdin_add_newline": true,
+                "strip_empty_ends": true
+            }
+        },
+        "item": {
+            "from": "ubuntu26lts1.example.com",
+            "to": "ubuntu26lts3.example.com"
+        },
+        "msg": "",
+        "rc": 0,
+        "start": "2026-10-28 08:33:26.580930",
+        "stderr": "",
+        "stderr_lines": [],
+        "stdout": "124",
+        "stdout_lines": [
+            "124"
+        ]
+    },
+    "msg": "OK: ubuntu26lts1.example.com -> ubuntu26lts3.example.com bloccato."
+}
+
+TASK [[FASE 3] Lato isolato: cancella U1, U2 in G2, cancella G3, rinomina U4 - su ubuntu26lts1.example.com] ***
+changed: [localhost -> ubuntu26lts1.example.com]
+
+TASK [[FASE 3] Blocca se le scritture sul lato isolato sono fallite (continuita' operativa violata)] ***
+ok: [localhost]
+
+TASK [[FASE 3] Lato raggiungibile, dopo l'intervallo: U1 in G1, cancella U2, U3 in G3, vecchio U4 in G4 - su ubuntu26lts2.example.com] ***
+changed: [localhost -> ubuntu26lts2.example.com]
+
+TASK [[FASE 3] Blocca se le scritture sul lato raggiungibile sono fallite] *****
+ok: [localhost]
+
+TASK [[FASE 4] Legge lo stato dei casi sui due lati mentre la partizione e' attiva - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 4] Report dello stato dei due lati durante la partizione] **********
+ok: [localhost] => {
+    "msg": [
+        "DURANTE LA PARTIZIONE (1 = presente, 0 = assente, -1 = lettura fallita):",
+        "node1 U1=0",
+        "node1 U2=1",
+        "node1 G2_ha_U2=1",
+        "node1 G3=0",
+        "node1 U4=0",
+        "node1 U4renamed=1",
+        "node2 U1=1",
+        "node2 G1_ha_U1=1",
+        "node2 U2=0",
+        "node2 G3_ha_U3=1",
+        "node2 G4_ha_U4=1",
+        "node2 U4renamed=0"
+    ]
+}
+
+TASK [[FASE 4] Blocca se i due lati non mostrano ciascuno SOLO le proprie modifiche] ***
+ok: [localhost] => (item=node1 U1=0)
+ok: [localhost] => (item=node1 U2=1)
+ok: [localhost] => (item=node1 G2_ha_U2=1)
+ok: [localhost] => (item=node1 G3=0)
+ok: [localhost] => (item=node1 U4=0)
+ok: [localhost] => (item=node1 U4renamed=1)
+ok: [localhost] => (item=node2 U1=1)
+ok: [localhost] => (item=node2 G1_ha_U1=1)
+ok: [localhost] => (item=node2 U2=0)
+ok: [localhost] => (item=node2 G3_ha_U3=1)
+ok: [localhost] => (item=node2 G4_ha_U4=1)
+ok: [localhost] => (item=node2 U4renamed=0)
+
+TASK [[FASE 5] Rimuove le regole di partizione da tutti e tre i master] ********
+changed: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+
+TASK [[FASE 6] Attende che il namespace sia identico e coerente su tutti i nodi dopo la guarigione] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/assert_data_integrity.yml for localhost
+
+TASK [[INTEGRITA'] Controlla i parametri passati alla verifica d'integrita'] ***
+ok: [localhost]
+
+TASK [[INTEGRITA'] Confronta il contenuto del DIT fra i nodi, con polling fino al timeout - puro shell] ***
+ok: [localhost]
+
+TASK [[INTEGRITA'] Report del confronto fra i nodi] ****************************
+ok: [localhost] => {
+    "msg": [
+        "(dopo la guarigione della partizione)",
+        "INTEGRITY_PROGRESS: 11s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 24s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 36s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 48s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 60s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 70s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 82s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 94s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 106s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 118s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 128s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 140s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 152s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 184s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 194s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 206s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 216s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 228s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 240s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "EXCLUDED ubuntu26lts1.example.com: 746 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts2.example.com: 724 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts3.example.com: 726 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts4.example.com: 749 entry (^cn=svcprobe\\.)",
+        "DIGEST ubuntu26lts1.example.com: entry=17 sha256=ea70613ea949b851",
+        "DIGEST ubuntu26lts2.example.com: entry=17 sha256=1ec89bdda4ec0c9a",
+        "DIGEST ubuntu26lts3.example.com: entry=17 sha256=1ec89bdda4ec0c9a",
+        "DIGEST ubuntu26lts4.example.com: entry=18 sha256=cb027aca74d2b995",
+        "KNOWN_DIFF ubuntu26lts4.example.com: dc=example,dc=com attributi createtimestamp,entrycsn,entryuuid,modifytimestamp",
+        "VALUE_DIFF ubuntu26lts2.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com entrycsn: ubuntu26lts1.example.com=['20261028073330.146969Z#000000#001#000000'] ubuntu26lts2.example.com=['20261028073302.782596Z#000000#001#000000']",
+        "VALUE_DIFF ubuntu26lts2.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com modifytimestamp: ubuntu26lts1.example.com=['20261028073330Z'] ubuntu26lts2.example.com=['20261028073302Z']",
+        "VALUE_DIFF ubuntu26lts3.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com entrycsn: ubuntu26lts1.example.com=['20261028073330.146969Z#000000#001#000000'] ubuntu26lts3.example.com=['20261028073302.782596Z#000000#001#000000']",
+        "VALUE_DIFF ubuntu26lts3.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com modifytimestamp: ubuntu26lts1.example.com=['20261028073330Z'] ubuntu26lts3.example.com=['20261028073302Z']",
+        "EXTRA_ENTRY ubuntu26lts4.example.com: cn=refint-part.group.3,ou=groups,dc=example,dc=com (assente su ubuntu26lts1.example.com)",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.1,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.1,ou=people,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.2,ou=people,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.4,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.4-renamed,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.4,ou=people,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.0,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=['cn=refint-part.group.1,ou=groups,dc=example,dc=com', 'cn=refint-part.group.2,ou=groups,dc=example,dc=com', 'cn=refint-part.group.4,ou=groups,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.group.1,ou=groups,dc=example,dc=com', 'cn=refint-part.group.2,ou=groups,dc=example,dc=com', 'cn=refint-part.group.3,ou=groups,dc=example,dc=com', 'cn=refint-part.group.4,ou=groups,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.3,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=[] ubuntu26lts4.example.com=['cn=refint-part.group.3,ou=groups,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.4-renamed,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=['cn=refint-part.group.4,ou=groups,dc=example,dc=com'] ubuntu26lts4.example.com=[]",
+        "DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.1,ou=groups,dc=example,dc=com member=cn=refint-part.user.1,ou=people,dc=example,dc=com",
+        "DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com member=cn=refint-part.user.2,ou=people,dc=example,dc=com",
+        "DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.4,ou=groups,dc=example,dc=com member=cn=refint-part.user.4,ou=people,dc=example,dc=com",
+        "INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_TIMEOUT: nessun esito positivo entro 240s"
+    ]
+}
+
+TASK [[INTEGRITA'] Blocca se il contenuto del DIT diverge fra i nodi o le appartenenze sono incoerenti] ***
+skipping: [localhost]
+
+TASK [[FASE 6] Conserva l'esito dell'integrita' per l'assert finale] ***********
+ok: [localhost]
+
+TASK [[FASE 6] Legge lo stato finale dei quattro casi su ogni nodo (dn, member, memberOf) - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 6] Report dello stato finale (quale lato ha prevalso in ciascun caso)] ***
+ok: [localhost] => {
+    "msg": [
+        "== ubuntu26lts1.example.com",
+        "  dn: cn=refint-part.user.0,ou=people",
+        "  memberOf: cn=refint-part.group.1,ou=groups",
+        "  memberOf: cn=refint-part.group.2,ou=groups",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  dn: cn=refint-part.user.3,ou=people",
+        "  dn: cn=refint-part.user.4-renamed,ou=people",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  dn: cn=refint-part.group.1,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  dn: cn=refint-part.group.2,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  dn: cn=refint-part.group.4,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.4-renamed,ou=people",
+        "== ubuntu26lts2.example.com",
+        "  dn: cn=refint-part.user.0,ou=people",
+        "  memberOf: cn=refint-part.group.1,ou=groups",
+        "  memberOf: cn=refint-part.group.2,ou=groups",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  dn: cn=refint-part.user.3,ou=people",
+        "  dn: cn=refint-part.user.4-renamed,ou=people",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  dn: cn=refint-part.group.1,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  dn: cn=refint-part.group.2,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  dn: cn=refint-part.group.4,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.4-renamed,ou=people",
+        "== ubuntu26lts3.example.com",
+        "  dn: cn=refint-part.user.0,ou=people",
+        "  memberOf: cn=refint-part.group.1,ou=groups",
+        "  memberOf: cn=refint-part.group.2,ou=groups",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  dn: cn=refint-part.user.3,ou=people",
+        "  dn: cn=refint-part.user.4-renamed,ou=people",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  dn: cn=refint-part.group.1,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  dn: cn=refint-part.group.2,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  dn: cn=refint-part.group.4,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.4-renamed,ou=people",
+        "== ubuntu26lts4.example.com",
+        "  dn: cn=refint-part.user.0,ou=people",
+        "  memberOf: cn=refint-part.group.1,ou=groups",
+        "  memberOf: cn=refint-part.group.2,ou=groups",
+        "  memberOf: cn=refint-part.group.4,ou=groups",
+        "  memberOf: cn=refint-part.group.3,ou=groups",
+        "  dn: cn=refint-part.user.3,ou=people",
+        "  memberOf: cn=refint-part.group.3,ou=groups",
+        "  dn: cn=refint-part.user.4-renamed,ou=people",
+        "  dn: cn=refint-part.group.1,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.1,ou=people",
+        "  dn: cn=refint-part.group.2,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.2,ou=people",
+        "  dn: cn=refint-part.group.4,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.4,ou=people",
+        "  dn: cn=refint-part.group.3,ou=groups",
+        "  member: cn=refint-part.user.0,ou=people",
+        "  member: cn=refint-part.user.3,ou=people"
+    ]
+}
+
+TASK [[FASE 7] Ferma la sonda di servizio e verifica la durabilita' delle scritture confermate] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/service_probe.yml for localhost
+
+TASK [[SONDA] Controlla i parametri della sonda di servizio] *******************
+ok: [localhost]
+
+TASK [[SONDA] Fissa l'identificativo del run e l'elenco dei nodi sondati] ******
+skipping: [localhost]
+
+TASK [[SONDA] Ferma le sonde in esecuzione (file di stop, poi SIGTERM a chi resta)] ***
+changed: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Crea la directory del run sui nodi] ******************************
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Copia lo script della sonda sui nodi] ****************************
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Scrive il file della password (0600) sui nodi] *******************
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost]
+
+TASK [[SONDA] Raccoglie i log, calcola il report e attende la durabilita' delle scritture confermate - puro shell] ***
+ok: [localhost]
+
+TASK [[SONDA] Conserva il report per l'assert finale] **************************
+ok: [localhost]
+
+TASK [[SONDA] Report della sonda di servizio] **********************************
+ok: [localhost] => {
+    "msg": [
+        "PROBE ubuntu26lts1.example.com lettura: 261/261 ok (100.0%), interruzione max 0.0s, latenza p50=26ms p95=234ms max=394ms",
+        "PROBE ubuntu26lts1.example.com scrittura: 261/261 ok (100.0%), interruzione max 0.0s, latenza p50=29ms p95=279ms max=915ms",
+        "PROBE ubuntu26lts2.example.com lettura: 263/263 ok (100.0%), interruzione max 0.0s, latenza p50=25ms p95=254ms max=933ms",
+        "PROBE ubuntu26lts2.example.com scrittura: 263/263 ok (100.0%), interruzione max 0.0s, latenza p50=29ms p95=272ms max=880ms",
+        "PROBE ubuntu26lts3.example.com lettura: 237/237 ok (100.0%), interruzione max 0.0s, latenza p50=25ms p95=243ms max=932ms",
+        "PROBE ubuntu26lts3.example.com scrittura: 237/237 ok (100.0%), interruzione max 0.0s, latenza p50=27ms p95=276ms max=994ms",
+        "PROBE ubuntu26lts4.example.com lettura: 275/275 ok (100.0%), interruzione max 0.0s, latenza p50=25ms p95=247ms max=438ms",
+        "PROBE_ACKED_WRITES: 761",
+        "DURABILITY_PROGRESS: 10s",
+        "DURABILITY_PROGRESS: 22s",
+        "DURABILITY_PROGRESS: 34s",
+        "DURABILITY_PROGRESS: 46s",
+        "DURABILITY_PROGRESS: 58s",
+        "DURABILITY_PROGRESS: 70s",
+        "DURABILITY_PROGRESS: 83s",
+        "DURABILITY_PROGRESS: 95s",
+        "DURABILITY_PROGRESS: 107s",
+        "DURABILITY_PROGRESS: 118s",
+        "DURABILITY_PROGRESS: 128s",
+        "DURABILITY_PROGRESS: 140s",
+        "DURABILITY_PROGRESS: 152s",
+        "DURABILITY_PROGRESS: 164s",
+        "DURABILITY_PROGRESS: 176s",
+        "DURABILITY ubuntu26lts1.example.com: 761/761 scritture confermate presenti (+0 non confermate ma presenti)",
+        "DURABILITY_MISSING ubuntu26lts2.example.com: 22/761 scritture confermate assenti, es. cn=svcprobe.20261028083245.ubuntu26lts1.10,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.11,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.12,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.13,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.14,ou=people,dc=example,dc=com",
+        "DURABILITY_MISSING ubuntu26lts3.example.com: 22/761 scritture confermate assenti, es. cn=svcprobe.20261028083245.ubuntu26lts1.10,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.11,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.12,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.13,ou=people,dc=example,dc=com, cn=svcprobe.20261028083245.ubuntu26lts1.14,ou=people,dc=example,dc=com",
+        "DURABILITY ubuntu26lts4.example.com: 761/761 scritture confermate presenti (+0 non confermate ma presenti)",
+        "DURABILITY_FAIL",
+        "DURABILITY_TIMEOUT: scritture confermate ancora assenti dopo 180s"
+    ]
+}
+
+TASK [[SONDA] Cancella le entry svcprobe.* e attende che spariscano da tutti i nodi - puro shell] ***
+changed: [localhost]
+
+TASK [[SONDA] Conserva l'esito della cancellazione per gli assert] *************
+ok: [localhost]
+
+TASK [[SONDA] Blocca se i residui svcprobe.* di un run precedente non sono spariti prima di avviare la sonda] ***
+skipping: [localhost]
+
+TASK [[SONDA] Avvia la sonda in background sui nodi] ***************************
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Verifica che ogni sonda sia attiva e abbia gia' registrato operazioni riuscite] ***
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se una sonda non e' partita (il test misurerebbe il servizio solo in parte)] ***
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Rimuove i file della sonda dai nodi (password compresa)] *********
+changed: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+changed: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+changed: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+changed: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Estrae i numeri del report] **************************************
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se la sonda non ha prodotto un report completo] ***********
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se un nodo NON coinvolto dal guasto ha smesso di servire] ***
+skipping: [localhost] => (item=ubuntu26lts4.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts1.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts1.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com W) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se una scrittura confermata al client manca su un nodo (perdita di dati)] ***
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se le entry della sonda non sono state rimosse da tutti i nodi] ***
+skipping: [localhost]
+
+TASK [[FASE 8] Cancella le entry refint-part.* da ogni master] *****************
+changed: [localhost -> ubuntu26lts1.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu26lts2.example.com] => (item=(censored due to no_log))
+ok: [localhost -> ubuntu26lts3.example.com] => (item=(censored due to no_log))
+
+TASK [[FASE 8] Attende che il namespace sia vuoto su tutti i nodi - puro shell] ***
+ok: [localhost]
+
+TASK [[FASE 9] Blocca se dopo la guarigione il namespace non e' identico e coerente su tutti i nodi] ***
+[ERROR]: Task failed: Action failed: ["ERRORE: dopo la guarigione della partizione l'integrita' referenziale e' violata o i nodi divergono (dettagli sotto; lo stato finale per nodo e' nel report di FASE 6). DANGLING_MEMBER = un gruppo contiene un utente che non esiste piu'; ORPHAN_MEMBEROF = un utente risulta membro di un gruppo inesistente o che non lo contiene; VALUE_DIFF/MISSING_ENTRY = i nodi non hanno riconciliato allo stesso stato. Non e' un difetto del test: e' una corruzione silenziosa prodotta dalla partizione.", 'INTEGRITY_PROGRESS: 11s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 24s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 36s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 48s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 60s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 70s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 82s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 94s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 106s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 118s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 128s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 140s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 152s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 184s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 194s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 206s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 216s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 228s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_PROGRESS: 240s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'EXCLUDED ubuntu26lts1.example.com: 746 entry (^cn=svcprobe\\.)', 'EXCLUDED ubuntu26lts2.example.com: 724 entry (^cn=svcprobe\\.)', 'EXCLUDED ubuntu26lts3.example.com: 726 entry (^cn=svcprobe\\.)', 'EXCLUDED ubuntu26lts4.example.com: 749 entry (^cn=svcprobe\\.)', 'DIGEST ubuntu26lts1.example.com: entry=17 sha256=ea70613ea949b851', 'DIGEST ubuntu26lts2.example.com: entry=17 sha256=1ec89bdda4ec0c9a', 'DIGEST ubuntu26lts3.example.com: entry=17 sha256=1ec89bdda4ec0c9a', 'DIGEST ubuntu26lts4.example.com: entry=18 sha256=cb027aca74d2b995', 'KNOWN_DIFF ubuntu26lts4.example.com: dc=example,dc=com attributi createtimestamp,entrycsn,entryuuid,modifytimestamp', "VALUE_DIFF ubuntu26lts2.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com entrycsn: ubuntu26lts1.example.com=['20261028073330.146969Z#000000#001#000000'] ubuntu26lts2.example.com=['20261028073302.782596Z#000000#001#000000']", "VALUE_DIFF ubuntu26lts2.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com modifytimestamp: ubuntu26lts1.example.com=['20261028073330Z'] ubuntu26lts2.example.com=['20261028073302Z']", "VALUE_DIFF ubuntu26lts3.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com entrycsn: ubuntu26lts1.example.com=['20261028073330.146969Z#000000#001#000000'] ubuntu26lts3.example.com=['20261028073302.782596Z#000000#001#000000']", "VALUE_DIFF ubuntu26lts3.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com modifytimestamp: ubuntu26lts1.example.com=['20261028073330Z'] ubuntu26lts3.example.com=['20261028073302Z']", 'EXTRA_ENTRY ubuntu26lts4.example.com: cn=refint-part.group.3,ou=groups,dc=example,dc=com (assente su ubuntu26lts1.example.com)', "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.1,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.1,ou=people,dc=example,dc=com']", "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.2,ou=people,dc=example,dc=com']", "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.4,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.4-renamed,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.4,ou=people,dc=example,dc=com']", "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.0,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=['cn=refint-part.group.1,ou=groups,dc=example,dc=com', 'cn=refint-part.group.2,ou=groups,dc=example,dc=com', 'cn=refint-part.group.4,ou=groups,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.group.1,ou=groups,dc=example,dc=com', 'cn=refint-part.group.2,ou=groups,dc=example,dc=com', 'cn=refint-part.group.3,ou=groups,dc=example,dc=com', 'cn=refint-part.group.4,ou=groups,dc=example,dc=com']", "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.3,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=[] ubuntu26lts4.example.com=['cn=refint-part.group.3,ou=groups,dc=example,dc=com']", "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.4-renamed,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=['cn=refint-part.group.4,ou=groups,dc=example,dc=com'] ubuntu26lts4.example.com=[]", 'DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.1,ou=groups,dc=example,dc=com member=cn=refint-part.user.1,ou=people,dc=example,dc=com', 'DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com member=cn=refint-part.user.2,ou=people,dc=example,dc=com', 'DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.4,ou=groups,dc=example,dc=com member=cn=refint-part.user.4,ou=people,dc=example,dc=com', 'INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)', 'INTEGRITY_TIMEOUT: nessun esito positivo entro 240s']
+Origin: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/test_partition_referential_integrity/test_partition_referential_integrity.yml:742:11
+
+740         # ==========================================================================
+741
+742         - name: "[FASE 9] Blocca se dopo la guarigione il namespace non e' identico e coerente su tutti i nodi"
+              ^ column 11
+
+fatal: [localhost]: FAILED! => {
+    "assertion": "'INTEGRITY_OK' in integrity_after_heal.stdout",
+    "changed": false,
+    "evaluated_to": false,
+    "msg": [
+        "ERRORE: dopo la guarigione della partizione l'integrita' referenziale e' violata o i nodi divergono (dettagli sotto; lo stato finale per nodo e' nel report di FASE 6). DANGLING_MEMBER = un gruppo contiene un utente che non esiste piu'; ORPHAN_MEMBEROF = un utente risulta membro di un gruppo inesistente o che non lo contiene; VALUE_DIFF/MISSING_ENTRY = i nodi non hanno riconciliato allo stesso stato. Non e' un difetto del test: e' una corruzione silenziosa prodotta dalla partizione.",
+        "INTEGRITY_PROGRESS: 11s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 24s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 36s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 48s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 60s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 70s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 82s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 94s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 106s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 118s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 128s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 140s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 152s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 184s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 194s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 206s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 216s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 228s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_PROGRESS: 240s - INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "EXCLUDED ubuntu26lts1.example.com: 746 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts2.example.com: 724 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts3.example.com: 726 entry (^cn=svcprobe\\.)",
+        "EXCLUDED ubuntu26lts4.example.com: 749 entry (^cn=svcprobe\\.)",
+        "DIGEST ubuntu26lts1.example.com: entry=17 sha256=ea70613ea949b851",
+        "DIGEST ubuntu26lts2.example.com: entry=17 sha256=1ec89bdda4ec0c9a",
+        "DIGEST ubuntu26lts3.example.com: entry=17 sha256=1ec89bdda4ec0c9a",
+        "DIGEST ubuntu26lts4.example.com: entry=18 sha256=cb027aca74d2b995",
+        "KNOWN_DIFF ubuntu26lts4.example.com: dc=example,dc=com attributi createtimestamp,entrycsn,entryuuid,modifytimestamp",
+        "VALUE_DIFF ubuntu26lts2.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com entrycsn: ubuntu26lts1.example.com=['20261028073330.146969Z#000000#001#000000'] ubuntu26lts2.example.com=['20261028073302.782596Z#000000#001#000000']",
+        "VALUE_DIFF ubuntu26lts2.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com modifytimestamp: ubuntu26lts1.example.com=['20261028073330Z'] ubuntu26lts2.example.com=['20261028073302Z']",
+        "VALUE_DIFF ubuntu26lts3.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com entrycsn: ubuntu26lts1.example.com=['20261028073330.146969Z#000000#001#000000'] ubuntu26lts3.example.com=['20261028073302.782596Z#000000#001#000000']",
+        "VALUE_DIFF ubuntu26lts3.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com modifytimestamp: ubuntu26lts1.example.com=['20261028073330Z'] ubuntu26lts3.example.com=['20261028073302Z']",
+        "EXTRA_ENTRY ubuntu26lts4.example.com: cn=refint-part.group.3,ou=groups,dc=example,dc=com (assente su ubuntu26lts1.example.com)",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.1,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.1,ou=people,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.2,ou=people,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.group.4,ou=groups,dc=example,dc=com member: ubuntu26lts1.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.4-renamed,ou=people,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.user.0,ou=people,dc=example,dc=com', 'cn=refint-part.user.4,ou=people,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.0,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=['cn=refint-part.group.1,ou=groups,dc=example,dc=com', 'cn=refint-part.group.2,ou=groups,dc=example,dc=com', 'cn=refint-part.group.4,ou=groups,dc=example,dc=com'] ubuntu26lts4.example.com=['cn=refint-part.group.1,ou=groups,dc=example,dc=com', 'cn=refint-part.group.2,ou=groups,dc=example,dc=com', 'cn=refint-part.group.3,ou=groups,dc=example,dc=com', 'cn=refint-part.group.4,ou=groups,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.3,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=[] ubuntu26lts4.example.com=['cn=refint-part.group.3,ou=groups,dc=example,dc=com']",
+        "VALUE_DIFF ubuntu26lts4.example.com: cn=refint-part.user.4-renamed,ou=people,dc=example,dc=com memberof: ubuntu26lts1.example.com=['cn=refint-part.group.4,ou=groups,dc=example,dc=com'] ubuntu26lts4.example.com=[]",
+        "DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.1,ou=groups,dc=example,dc=com member=cn=refint-part.user.1,ou=people,dc=example,dc=com",
+        "DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.2,ou=groups,dc=example,dc=com member=cn=refint-part.user.2,ou=people,dc=example,dc=com",
+        "DANGLING_MEMBER ubuntu26lts4.example.com: cn=refint-part.group.4,ou=groups,dc=example,dc=com member=cn=refint-part.user.4,ou=people,dc=example,dc=com",
+        "INTEGRITY_FAIL: 14 problemi (riferimento ubuntu26lts1.example.com)",
+        "INTEGRITY_TIMEOUT: nessun esito positivo entro 240s"
+    ]
+}
+
+TASK [[POST] Disabilita la simulazione WAN su tutto il cluster (sempre)] *******
+changed: [localhost]
+
+TASK [[POST] Rimuove SEMPRE le regole di partizione (anche se il test si e' fermato prima della guarigione)] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+
+TASK [[POST] Ferma SEMPRE le sonde di servizio e ne rimuove i file dai nodi] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/test/service_probe.yml for localhost
+
+TASK [[SONDA] Controlla i parametri della sonda di servizio] *******************
+ok: [localhost]
+
+TASK [[SONDA] Fissa l'identificativo del run e l'elenco dei nodi sondati] ******
+ok: [localhost]
+
+TASK [[SONDA] Ferma le sonde in esecuzione (file di stop, poi SIGTERM a chi resta)] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Crea la directory del run sui nodi] ******************************
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Copia lo script della sonda sui nodi] ****************************
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Scrive il file della password (0600) sui nodi] *******************
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost] => (item=(censored due to no_log)) 
+skipping: [localhost]
+
+TASK [[SONDA] Raccoglie i log, calcola il report e attende la durabilita' delle scritture confermate - puro shell] ***
+skipping: [localhost]
+
+TASK [[SONDA] Conserva il report per l'assert finale] **************************
+skipping: [localhost]
+
+TASK [[SONDA] Report della sonda di servizio] **********************************
+skipping: [localhost]
+
+TASK [[SONDA] Cancella le entry svcprobe.* e attende che spariscano da tutti i nodi - puro shell] ***
+skipping: [localhost]
+
+TASK [[SONDA] Conserva l'esito della cancellazione per gli assert] *************
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se i residui svcprobe.* di un run precedente non sono spariti prima di avviare la sonda] ***
+skipping: [localhost]
+
+TASK [[SONDA] Avvia la sonda in background sui nodi] ***************************
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Verifica che ogni sonda sia attiva e abbia gia' registrato operazioni riuscite] ***
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se una sonda non e' partita (il test misurerebbe il servizio solo in parte)] ***
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Rimuove i file della sonda dai nodi (password compresa)] *********
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[SONDA] Estrae i numeri del report] **************************************
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se la sonda non ha prodotto un report completo] ***********
+skipping: [localhost] => (item=ubuntu26lts1.example.com) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se un nodo NON coinvolto dal guasto ha smesso di servire] ***
+skipping: [localhost] => (item=ubuntu26lts4.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts4.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts2.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts1.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts1.example.com W) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com R) 
+skipping: [localhost] => (item=ubuntu26lts3.example.com W) 
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se una scrittura confermata al client manca su un nodo (perdita di dati)] ***
+skipping: [localhost]
+
+TASK [[SONDA] Blocca se le entry della sonda non sono state rimosse da tutti i nodi] ***
+skipping: [localhost]
+
+TASK [[POST] Verifica che la simulazione WAN sia REALMENTE rimossa dai 4 nodi] ***
+included: /home/vagrant/projects/openldap-n-way-multimaster-WIP/stress_test/simulate_wan_mpls_ipsec/assert_wan_state.yml for localhost
+
+TASK [[WAN] Controlla i parametri passati alla verifica dello stato WAN] *******
+ok: [localhost]
+
+TASK [[WAN] Rileva lo stato reale della simulazione WAN (qdisc netem e regole mangle 636) sui nodi] ***
+ok: [localhost -> ubuntu26lts1.example.com] => (item=ubuntu26lts1.example.com)
+ok: [localhost -> ubuntu26lts2.example.com] => (item=ubuntu26lts2.example.com)
+ok: [localhost -> ubuntu26lts3.example.com] => (item=ubuntu26lts3.example.com)
+ok: [localhost -> ubuntu26lts4.example.com] => (item=ubuntu26lts4.example.com)
+
+TASK [[WAN] Blocca se lo stato reale della simulazione WAN non e' quello atteso su un nodo] ***
+ok: [localhost] => (item=ubuntu26lts1.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 0,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts1.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts2.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 1,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts2.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts3.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 2,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts3.example.com."
+}
+ok: [localhost] => (item=ubuntu26lts4.example.com) => {
+    "ansible_loop_var": "item",
+    "changed": false,
+    "item": 3,
+    "msg": "OK: simulazione WAN 'disabled' su ubuntu26lts4.example.com."
+}
+
+TASK [[POST] Blocca se il playbook di disattivazione WAN e' terminato con errore] ***
+ok: [localhost]
+
+PLAY RECAP *********************************************************************
+localhost                  : ok=79   changed=17   unreachable=0    failed=1    skipped=40   rescued=0    ignored=0   
+
