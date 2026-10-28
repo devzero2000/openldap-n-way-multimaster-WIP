@@ -45,8 +45,15 @@
 #
 # CHECK MODE: non supportato (avvia processi e scrive sul cluster).
 #
-# VERSIONE:     1.0
+# VERSIONE:     1.1
 # CHANGELOG:
+#   1.1 - 2026-10-28 - assert: ogni verifica in block/rescue e un assert
+#                      finale con l'elenco di quelle fallite. Prima il primo
+#                      assert fallito fermava gli altri (nel run del
+#                      2026-10-28 la durabilita' violata avrebbe nascosto
+#                      l'esito del cleanup). Il controllo di disponibilita'
+#                      salta i nodi assenti dal report invece di andare in
+#                      errore sull'indice mancante.
 #   1.0 - 2026-10-27 - prima versione.
 # ==============================================================================
 
@@ -378,67 +385,116 @@
 # assert: esito (dopo il cleanup del test chiamante)
 # ------------------------------------------------------------------------------
 
+# Ogni verifica in un block/rescue: un esito negativo viene annotato e le
+# verifiche successive girano comunque; l'assert finale fallisce una volta
+# sola con l'elenco. In v1.0 il primo assert fallito fermava gli altri: con
+# la durabilita' violata il cleanup delle entry svcprobe.* non veniva
+# verificato. L'errore dettagliato resta nel task fallito di ciascuna.
+- name: "[SONDA] Azzera l'elenco delle verifiche fallite"
+  ansible.builtin.set_fact:
+    probe_failures: []
+  when: probe_action == 'assert'
+
 - name: "[SONDA] Estrae i numeri del report"
   ansible.builtin.set_fact:
     probe_summary: >-
       {{ (probe_report.stdout_lines | select('match', '^PROBE_JSON ') | first | default('PROBE_JSON {}'))[11:] | from_json }}
   when: probe_action == 'assert'
 
-- name: "[SONDA] Blocca se la sonda non ha prodotto un report completo"
-  ansible.builtin.assert:
-    that:
-      - probe_summary[item] is defined
-      - probe_summary[item]['R']['total'] | default(0) >= 3
-      - item not in probe_rw_nodes or (probe_summary[item]['W']['total'] | default(0) >= 3)
-    fail_msg: >-
-      ERRORE: report della sonda assente o incompleto per {{ item }} (servono
-      almeno 3 letture, e 3 scritture sui master) - senza dati il test non
-      dice nulla sull'erogazione del servizio.
-      {{ probe_report.stdout_lines | default([]) | select('match', '^PROBE_ERROR') | list }}
-    quiet: true
-  loop: "{{ probe_all_nodes }}"
+- name: "[SONDA] Verifica: report completo"
   when: probe_action == 'assert'
+  block:
+    - name: "[SONDA] Blocca se la sonda non ha prodotto un report completo"
+      ansible.builtin.assert:
+        that:
+          - probe_summary[item] is defined
+          - probe_summary[item]['R']['total'] | default(0) >= 3
+          - item not in probe_rw_nodes or (probe_summary[item]['W']['total'] | default(0) >= 3)
+        fail_msg: >-
+          ERRORE: report della sonda assente o incompleto per {{ item }} (servono
+          almeno 3 letture, e 3 scritture sui master) - senza dati il test non
+          dice nulla sull'erogazione del servizio.
+          {{ probe_report.stdout_lines | default([]) | select('match', '^PROBE_ERROR') | list }}
+        quiet: true
+      loop: "{{ probe_all_nodes }}"
+  rescue:
+    - name: "[SONDA] Annota il fallimento della verifica"
+      ansible.builtin.set_fact:
+        probe_failures: "{{ probe_failures + [ansible_failed_task.name] }}"
 
-- name: "[SONDA] Blocca se un nodo NON coinvolto dal guasto ha smesso di servire"
-  ansible.builtin.assert:
-    that:
-      - probe_summary[item[0]][item[1]]['availability_pct'] | float >= (probe_min_availability_pct | default(100) | float)
-    fail_msg: >-
-      ERRORE: su {{ item[0] }}, che il guasto non doveva toccare, la
-      {{ (item[1] == 'R') | ternary('lettura', 'scrittura') }} e' riuscita solo
-      nel {{ probe_summary[item[0]][item[1]]['availability_pct'] }}% dei casi
-      (soglia {{ probe_min_availability_pct | default(100) }}%; interruzione max
-      {{ probe_summary[item[0]][item[1]]['max_outage_s'] }}s). Il guasto si e'
-      propagato a un nodo sano.
-    success_msg: >-
-      OK: {{ item[0] }} {{ (item[1] == 'R') | ternary('lettura', 'scrittura') }}
-      {{ probe_summary[item[0]][item[1]]['availability_pct'] }}%
-  loop: >-
-    {{ (probe_all_nodes | difference(probe_impacted_nodes | default([]))) | product(['R', 'W']) | list }}
-  loop_control:
-    label: "{{ item[0] }} {{ item[1] }}"
-  when:
-    - probe_action == 'assert'
-    - item[1] in probe_summary[item[0]]
-
-- name: "[SONDA] Blocca se una scrittura confermata al client manca su un nodo (perdita di dati)"
-  ansible.builtin.assert:
-    that:
-      - "'DURABILITY_OK' in probe_report.stdout"
-    fail_msg: >-
-      ERRORE: almeno una scrittura confermata (rc=0) dalla sonda non e'
-      presente su tutti i nodi dopo {{ probe_durability_timeout | default(180) }}s -
-      {{ probe_report.stdout_lines | select('match', '^(DURABILITY|PROBE_ERROR)') | list }}
-    success_msg: "{{ probe_report.stdout_lines | select('match', '^DURABILITY_OK') | list }}"
+- name: "[SONDA] Verifica: servizio dei nodi non coinvolti"
   when: probe_action == 'assert'
+  block:
+    - name: "[SONDA] Blocca se un nodo NON coinvolto dal guasto ha smesso di servire"
+      ansible.builtin.assert:
+        that:
+          - probe_summary[item[0]][item[1]]['availability_pct'] | float >= (probe_min_availability_pct | default(100) | float)
+        fail_msg: >-
+          ERRORE: su {{ item[0] }}, che il guasto non doveva toccare, la
+          {{ (item[1] == 'R') | ternary('lettura', 'scrittura') }} e' riuscita solo
+          nel {{ probe_summary[item[0]][item[1]]['availability_pct'] }}% dei casi
+          (soglia {{ probe_min_availability_pct | default(100) }}%; interruzione max
+          {{ probe_summary[item[0]][item[1]]['max_outage_s'] }}s). Il guasto si e'
+          propagato a un nodo sano.
+        success_msg: >-
+          OK: {{ item[0] }} {{ (item[1] == 'R') | ternary('lettura', 'scrittura') }}
+          {{ probe_summary[item[0]][item[1]]['availability_pct'] }}%
+      loop: >-
+        {{ (probe_all_nodes | difference(probe_impacted_nodes | default([]))) | product(['R', 'W']) | list }}
+      loop_control:
+        label: "{{ item[0] }} {{ item[1] }}"
+      # item[0] in probe_summary: con il report incompleto (verifica
+      # precedente, ora non bloccante) l'indice mancante farebbe errore
+      when:
+        - item[0] in probe_summary
+        - item[1] in probe_summary[item[0]]
+  rescue:
+    - name: "[SONDA] Annota il fallimento della verifica"
+      ansible.builtin.set_fact:
+        probe_failures: "{{ probe_failures + [ansible_failed_task.name] }}"
 
-- name: "[SONDA] Blocca se le entry della sonda non sono state rimosse da tutti i nodi"
+- name: "[SONDA] Verifica: durabilita'"
+  when: probe_action == 'assert'
+  block:
+    - name: "[SONDA] Blocca se una scrittura confermata al client manca su un nodo (perdita di dati)"
+      ansible.builtin.assert:
+        that:
+          - "'DURABILITY_OK' in probe_report.stdout"
+        fail_msg: >-
+          ERRORE: almeno una scrittura confermata (rc=0) dalla sonda non e'
+          presente su tutti i nodi dopo {{ probe_durability_timeout | default(180) }}s -
+          {{ probe_report.stdout_lines | select('match', '^(DURABILITY|PROBE_ERROR)') | list }}
+        success_msg: "{{ probe_report.stdout_lines | select('match', '^DURABILITY_OK') | list }}"
+  rescue:
+    - name: "[SONDA] Annota il fallimento della verifica"
+      ansible.builtin.set_fact:
+        probe_failures: "{{ probe_failures + [ansible_failed_task.name] }}"
+
+- name: "[SONDA] Verifica: cleanup"
+  when: probe_action == 'assert'
+  block:
+    - name: "[SONDA] Blocca se le entry della sonda non sono state rimosse da tutti i nodi"
+      ansible.builtin.assert:
+        that:
+          - "'PROBE_CLEANUP_OK' in probe_cleanup.stdout"
+        fail_msg: >-
+          ERRORE: entry svcprobe.* ancora presenti dopo il cleanup
+          ({{ probe_cleanup.stdout_lines | last | default('') }}; -1 = conteggio
+          non riuscito via SSH). Il prossimo run le rimuove comunque all'avvio.
+        success_msg: "{{ probe_cleanup.stdout_lines | last }}"
+  rescue:
+    - name: "[SONDA] Annota il fallimento della verifica"
+      ansible.builtin.set_fact:
+        probe_failures: "{{ probe_failures + [ansible_failed_task.name] }}"
+
+- name: "[SONDA] Esito complessivo: blocca se anche una sola verifica della sonda e' fallita"
   ansible.builtin.assert:
     that:
-      - "'PROBE_CLEANUP_OK' in probe_cleanup.stdout"
-    fail_msg: >-
-      ERRORE: entry svcprobe.* ancora presenti dopo il cleanup
-      ({{ probe_cleanup.stdout_lines | last | default('') }}; -1 = conteggio
-      non riuscito via SSH). Il prossimo run le rimuove comunque all'avvio.
-    success_msg: "{{ probe_cleanup.stdout_lines | last }}"
+      - probe_failures | length == 0
+    fail_msg: "{{ [probe_fail_hint] + probe_failures }}"
+    success_msg: "OK: report, servizio, durabilita' e cleanup della sonda verificati."
+  vars:
+    probe_fail_hint: >-
+      ERRORE: {{ probe_failures | length }} verifiche della sonda fallite
+      (dettagli nel task fallito di ciascuna, sopra):
   when: probe_action == 'assert'
