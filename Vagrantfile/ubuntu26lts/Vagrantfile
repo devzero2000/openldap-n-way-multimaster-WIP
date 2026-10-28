@@ -313,6 +313,12 @@ EOF
             echo "  IdentityFile ~/.ssh/id_ed25519_github"
             echo "  IdentitiesOnly yes"
           fi
+          # Chiave per GitLab (fork di OpenLDAP; solo dove e' presente)
+          if [ -f /home/vagrant/.ssh/id_ed25519_gitlab ]; then
+            echo "Host gitlab.com"
+            echo "  IdentityFile ~/.ssh/id_ed25519_gitlab"
+            echo "  IdentitiesOnly yes"
+          fi
           echo "$END_MARK"
         } >> "$SSH_CFG"
         chown vagrant:vagrant "$SSH_CFG"
