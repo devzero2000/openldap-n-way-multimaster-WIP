@@ -4,6 +4,11 @@
 Vagrant.configure("2") do |config|
   config.vm.box = "bento/ubuntu-26.04"
   config.vm.box_version = "202606.01.0"
+  # Versione della box fissata: inutile interrogare Vagrant Cloud a ogni
+  # "vagrant up" per sapere se ne esiste una piu' recente.
+  config.vm.box_check_update = false
+
+  domain = "example.com"
 
   # Mappatura dei nodi con i rispettivi IP
   nodes = {
@@ -17,10 +22,34 @@ Vagrant.configure("2") do |config|
   # Ansible si usa come utente "vagrant" (come nel cluster 24.04).
   master = "ubuntu26lts1"
 
-  nodes.each_with_index do |(hostname, ip), index|
+  # Repliche in sola lettura (gruppo [readonlyreplica] dell'inventory);
+  # tutti gli altri nodi finiscono nel gruppo [cluster].
+  readonly_replicas = ["ubuntu26lts4"]
+
+  # /etc/hosts e inventory Ansible generati da "nodes": un solo punto in cui
+  # aggiungere/rinominare nodi, niente liste duplicate da tenere allineate.
+  hosts_block = nodes.map { |h, ip| "#{ip} #{h}.#{domain} #{h}" }.join("\n")
+  cluster_nodes = nodes.keys - readonly_replicas
+  inventory = [
+    "[cluster]",
+    *cluster_nodes.map { |h| "#{h}.#{domain}" },
+    "",
+    "[readonlyreplica]",
+    *readonly_replicas.map { |h| "#{h}.#{domain}" },
+    "",
+    "[ldap_all:children]",
+    "cluster",
+    "readonlyreplica",
+    "",
+    "[all:vars]",
+    "ansible_user=vagrant",
+    "ansible_python_interpreter=/usr/bin/python3"
+  ].join("\n")
+
+  nodes.each do |hostname, ip|
     config.vm.define hostname do |node|
-      
-      node.vm.hostname = "#{hostname}.example.com"
+
+      node.vm.hostname = "#{hostname}.#{domain}"
       node.vm.provider "vmware_desktop" do |v|
         v.gui = false
         v.vmx["memsize"] = "4096"
@@ -31,6 +60,11 @@ Vagrant.configure("2") do |config|
         # anche quando Vagrant smettera' di sovrascriverli.
         v.vmx["ethernet0.pcislotnumber"] = "160"
         v.vmx["ethernet1.pcislotnumber"] = "256"
+        # Valori gia' dichiarati qui sopra: il warning di Vagrant sul VMX
+        # della box (vmx-allowlisting) non aggiunge informazioni.
+        # :disable_warning e non true: non e' la box a essere stata corretta,
+        # e' questo Vagrantfile a compensare.
+        v.allowlist_verified = :disable_warning
         # Niente sincronizzazione PERIODICA dell'orologio da VMware Tools:
         # l'ora la gestisce solo chrony (NTP). Con entrambi attivi l'orologio
         # delle VM oscillava di ~4,5s (VMware Tools lo riportava all'ora
@@ -41,14 +75,30 @@ Vagrant.configure("2") do |config|
         # 2026-10-26). Le sincronizzazioni una tantum (resume/snapshot)
         # restano attive.
         v.vmx["tools.syncTime"] = "FALSE"
+        # Linked clone (default): il disco della VM dipende dal disco base
+        # nella cache delle box (~/.vagrant.d/boxes). Cancellare la box rende
+        # la VM non avviabile (incidente del 2026-11-23). Con false ogni VM
+        # nuova ha un disco completo e autonomo, al costo di piu' spazio.
+        # Vale solo per le VM create dopo la modifica.
+        # v.linked_clone = false
       end
 
       # Rete Bridged
       node.vm.network "public_network", ip: ip, bridge: "eth0"
 
-      # Provisioning iniziale (eseguito solo alla prima creazione)
-      node.vm.provision "shell", inline: <<-SHELL
+      # ------------------------------------------------------------------
+      # Provisioning iniziale "setup": eseguito solo alla prima creazione
+      # (o esplicitamente con: vagrant provision --provision-with setup).
+      # Contiene tutto cio' che e' lento (apt) o che serve una volta sola.
+      # ------------------------------------------------------------------
+      node.vm.provision "setup", type: "shell", inline: <<-SHELL
+        set -e
         export DEBIAN_FRONTEND=noninteractive
+        export NEEDRESTART_MODE=a
+        # Al primo boot apt-daily/unattended-upgrades possono partire da soli
+        # e tenere il lock di dpkg: invece di fallire con "Could not get
+        # lock", apt aspetta fino a 10 minuti che il lock si liberi.
+        APT_OPTS="-o DPkg::Lock::Timeout=600"
 
         # --- FIX IPv6 / mirror APT (diagnosticato in sessione di lavoro,
         # settembre 2026): il router di casa non fornisce IPv6 (ne' RA ne'
@@ -84,16 +134,53 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
         # --- fine fix IPv6 / mirror APT ---
 
-        # Primo update (tutti i nodi): aggiornamento completo dei pacchetti
-        # + pulizia di quelli non piu' necessari (es. kernel vecchi).
+        # Aggiornamento completo dei pacchetti + pulizia di quelli non piu'
+        # necessari (es. kernel vecchi). Una volta sola, alla creazione: gli
+        # aggiornamenti successivi li fa unattended-upgrades (sotto).
         # force-confdef/confold: nessun prompt sui file di configurazione
         # modificati (si tiene la versione locale); NEEDRESTART_MODE=a evita
         # il prompt di needrestart sui servizi da riavviare.
-        export NEEDRESTART_MODE=a
-        apt-get update -y
-        apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
-        apt-get autoremove -y --purge
-        apt-get autoclean -y
+        apt-get $APT_OPTS update
+        apt-get $APT_OPTS -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
+        apt-get $APT_OPTS install -y unattended-upgrades
+        apt-get $APT_OPTS autoremove -y --purge
+        apt-get $APT_OPTS autoclean -y
+
+        # --- Aggiornamenti automatici (unattended-upgrades) ---
+        cat << 'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+
+        # Sostituisce il vecchio 50unattended-upgrades-local, che indicava le
+        # origini ESM senza suffisso del pocket (non corrispondevano a nessun
+        # repository). Le liste Allowed-Origins si SOMMANO a quelle di
+        # 50unattended-upgrades (che gia' include security ed ESM security):
+        # qui si aggiungono esplicitamente anche gli "updates".
+        rm -f /etc/apt/apt.conf.d/50unattended-upgrades-local
+        cat << 'EOF' > /etc/apt/apt.conf.d/52unattended-upgrades-local
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-updates";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-updates";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+    "${distro_id}ESM:${distro_codename}-infra-updates";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+// Nessun riavvio automatico: nel cluster MMR i nodi non devono riavviarsi
+// tutti insieme. Dopo un aggiornamento del kernel il riavvio va fatto a
+// mano, un nodo alla volta (presenza di /var/run/reboot-required).
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+        # --- fine aggiornamenti automatici ---
 
         timedatectl set-timezone Europe/Rome
         # Su 26.04 il servizio NTP e' chrony (systemd-timesyncd non e'
@@ -103,7 +190,7 @@ EOF
         # /usr/lib/systemd/ntp-units.d/50-chrony.list.
         timedatectl set-ntp true
         systemctl restart chrony
-        
+
         echo "vagrant ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-vagrant
         chmod 440 /etc/sudoers.d/90-vagrant
 
@@ -122,7 +209,7 @@ EOF
           # (verificato settembre 2026: ultime build per questing/noble):
           # aggiungerlo farebbe fallire apt-add-repository e il provisioning.
           # (apt-get update gia' eseguito all'inizio del provisioning)
-          apt-get install -y ansible
+          apt-get $APT_OPTS install -y ansible
 
           # Strumenti di sviluppo Ansible (tutti da universe di 26.04):
           # - ansible-lint: lint dei playbook; "ansible-lint --fix" fa anche
@@ -130,7 +217,7 @@ EOF
           # - yamllint: verifica sintassi e stile YAML
           # - vim + vim-ale: lint in tempo reale dentro Vim (ALE si carica da
           #   solo da /usr/share/vim/vimfiles/pack/dist-bundle/start/ale)
-          apt-get install -y ansible-lint yamllint vim vim-ale
+          apt-get $APT_OPTS install -y ansible-lint yamllint vim vim-ale
 
           # Configurazione yamllint compatibile con ansible-lint
           # (letta da yamllint e da ansible-lint quando il progetto non ha
@@ -191,15 +278,14 @@ command! AnsibleFix write | execute '!ansible-lint --fix ' . shellescape(expand(
 EOF
         fi
       SHELL
-    end
-  end
 
-  # Secondo stage / Boot provisioning: eseguito SEMPRE ad ogni avvio (run: "always") 
-  nodes.each do |hostname, ip|
-    config.vm.define hostname do |node|
-      node.vm.provision "shell", run: "always", inline: <<-SHELL
-        export DEBIAN_FRONTEND=noninteractive
-
+      # ------------------------------------------------------------------
+      # Provisioning "boot": eseguito SEMPRE ad ogni avvio (run: "always").
+      # Solo operazioni locali e istantanee (niente apt, niente rete):
+      # l'avvio delle VM resta rapido e non entra in conflitto con
+      # unattended-upgrades per il lock di dpkg.
+      # ------------------------------------------------------------------
+      node.vm.provision "boot", type: "shell", run: "always", inline: <<-SHELL
         # 0) Niente sincronizzazione PERIODICA dell'orologio da VMware Tools,
         #    a ogni avvio (non solo alla creazione): affianca
         #    v.vmx["tools.syncTime"] = "FALSE" e vale anche per le VM gia'
@@ -213,69 +299,23 @@ EOF
           echo "vmware-toolbox-cmd non presente: timesync di VMware Tools non modificato" >&2
         fi
 
-        # 1) Configurazione hosts
+        # 1) Configurazione hosts (generata dalla mappa "nodes")
         sed -i '/# Configurazione Cluster Ansible/,$d' /etc/hosts
-        echo -e "\n# Configurazione Cluster Ansible" >> /etc/hosts
-        echo "192.168.1.20 ubuntu26lts1.example.com ubuntu26lts1" >> /etc/hosts
-        echo "192.168.1.21 ubuntu26lts2.example.com ubuntu26lts2" >> /etc/hosts
-        echo "192.168.1.22 ubuntu26lts3.example.com ubuntu26lts3" >> /etc/hosts
-        echo "192.168.1.23 ubuntu26lts4.example.com ubuntu26lts4" >> /etc/hosts
+        cat << 'EOF' >> /etc/hosts
 
-        # 2) Inventory Ansible (solo sul master)
+# Configurazione Cluster Ansible
+#{hosts_block}
+EOF
+
+        # 2) Inventory Ansible (solo sul master, generato dalla mappa "nodes")
         if [ "#{hostname}" = "#{master}" ]; then
           mkdir -p /etc/ansible
           cat << 'EOF' > /etc/ansible/hosts
-[cluster]
-ubuntu26lts1.example.com
-ubuntu26lts2.example.com
-ubuntu26lts3.example.com
-
-[readonlyreplica]
-ubuntu26lts4.example.com
-
-[ldap_all:children]
-cluster
-readonlyreplica
-
-[all:vars]
-ansible_user=vagrant
-ansible_python_interpreter=/usr/bin/python3
+#{inventory}
 EOF
         fi
 
-        # 3) Unattended Upgrades & Configurazione completa
-        apt-get update -y
-        apt-get install -y unattended-upgrades apt-listchanges
-
-        cat << 'EOF' > /etc/apt/apt.conf.d/20auto-upgrades
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-EOF
-
-        cat << 'EOF' > /etc/apt/apt.conf.d/50unattended-upgrades-local
-Unattended-Upgrade::Allowed-Origins {
-    "${distro_id}:${distro_codename}";
-    "${distro_id}:${distro_codename}-updates";
-    "${distro_id}:${distro_codename}-security";
-    "${distro_id}ESMApps:${distro_codename}";
-    "${distro_id}ESM:${distro_codename}";
-};
-Unattended-Upgrade::AutoFixInterruptedDpkg "true";
-Unattended-Upgrade::MinimalSteps "true";
-Unattended-Upgrade::InstallOnShutdown "false";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
-Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
-Unattended-Upgrade::Clean-Installed-Packages "true";
-EOF
-
-        # FORZA L'AGGIORNAMENTO TOTALE E LA PULIZIA AD OGNI AVVIO
-        export NEEDRESTART_MODE=a
-        apt-get update -y
-        apt-get -y -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" full-upgrade
-        apt-get autoremove -y --purge
-        apt-get autoclean -y
-
-        # 4) Gestione chiavi SSH (APPEND invece di SOVRASCRITTURA)
+        # 3) Gestione chiavi SSH (APPEND invece di SOVRASCRITTURA)
         if [ -d /vagrant/.cluster_keys ]; then
           cat /vagrant/.cluster_keys/*.pub >> /home/vagrant/.ssh/authorized_keys
           sort -u /home/vagrant/.ssh/authorized_keys -o /home/vagrant/.ssh/authorized_keys
@@ -283,46 +323,17 @@ EOF
           chmod 600 /home/vagrant/.ssh/authorized_keys
         fi
 
-        # Configurazione SSH: blocco gestito tra marcatori, riscritto a ogni
-        # avvio senza toccare il resto del file. Prima il file veniva
-        # sovrascritto con ">", cancellando ogni aggiunta manuale (es. il
-        # blocco Host github.com, sparito -> git push "Permission denied").
-        SSH_CFG=/home/vagrant/.ssh/config
-        BEGIN_MARK="# BEGIN cluster Vagrant (gestito dal provisioning, non modificare)"
-        END_MARK="# END cluster Vagrant"
-        touch "$SSH_CFG"
-        # Migrazione: file scritto per intero dalla vecchia versione (nessun
-        # marcatore e solo le vecchie righe) -> si riparte da file vuoto
-        if ! grep -qF "$BEGIN_MARK" "$SSH_CFG" && \
-           ! grep -qvxF -e 'Host 192.168.1.*' -e 'Host *.example.com' \
-               -e '  StrictHostKeyChecking no' -e '  UserKnownHostsFile=/dev/null' -e '' "$SSH_CFG"; then
-          : > "$SSH_CFG"
-        fi
-        sed -i "/^$BEGIN_MARK/,/^$END_MARK/d" "$SSH_CFG"
-        {
-          echo "$BEGIN_MARK"
-          echo "Host 192.168.1.*"
-          echo "  StrictHostKeyChecking no"
-          echo "  UserKnownHostsFile=/dev/null"
-          echo "Host *.example.com"
-          echo "  StrictHostKeyChecking no"
-          echo "  UserKnownHostsFile=/dev/null"
-          # Chiave per GitHub (solo sui nodi dove e' presente)
-          if [ -f /home/vagrant/.ssh/id_ed25519_github ]; then
-            echo "Host github.com"
-            echo "  IdentityFile ~/.ssh/id_ed25519_github"
-            echo "  IdentitiesOnly yes"
-          fi
-          # Chiave per GitLab (fork di OpenLDAP; solo dove e' presente)
-          if [ -f /home/vagrant/.ssh/id_ed25519_gitlab ]; then
-            echo "Host gitlab.com"
-            echo "  IdentityFile ~/.ssh/id_ed25519_gitlab"
-            echo "  IdentitiesOnly yes"
-          fi
-          echo "$END_MARK"
-        } >> "$SSH_CFG"
-        chown vagrant:vagrant "$SSH_CFG"
-        chmod 600 "$SSH_CFG"
+        # 4) Configurazione SSH client tra i nodi del cluster
+        cat << 'EOF' > /home/vagrant/.ssh/config
+Host 192.168.1.*
+  StrictHostKeyChecking no
+  UserKnownHostsFile=/dev/null
+Host *.#{domain}
+  StrictHostKeyChecking no
+  UserKnownHostsFile=/dev/null
+EOF
+        chown vagrant:vagrant /home/vagrant/.ssh/config
+        chmod 600 /home/vagrant/.ssh/config
       SHELL
     end
   end
